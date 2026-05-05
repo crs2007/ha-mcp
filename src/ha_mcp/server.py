@@ -87,7 +87,7 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
             instructions=instructions,
         )
 
-        # Register all tools and expert prompts
+        # Register all tools, prompts, and skills
         self._initialize_server()
 
     @property
@@ -140,12 +140,35 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
         # Register enhanced tools for first/second interaction success
         self.register_enhanced_tools()
 
+        # Register MCP prompts (safety, troubleshooting, automation, status, security)
+        self._initialize_prompts()
+
         # Register bundled skills as MCP resources
         self._register_skills()
 
         # Apply tool search transform (must come after all tools and
         # ResourcesAsTools are registered so it can wrap everything)
         self._apply_tool_search()
+
+    def _initialize_prompts(self) -> None:
+        """Register all MCP prompt modules with the server.
+
+        Prompts are reusable, parameterized conversation-starters that guide
+        LLMs through structured workflows: safety guards, troubleshooting chains,
+        automation creation, status reports, and security-sensitive operations.
+        """
+        try:
+            from .prompts import register_all_prompts
+
+            register_all_prompts(self.mcp)
+            logger.info(
+                "Registered MCP prompts "
+                "(safety, troubleshooting, automation, status, security)"
+            )
+        except Exception:
+            logger.exception(
+                "Failed to register MCP prompts — server will start without prompts"
+            )
 
     def _get_skills_dir(self) -> Path | None:
         """Return the bundled skills directory if it exists.
@@ -215,11 +238,11 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
             "IMPORTANT: This server provides best-practice skills that MUST "
             "be consulted before performing matching actions. "
             "Read the SKILL.md for the matching skill "
-            "\u2014 it contains a Reference Files table that maps tasks to "
+            "— it contains a Reference Files table that maps tasks to "
             "specific reference files. You MUST read the referenced files "
             "that match your current task before proceeding. "
             "Do NOT load all reference files upfront "
-            "\u2014 only the ones the table directs you to.\n\n"
+            "— only the ones the table directs you to.\n\n"
             f"How to access: {access_method}\n"
         )
 
@@ -230,21 +253,21 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
             instructions += (
                 "\n\n## Tool Discovery\n"
                 "This server uses search-based tool discovery. Most tools "
-                "are NOT listed directly \u2014 use ha_search_tools to find them.\n\n"
+                "are NOT listed directly — use ha_search_tools to find them.\n\n"
                 "WORKFLOW:\n"
                 '1. Call ha_search_tools(query="...") to find relevant tools\n'
                 "2. Results include name, description, parameters, and "
                 "annotations (readOnlyHint/destructiveHint)\n"
-                "3. Execute the discovered tool \u2014 two options:\n"
+                "3. Execute the discovered tool — two options:\n"
                 "   a) DIRECT CALL (preferred): Call the tool directly by "
                 "name. All discovered tools are callable without a proxy.\n"
                 "   b) VIA PROXY: For permission-gated execution, use the "
                 "matching proxy:\n"
-                "      - ha_call_read_tool \u2014 safe, read-only operations\n"
-                "      - ha_call_write_tool \u2014 creates or modifies data\n"
-                "      - ha_call_delete_tool \u2014 removes data permanently\n\n"
-                "Once you know a tool\u2019s name, you do NOT need to search "
-                "again \u2014 call it directly.\n\n"
+                "      - ha_call_read_tool — safe, read-only operations\n"
+                "      - ha_call_write_tool — creates or modifies data\n"
+                "      - ha_call_delete_tool — removes data permanently\n\n"
+                "Once you know a tool’s name, you do NOT need to search "
+                "again — call it directly.\n\n"
                 f"A few critical tools are listed directly "
                 f"({', '.join(DEFAULT_PINNED_TOOLS)}). Everything else must "
                 f"be discovered via search.\n\n"
@@ -319,13 +342,13 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
         "history, statistics, devices, integrations, services, backups, "
         "todo, camera, blueprints, system, and more.\n\n"
         "WORKFLOW:\n"
-        "1. ha_search_tools(query='...') \u2014 find tools (this tool)\n"
+        "1. ha_search_tools(query='...') — find tools (this tool)\n"
         "2. Execute: call the tool DIRECTLY by name (preferred), or use "
         "a proxy for permission gating:\n"
-        "   - ha_call_read_tool \u2014 readOnlyHint tools (safe, no side effects)\n"
-        "   - ha_call_write_tool \u2014 destructiveHint tools that create/update\n"
-        "   - ha_call_delete_tool \u2014 destructiveHint tools that remove/delete\n"
-        "Once you know a tool name, call it directly \u2014 no need to search "
+        "   - ha_call_read_tool — readOnlyHint tools (safe, no side effects)\n"
+        "   - ha_call_write_tool — destructiveHint tools that create/update\n"
+        "   - ha_call_delete_tool — destructiveHint tools that remove/delete\n"
+        "Once you know a tool name, call it directly — no need to search "
         "again.\n\n"
         "If using proxies, call with TWO top-level params:\n"
         '   ha_call_read_tool(name="ha_search_entities", arguments={"query": "..."})\n'
@@ -670,7 +693,7 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
     async def start(self) -> None:
         """Start the Smart MCP server with async compatibility."""
         logger.info(
-            f"🚀 Starting Smart {self.settings.mcp_server_name} v{self.settings.mcp_server_version}"
+            f"\U0001f680 Starting Smart {self.settings.mcp_server_name} v{self.settings.mcp_server_version}"
         )
 
         # Test connection on startup
@@ -687,7 +710,7 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
             logger.error(f"❌ Error testing connection: {e}")
 
         # Log available tools count
-        logger.info("🔧 Smart server with enhanced tools loaded")
+        logger.info("\U0001f527 Smart server with enhanced tools loaded")
 
         # Run the MCP server with async compatibility
         await self.mcp.run_async()
@@ -697,4 +720,4 @@ class HomeAssistantSmartMCPServer(EnhancedToolsMixin):
         # Only close client if it was actually created
         if self._client is not None and hasattr(self._client, "close"):
             await self._client.close()
-        logger.info("🔧 Home Assistant Smart MCP Server closed")
+        logger.info("\U0001f527 Home Assistant Smart MCP Server closed")
