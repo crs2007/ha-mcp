@@ -254,6 +254,43 @@
     "source_file": "tools_areas.py"
   },
   {
+    "name": "ha_intent_process",
+    "title": "Process Assist Intent",
+    "description": "Run a natural-language sentence through Home Assistant's Assist intent system.\n\nCalls POST /api/conversation/process — the same endpoint that voice\nclients (Assist devices, mobile app voice input) use. Will EXECUTE\nmatched intents (e.g. turn devices on/off, set temperatures), not just\nanalyze them. Treat as a write operation.\n\nUSE CASES:\n- Test whether HA can already handle a command natively before building an automation\n- Validate custom sentence templates added under intent_script / conversation\n- Debug why an Assist sentence isn't matching (response_type='error', code='no_intent_match')\n- Reviver agent: check intent coverage for documented use cases\n\nEXAMPLES:\n- ha_intent_process(sentence=\"turn on the kitchen light\")\n- ha_intent_process(sentence=\"הדלק את האור בסלון\", language=\"he\")\n- ha_intent_process(sentence=\"what's the bedroom temperature\")\n- ha_intent_process(sentence=\"and the kitchen?\", conversation_id=\"<prev_id>\")\n- ha_intent_process(sentence=\"run good morning\", agent_id=\"conversation.home_assistant\")\n\nRETURNS:\n- success: True unless response_type is 'error'\n- response_type: 'action_done' | 'query_answer' | 'error'\n- speech: Plain-text reply from HA (e.g. \"Turned on the light\")\n- language: Language code HA used\n- conversation_id: Pass back to chain follow-up calls\n- targets: List of resolved targets (entity / area / domain)\n- service_calls: { success: [...], failed: [...] } — entities affected\n- error_code: When response_type='error' (e.g. 'no_intent_match',\n  'no_valid_targets', 'failed_to_handle')\n- raw: Full unmodified HA response for advanced inspection",
+    "inputSchema": {
+      "properties": {
+        "sentence": {
+          "type": "Annotated[str, Field(description=\"Natural-language command to send through HA's Assist conversation pipeline (e.g. 'turn on the kitchen light'). Same path a voice command would take. Commands that match an intent will execute (turn on lights, set temperature, etc.).\", min_length=1)]"
+        },
+        "language": {
+          "type": "Annotated[str | None, Field(description=\"Optional BCP47 language code (e.g. 'en', 'he', 'en-US'). If omitted, HA uses its configured default language.\", default=None)]",
+          "default": null
+        },
+        "conversation_id": {
+          "type": "Annotated[str | None, Field(description='Optional conversation ID to maintain context across multiple calls (for follow-up questions). If omitted, HA starts a new conversation. Returned in the response.', default=None)]",
+          "default": null
+        },
+        "agent_id": {
+          "type": "Annotated[str | None, Field(description=\"Optional conversation agent entity_id (e.g. 'conversation.home_assistant'). If omitted, HA uses the default Assist agent.\", default=None)]",
+          "default": null
+        }
+      },
+      "required": [
+        "sentence"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    },
+    "tags": [
+      "Assist"
+    ],
+    "source_file": "tools_assist.py"
+  },
+  {
     "name": "ha_manage_pipeline",
     "title": "Manage Assist Pipeline",
     "description": "Manage Home Assistant Assist pipelines.\n\nUse action='list' to discover pipeline IDs, action='get' to inspect one\npipeline, action='create' or action='update' to write pipeline settings,\nand action='set_preferred' to choose the preferred pipeline.\n\nEXAMPLES:\n- List pipelines: ha_manage_pipeline(action=\"list\")\n- Get one pipeline: ha_manage_pipeline(action=\"get\", pipeline_id=\"preferred\")\n- Create by cloning preferred: ha_manage_pipeline(\n      action=\"create\",\n      name=\"Local Assist\",\n      conversation_engine=\"conversation.local_llm\",\n  )\n- Create by cloning a specific pipeline: ha_manage_pipeline(\n      action=\"create\",\n      base_pipeline_id=\"preferred\",\n      name=\"Local Assist\",\n      conversation_engine=\"conversation.local_llm\",\n  )\n- Update conversation agent and clear TTS voice: ha_manage_pipeline(\n      action=\"update\",\n      pipeline_id=\"preferred\",\n      conversation_engine=\"conversation.local_llm\",\n      tts_voice=\"\",\n  )\n- Set preferred: ha_manage_pipeline(\n      action=\"set_preferred\",\n      pipeline_id=\"preferred\",\n  )\n\nEmpty string clears nullable STT/TTS/wake-word fields. Non-nullable\nfields such as name, language, conversation_language, and\nconversation_engine must be omitted or non-empty.",
@@ -2088,7 +2125,7 @@
   {
     "name": "ha_get_logs",
     "title": "Get Logs",
-    "description": "Get Home Assistant logs from various sources.\n\n**Sources:**\n- \"logbook\" (default): Entity state change history with pagination\n- \"system\": Structured system log entries (errors, warnings) via system_log/list\n- \"error_log\": Raw home-assistant.log text\n- \"supervisor\": Add-on container logs (requires slug = add-on slug)\n- \"system_service\": HA-Supervisor-managed system service logs (requires\n  slug ∈ {supervisor, host, core, dns, audio, cli, multicast, observer})\n- \"logger\": Effective log level per integration via logger/log_info (confirms logger.set_level changes took effect)\n\n**Shared params:** limit, search (keyword filter on entries/lines; matches integration domain for source='logger')\n**Order:** order='newest' (default) returns most-recent first; order='oldest' returns chronological-first. Applies to all time-ordered sources (logbook, system, error_log, supervisor, system_service); ignored for source='logger'. For raw-text sources (error_log, supervisor, system_service) it sets the read direction of the most-recent window.\n**Logbook params:** hours_back, entity_id, end_time, offset, compact (default True — strips attribute dicts to save context)\n**System/error_log params:** level (ERROR, WARNING, INFO, DEBUG)\n**Supervisor params:** slug = add-on slug, e.g. \"core_mosquitto\" (use\n    ha_get_addon() to list installed slugs)\n**System-service params:** slug = service name. The slug \"supervisor\"\n    here means the Supervisor service's own logs, NOT an add-on with\n    that name — the source param disambiguates.",
+    "description": "Get Home Assistant logs from various sources.\n\n**Sources:**\n- \"logbook\" (default): Entity state change history with pagination\n- \"system\": Structured system log entries (errors, warnings) via system_log/list\n- \"error_log\": Raw home-assistant.log text\n- \"supervisor\": Add-on container logs (requires slug = add-on slug)\n- \"system_service\": HA-Supervisor-managed system service logs (requires\n  slug ∈ {supervisor, host, core, dns, audio, cli, multicast, observer})\n- \"logger\": Effective log level per integration via logger/log_info (confirms logger.set_level changes took effect)\n\n**Shared params:** limit, search (keyword filter on entries/lines; matches integration domain for source='logger')\n**Order:** order='newest' (default) returns most-recent first; order='oldest' returns chronological-first. Applies to all time-ordered sources (logbook, system, error_log, supervisor, system_service); ignored for source='logger'. For raw-text sources (error_log, supervisor, system_service) it sets the read direction of the most-recent window.\n**Logbook params:** hours_back, entity_id, end_time, offset, compact (default True — strips attribute dicts to save context)\n**System/error_log params:** level (ERROR, WARNING, INFO, DEBUG)\n**error_log params:** structured (default False — when True, returns a\n    deduplicated, component-grouped summary sorted by occurrence count\n    instead of raw text; bounded output on large logs), top_n (max\n    distinct issues in structured output, default 20)\n**Supervisor params:** slug = add-on slug, e.g. \"core_mosquitto\" (use\n    ha_get_addon() to list installed slugs)\n**System-service params:** slug = service name. The slug \"supervisor\"\n    here means the Supervisor service's own logs, NOT an add-on with\n    that name — the source param disambiguates.",
     "inputSchema": {
       "properties": {
         "source": {
@@ -2129,6 +2166,14 @@
         },
         "level": {
           "type": "str | None",
+          "default": null
+        },
+        "structured": {
+          "type": "Annotated[bool, Field(description=\"source='error_log' only. When True, return a deduplicated, component-grouped summary of the log (counted issues sorted by frequency) instead of raw text. Use this on busy instances where the raw log is large enough to exhaust context. Ignored for other sources.\")]",
+          "default": false
+        },
+        "top_n": {
+          "type": "Annotated[int | None, Field(ge=1, description='Max distinct issues to return when structured=True (default 20). Bounds the response regardless of log size.')]",
           "default": null
         },
         "slug": {
