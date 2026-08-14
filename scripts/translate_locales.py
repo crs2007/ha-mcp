@@ -26,9 +26,10 @@ down is a HUMAN: hand-edit the translations, run
 run sees nothing stale and no-ops. Hand-edits always win; the machine only
 touches strings whose English changed.
 Every returned string is validated (placeholder parity, the settings UI markup
-allowlist, formatting-tag parity, panel-link parity) before it is written; a
-failure leaves that string unwritten and the run red rather than shipping a
-broken translation.
+allowlist, formatting-tag parity, panel-link parity, and the on-screen names
+Python hardcodes staying untranslated) before it is written; a failure
+leaves that string unwritten and the run red rather than shipping a broken
+translation.
 
 Rate limits and outages: requests are paced under the free-tier rate and
 retry transient errors with backoff; a persistently failing batch marks its
@@ -36,7 +37,7 @@ strings failed and the run continues, and two consecutive dead batches stop
 the run early. Partial runs are resumable — completed work is recorded in
 ``tests/src/unit/locale_sync_progress.json`` and skipped on the rerun; only a
 fully successful run repins the baseline and deletes that record, so the
-parity suite stays red until every string is translated.
+locale-sync runs stay red until every string is translated.
 
 Usage::
 
@@ -50,10 +51,13 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from collections import Counter
+from collections.abc import Container
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
@@ -63,6 +67,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import generate_locales  # type: ignore[import-not-found]  # noqa: E402
+import locale_rules  # type: ignore[import-not-found]  # noqa: E402
 from update_locale_baseline import (  # type: ignore[import-not-found]  # noqa: E402
     _load_test_module,
 )
@@ -105,11 +110,18 @@ def _out_of_time() -> bool:
 # to ~1500 characters each.
 _MAX_CHARS_PER_REQUEST = 6000
 
-_STYLE_SAMPLE_KEYS = (
-    "notice.shared_settings",
-    "features.read_only_mode.help",
-    "tabs.server",
+# The style samples are the only signal the engine gets about how a catalog
+# addresses its reader — du/Sie, tu/vous, 你/您 — and nothing downstream can
+# recover it: placeholder, markup and key-parity validation pass either way,
+# and the ceilings only count text left untranslated. Samples whose English
+# does not address the reader leave the model on its own default for the
+# language, which is how formal German reaches a catalog that addresses its
+# reader informally in every string of its own. Prefer English sources that
+# address the reader, shortest first so the per-request overhead stays small.
+_SECOND_PERSON_RE = re.compile(
+    r"\b(?:you|your|yours|yourself|yourselves)\b", re.IGNORECASE
 )
+_STYLE_SAMPLE_COUNT = 3
 
 
 # Closed set: the apply functions branch on this and raise on anything else,
@@ -406,10 +418,73 @@ def build_plan(module: Any) -> Plan:
     return plan
 
 
+_CONFIG_FLOW_PATH = REPO_ROOT / "custom_components" / "ha_mcp_tools" / "config_flow.py"
+_CONST_PATH = REPO_ROOT / "custom_components" / "ha_mcp_tools" / "const.py"
+_SELECTOR_LABEL_RE = re.compile(r'label="([^"]+)"')
+_ENTRY_TITLE_RE = re.compile(r'^_?[A-Z][A-Z_]*TITLE\s*=\s*"([^"]+)"', re.M)
+# English sources quote with straight or typographic marks — both already occur
+# in the shipped catalogs — and the check has to see the quoted text either
+# way, or the spelling of a quote silently decides whether it applies.
+_QUOTED_RE = re.compile(r'["“”«»„]([^"“”«»„]+)["“”«»„]')
+
+
+@lru_cache(maxsize=1)
+def _hardcoded_ui_names() -> tuple[str, ...]:
+    """On-screen names Python hardcodes, which read English to every reader.
+
+    Quoting alone does not say whether a string may be translated: catalogs
+    correctly translate quoted cross-references to their own option labels,
+    and Home Assistant translates its own buttons ("Add entry"). What must
+    survive verbatim is the narrower class this returns — names our own code
+    fixes in Python, so no catalog can localise them and a reader told to pick
+    a translated one goes looking for something that is not on the screen.
+
+    Two kinds, one rule. Config-flow selector labels name a dropdown option;
+    entry titles name the config entry a reader is told to click. Both are
+    read from the source rather than listed here, so renaming one cannot
+    strand a stale copy; ``test_connect_local_lan_quotes_the_bind_host_option``
+    guards the selector rename against the catalogs.
+    """
+    flow = _CONFIG_FLOW_PATH.read_text("utf-8")
+    const = _CONST_PATH.read_text("utf-8")
+    labels: list[str] = _SELECTOR_LABEL_RE.findall(flow)
+    titles: list[str] = _ENTRY_TITLE_RE.findall(flow) + _ENTRY_TITLE_RE.findall(const)
+    return tuple(labels + titles)
+
+
+def _untranslatable_name_dropped(english: str, translated: str) -> str | None:
+    """The hardcoded on-screen name this translation localised away, if any.
+
+    Single quotes are matched against the known names rather than paired like
+    the other marks: English prose spells the apostrophe with the same
+    character, so pairing on it shifts every quote in a sentence containing one
+    and loses the real candidate. Measured on the shipped catalogs, adding `'`
+    to the paired class drops one of the two live violations.
+    """
+    for name in _hardcoded_ui_names():
+        if any(f"{q}{name}{q2}" in english for q, q2 in (("'", "'"), ("‘", "’"))):
+            if name not in translated:
+                return name
+    quoted_texts: list[str] = _QUOTED_RE.findall(english)
+    for quoted in quoted_texts:
+        for name in _hardcoded_ui_names():
+            if (
+                name == quoted or name.startswith(f"{quoted} ")
+            ) and quoted not in translated:
+                return quoted
+    return None
+
+
 def _validate(item: WorkItem, translated: Any) -> str | None:
     """The reason a translation is unusable for this item, or None."""
     if not isinstance(translated, str) or not translated.strip():
         return "empty or non-string translation"
+    dropped = _untranslatable_name_dropped(item.english, translated)
+    if dropped is not None:
+        return (
+            f"the on-screen name {dropped!r} is hardcoded in Python "
+            "and has to stay untranslated"
+        )
     if set(_PLACEHOLDER_RE.findall(item.english)) != set(
         _PLACEHOLDER_RE.findall(translated)
     ):
@@ -428,6 +503,25 @@ def _validate(item: WorkItem, translated: Any) -> str | None:
             _PANEL_LINK_RE.findall(item.english)
         ):
             return "panel-link targets differ from English"
+    # The same comparison the merge gate runs, so the engine cannot produce
+    # what that gate will later refuse. Without it a single dropped
+    # identifier is accepted, lands as a backfilled key no later run
+    # re-queues, and from then on reddens the parity arm every day -- the
+    # push is held back whole, the progress file is discarded, and the run
+    # re-spends its quota planning the same work again. Rejecting the one
+    # string instead costs one retry and leaves the key for tomorrow.
+    #
+    # Asked at the engine's setting, which narrows three arms the merge gate
+    # runs in full (``locale_rules._parity_fault`` names each). Numbers are
+    # the reason the dial exists: the two recorded tolerances are number
+    # entries and the engine cannot read them, so a full multiset here would
+    # refuse two correct strings on every run -- while asking nothing left a
+    # freshly written key unchecked here and checked there, which lands the
+    # fault and holds the whole tree back. Both failures cost a human one
+    # tolerance entry; only this one keeps the cost to a single key.
+    fault = locale_rules._parity_fault(item.english, translated, gate="engine")
+    if fault:
+        return f"contradicts the English source: {fault}"
     return None
 
 
@@ -437,21 +531,109 @@ def _language_label(locale: str) -> str:
     return f"{native} ({locale})"
 
 
-def _style_samples(locale: str) -> str:
+def _style_sample_keys(
+    english: dict[str, str],
+    translated: dict[str, str],
+    exclude: Container[str] = frozenset(),
+) -> list[str]:
+    """The keys whose sample pair shows this catalog's address register.
+
+    ``exclude`` drops every key the run still owes, not just the ones in the
+    request being built: results are applied after the last chunk, so a key
+    queued anywhere in the run still carries the translation of the PREVIOUS
+    English. Pairing that with the new source presents a mismatch as the thing
+    to imitate, and when the key is itself in the batch the model answers with
+    the stale text it was just shown — which validates, gets written, and
+    repins the baseline as if it were current.
+
+    A blank translation is skipped like a missing one. It renders as an empty
+    right-hand side into the prompt, so the pair it contributes shows the model
+    nothing to imitate while still counting against the sample budget — and on
+    a catalog whose register rests on a single key, that is the whole signal.
+    An engine answer this shape is rejected (`_validate`), and a hand-committed
+    one no longer survives a catalog load (`_validate_string_map`) — but this
+    script reads the catalogs with `json.loads` rather than through
+    `load_catalogs`, so one still reaches here out of a working tree the app has
+    not loaded. The parity ceilings would not object either: they count a key
+    untranslated only when it equals the English or is absent, so `""` reads
+    there as translated.
+    """
+    return sorted(
+        (
+            key
+            for key, text in english.items()
+            if key in translated
+            and translated[key].strip()
+            and key not in exclude
+            and _SECOND_PERSON_RE.search(text)
+        ),
+        key=lambda key: (len(english[key]), key),
+    )[:_STYLE_SAMPLE_COUNT]
+
+
+def _surface_catalogs(
+    locale: str, surface: Section
+) -> tuple[dict[str, str], dict[str, str]]:
+    """The (english, translated) pair a request of this section samples from.
+
+    The two authored surfaces do not have to agree — today the French component
+    catalog is `vous` throughout while its settings catalog mixes `tu` and
+    `vous` — so a component request sampled from the settings catalog would be
+    told to use a register its own surface does not use.
+    """
+    if surface == "component":
+        return (
+            _flatten(_load_json(COMPONENT_DIR / "en.json")),
+            _flatten(_load_json(COMPONENT_DIR / f"{locale}.json"))
+            if (COMPONENT_DIR / f"{locale}.json").exists()
+            else {},
+        )
     catalog = _load_json(LOCALES_DIR / f"{locale}.json")
-    english = _load_json(LOCALES_DIR / "en.json")["messages"]
-    samples = [
-        f"EN: {english[key]}\n{locale.upper()}: {catalog['messages'][key]}"
-        for key in _STYLE_SAMPLE_KEYS
-        if key in catalog.get("messages", {}) and key in english
-    ]
-    return "\n\n".join(samples)
+    return (
+        _load_json(LOCALES_DIR / "en.json")["messages"],
+        catalog.get("messages", {}),
+    )
 
 
-def _prompt(locale: str, batch: dict[str, str]) -> str:
-    samples = _style_samples(locale)
+def _style_samples(
+    locale: str, surface: Section, exclude: Container[str] = frozenset()
+) -> str:
+    english, translated = _surface_catalogs(locale, surface)
+    return "\n\n".join(
+        f"EN: {english[key]}\n{locale.upper()}: {translated[key]}"
+        for key in _style_sample_keys(english, translated, exclude)
+    )
+
+
+def _prompt(
+    locale: str,
+    batch: dict[str, str],
+    surface: Section,
+    queued_keys: Container[str],
+) -> str:
+    """One request, for one surface. ``queued_keys`` is every key of that
+    surface the run still has to translate — not just this chunk's. Results are
+    applied after all chunks finish, so a key queued in a later chunk still has
+    its OLD translation on disk while this one is prompted; sampling it would
+    show a stale pair as the thing to imitate."""
+    samples = _style_samples(locale, surface, queued_keys)
     style = (
         f"Match the tone and terminology of these existing translations:\n{samples}\n\n"
+        if samples
+        else ""
+    )
+    # Carried by the samples, but not read off them on its own: with samples
+    # that address the reader and no rule, a single-string request still came
+    # back formal for a catalog that is informal throughout. Both halves are
+    # load-bearing — the rule points at the samples, so it says nothing
+    # without them. Worded as a majority rather than "exactly": a catalog can
+    # be internally inconsistent (fr mixes tu and vous today), and telling the
+    # model to imitate contradictory samples exactly is an instruction it
+    # cannot follow.
+    register_rule = (
+        "- Address the reader the way the sample translations predominantly "
+        "do; if they disagree, follow the form most of them use and apply it "
+        "consistently.\n"
         if samples
         else ""
     )
@@ -474,6 +656,7 @@ def _prompt(locale: str, batch: dict[str, str]) -> str:
         "GitHub Copilot), MCP tool names (ha_*), environment variables, "
         "file paths, URLs, configuration keys, and any text in double "
         "quotes that names an on-screen option or a literal value.\n"
+        f"{register_rule}"
         "- Keep the ⚠ and ⚠️ symbols where English has them.\n\n"
         f"{style}"
         "Strings to translate (JSON):\n"
@@ -574,13 +757,15 @@ def _accept_or_retry(
     results: dict[tuple[str, str], str],
     failures: list[str],
     failed: set[tuple[str, str]],
+    surface: Section,
+    queued_keys: Container[str],
 ) -> None:
     """Validate one translated string, retrying once with the reason."""
     reason = _validate(item, translated)
     if reason is not None:
         try:
             retry = _call_gemini(
-                _prompt(locale, {_string_id(item): item.english})
+                _prompt(locale, {_string_id(item): item.english}, surface, queued_keys)
                 + f"\n\nYour previous attempt was rejected: {reason}. "
                 "Fix that and return the corrected JSON."
             )
@@ -624,6 +809,72 @@ def _mark_unattempted(
             failed.add(ref)
 
 
+def _translate_surface(
+    locale: str,
+    surface: Section,
+    batch: dict[str, str],
+    by_id: dict[str, WorkItem],
+    queued_keys: set[str],
+    results: dict[tuple[str, str], str],
+    failures: list[str],
+    failed: set[tuple[str, str]],
+    consecutive_engine_failures: int,
+) -> tuple[bool, int]:
+    """Translate one surface's chunks; True when the engine is declared dead.
+
+    A chunk-level engine failure marks that chunk's strings failed and moves
+    on, so one blocked or truncated batch cannot take down the whole run; two
+    in a row read as systemic and stop the calls. The counter is owned by the
+    caller and threaded through: a locale's surfaces are consecutive requests
+    to the same engine, so a failure at the end of one and a failure at the
+    start of the next are two in a row.
+    """
+    # The register anchor is the one input to a run that nothing downstream
+    # can check, and on same-repo PRs the workflow commits without a human in
+    # the loop — so the log is the only place its choice is inspectable.
+    sample_keys = _style_sample_keys(*_surface_catalogs(locale, surface), queued_keys)
+    if sample_keys:
+        print(f"  {locale}/{surface}: register samples {sample_keys}")
+    else:
+        print(
+            f"  {locale}/{surface}: no sample addresses the reader — the engine "
+            "falls back to its own register for this language",
+            file=sys.stderr,
+        )
+
+    for chunk in _chunk(batch):
+        if _out_of_time():
+            failures.append(f"{locale}: time budget exhausted — stopping this run")
+            return True, consecutive_engine_failures
+        try:
+            response = _call_gemini(_prompt(locale, chunk, surface, queued_keys))
+        except SystemExit as exc:
+            consecutive_engine_failures += 1
+            for sid in chunk:
+                item = by_id[sid]
+                failures.append(
+                    f"{locale}/{item.section}/{item.key}: engine call failed ({exc})"
+                )
+                failed.add((item.section, item.key))
+            if consecutive_engine_failures >= _ENGINE_GIVE_UP_AFTER:
+                return True, consecutive_engine_failures
+            continue
+        consecutive_engine_failures = 0
+        time.sleep(_SECONDS_BETWEEN_REQUESTS)
+        for sid in chunk:
+            _accept_or_retry(
+                locale,
+                by_id[sid],
+                response.get(sid),
+                results,
+                failures,
+                failed,
+                surface,
+                queued_keys,
+            )
+    return False, consecutive_engine_failures
+
+
 def _translate_locale(
     locale: str, items: list[WorkItem]
 ) -> tuple[dict[tuple[str, str], str], list[str], set[tuple[str, str]], bool]:
@@ -642,39 +893,40 @@ def _translate_locale(
     cannot take down the whole run.
     """
     by_id = {_string_id(item): item for item in items}
-    batch = {sid: item.english for sid, item in by_id.items()}
+    # Requests are grouped by the surface they are sampled from, because the
+    # register rule points at samples and the two authored surfaces need not
+    # agree. Every key the surface still owes is excluded from its own
+    # samples: results are applied after the last chunk, so a key queued
+    # anywhere still carries the translation of the PREVIOUS English.
+    batches: dict[Section, dict[str, str]] = {}
+    queued: dict[Section, set[str]] = {}
+    for sid, item in by_id.items():
+        surface: Section = "component" if item.section == "component" else "messages"
+        batches.setdefault(surface, {})[sid] = item.english
+        queued.setdefault(surface, set()).add(item.key)
 
     results: dict[tuple[str, str], str] = {}
     failures: list[str] = []
     failed: set[tuple[str, str]] = set()
     dead = False
+    # Owned here, not per surface: the surfaces of one locale are consecutive
+    # requests to the same engine, so a failure ending one and a failure
+    # opening the next are two in a row.
     consecutive_engine_failures = 0
-    for chunk in _chunk(batch):
+    for surface, batch in batches.items():
         if dead:
             break
-        if _out_of_time():
-            failures.append(f"{locale}: time budget exhausted — stopping this run")
-            dead = True
-            break
-        try:
-            response = _call_gemini(_prompt(locale, chunk))
-        except SystemExit as exc:
-            consecutive_engine_failures += 1
-            for sid in chunk:
-                item = by_id[sid]
-                failures.append(
-                    f"{locale}/{item.section}/{item.key}: engine call failed ({exc})"
-                )
-                failed.add((item.section, item.key))
-            if consecutive_engine_failures >= _ENGINE_GIVE_UP_AFTER:
-                dead = True
-            continue
-        consecutive_engine_failures = 0
-        time.sleep(_SECONDS_BETWEEN_REQUESTS)
-        for sid in chunk:
-            _accept_or_retry(
-                locale, by_id[sid], response.get(sid), results, failures, failed
-            )
+        dead, consecutive_engine_failures = _translate_surface(
+            locale,
+            surface,
+            batch,
+            by_id,
+            queued[surface],
+            results,
+            failures,
+            failed,
+            consecutive_engine_failures,
+        )
     if dead:
         _mark_unattempted(locale, items, results, failures, failed)
     return results, failures, failed, dead
@@ -848,8 +1100,9 @@ def _repin_baseline(module: Any) -> None:
     so nothing on screen went stale, but someone must confirm the stub still
     describes the tool. Automation must not wave that through — changed
     ``" (parsed)"`` keys keep their OLD hash here, leaving
-    ``test_translations_are_checked_against_current_english`` red until a
-    human confirms and runs ``scripts/update_locale_baseline.py`` (the manual
+    ``test_translations_are_checked_against_current_english`` — run by the
+    locale-sync workflow's completeness verification — red until a human
+    confirms and runs ``scripts/update_locale_baseline.py`` (the manual
     repin, which is that confirmation).
     """
     current = module.english_sources()

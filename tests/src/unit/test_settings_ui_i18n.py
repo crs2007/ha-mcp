@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 from collections import Counter
 from pathlib import Path
@@ -229,6 +230,55 @@ def test_catalog_without_a_native_name_is_rejected(tmp_path: Path) -> None:
         load_catalogs(tmp_path)
 
 
+@pytest.mark.parametrize("blank", ["", " ", "\n\t "])
+@pytest.mark.parametrize("section", ["messages", "tool_groups"])
+def test_blank_catalog_value_is_rejected(
+    tmp_path: Path, section: str, blank: str
+) -> None:
+    """Blank and absent look the same in JSON and behave oppositely on screen.
+
+    English is the per-key fallback only for a key that is ABSENT: `t()` and
+    `tHtml()` resolve with `hasOwnProperty`, so an empty string wins over the
+    English source and renders as nothing. A translator emptying a value to
+    mean "not translated yet" would silently blank that piece of UI, and no
+    other check objects — the parity ceilings count a key untranslated only
+    when it equals the English or is missing.
+    """
+    catalog = {
+        "meta": {"native_name": "English", "dir": "ltr"},
+        "messages": {},
+        "tool_groups": {},
+        "tools": {},
+    }
+    catalog[section] = {"a": blank}
+    (tmp_path / "en.json").write_text(json.dumps(catalog), encoding="utf-8")
+
+    with pytest.raises(ValueError, match=re.escape(f"en.json.{section}.a is blank")):
+        load_catalogs(tmp_path)
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\n\t "])
+@pytest.mark.parametrize("field", ["title", "description"])
+def test_blank_tool_field_is_rejected(tmp_path: Path, field: str, blank: str) -> None:
+    """Same rule on the per-tool surface, which validates separately."""
+    (tmp_path / "en.json").write_text(
+        json.dumps(
+            {
+                "meta": {"native_name": "English", "dir": "ltr"},
+                "messages": {},
+                "tool_groups": {},
+                "tools": {"ha_get_state": {field: blank}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(
+        ValueError, match=re.escape(f"en.json.tools.ha_get_state.{field} is blank")
+    ):
+        load_catalogs(tmp_path)
+
+
 def test_inline_payload_escapes_script_breakout() -> None:
     serialized = serialize_payload({"messages": {"unsafe": "</script><b>&"}})
 
@@ -304,6 +354,34 @@ def test_shipped_catalog_loads_and_is_registered(locale: str) -> None:
         f"{_catalog_file(locale)} meta.dir is {catalog['meta'].get('dir')!r}; "
         "the rendered <html dir> attribute only accepts 'ltr' or 'rtl'"
     )
+
+
+# Same gate as ``test_locale_parity.completeness`` (see the marker comment
+# there): filled tool sections are the post-merge locale-sync workflow's to
+# owe, not the PR's — a new language legitimately merges as a near-empty
+# catalog the daily sync then fills, carrying only what the ungated checks in
+# this file ask of it. ``test_locale_sync_gate_shape`` pins the env-var wiring
+# on both files.
+_completeness = pytest.mark.skipif(
+    not os.environ.get("LOCALE_COMPLETENESS_CHECKS"),
+    reason=(
+        "translated-catalog completeness is verified by the post-merge "
+        "locale-sync workflow — set LOCALE_COMPLETENESS_CHECKS=1 to run"
+    ),
+)
+
+
+@_completeness
+@pytest.mark.parametrize("locale", _shipped_locales())
+def test_shipped_catalog_translates_the_tools_tab(locale: str) -> None:
+    """Both tool sections must be filled once the sync has run.
+
+    Split from the structural check above so a near-empty catalog can merge
+    and be filled post-merge; an empty section here after a clean sync run
+    means the fill never happened.
+    """
+    catalog = CATALOGS[locale]
+
     assert catalog["tool_groups"], (
         f"{_catalog_file(locale)} has an empty tool_groups — the tools tab "
         "would fall back to English group headings for this language"

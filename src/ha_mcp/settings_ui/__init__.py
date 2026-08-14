@@ -235,18 +235,25 @@ def _build_stub_policy_handlers(*, data_dir: Path) -> dict[str, Any]:
         except (ValidationError, ValueError) as e:
             return JSONResponse({"error": str(e)}, status_code=400)
         # Mirror main-server optimistic concurrency: reject if on-disk
-        # version moved between this caller's GET and PUT.
-        current = load_policy(data_dir)
-        if new_policy.version != current.version:
-            return JSONResponse(
-                {
-                    "error": "Policy version mismatch. Reload before saving.",
-                    "current_version": current.version,
-                    "current_policy": current.model_dump(mode="json"),
-                },
-                status_code=409,
-            )
-        save_policy(data_dir, new_policy)
+        # version moved between this caller's GET and PUT. The guard is
+        # what makes that check a real compare-and-swap: this handler runs
+        # in the SIDECAR process, so without the cross-process file lock it
+        # could read version N, lose the race to the main server's policy
+        # tools, and overwrite their commit with no version bump visible.
+        from ..utils.config_write_lock import config_write_guard
+
+        async with config_write_guard():
+            current = load_policy(data_dir)
+            if new_policy.version != current.version:
+                return JSONResponse(
+                    {
+                        "error": "Policy version mismatch. Reload before saving.",
+                        "current_version": current.version,
+                        "current_policy": current.model_dump(mode="json"),
+                    },
+                    status_code=409,
+                )
+            save_policy(data_dir, new_policy)
         return JSONResponse({"saved": True, "version": new_policy.version + 1})
 
     async def unavailable(_: Request) -> JSONResponse:
@@ -566,6 +573,15 @@ def register_settings_routes(
     and serve the "Open Web UI" button. Stdio transports use a separate
     side-process sidecar instead — see :mod:`ha_mcp.stdio_settings_sidecar`.
 
+    The ``RequireAuthMiddleware`` bypass is the documented posture, not an
+    oversight: SECURITY.md § "OAuth Mode — Beta Warning" states that the
+    settings UI "is **not** gated by the OAuth token", and its Scope section
+    excludes "The web settings UI not being gated by the OAuth/OIDC token".
+    OAuth and OIDC modes compensate by passing a *dedicated* secret path here
+    rather than the client-known MCP path (GHSA-mx64-982r-65vg); standard mode
+    and the add-on pass the MCP secret path, which already gates the whole
+    tool surface.
+
     Args:
         mcp: The FastMCP instance to register routes on.
         server: The HomeAssistantSmartMCPServer wrapping ``mcp``.
@@ -626,7 +642,9 @@ def register_settings_routes(
         ("/api/settings/features", ["GET"], "get_feature_flags"),
         ("/api/settings/features", ["POST"], "save_feature_flags"),
         # Theme / accessibility prefs (#1574 review) — server-side copy so
-        # they survive the stdio sidecar's per-spawn origin change
+        # they survive a stdio sidecar origin change (stable by default
+        # since #2131, but fresh on first spawn / lost ui.state / pin
+        # change / taken remembered port)
         ("/api/settings/theme", ["GET"], "get_theme_prefs"),
         ("/api/settings/theme", ["POST"], "save_theme_prefs"),
         # Advanced settings endpoints
