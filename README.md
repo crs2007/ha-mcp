@@ -84,6 +84,15 @@ These run the server outside Home Assistant — useful for **Container** / **Cor
 
 - **Docker (HTTP server):** run `ghcr.io/homeassistant-ai/ha-mcp` in HTTP mode, pointed at your Home Assistant URL and a long-lived token, and connect your client to its secret URL. See the [Setup Wizard](https://homeassistant-ai.github.io/ha-mcp/setup/) for the full command and per-client config.
 - **PyPI / uvx (HTTP server):** run the published `ha-mcp` package with `uvx ha-mcp@latest` (or pip) as a streamable-HTTP server the same way. Details in the [Setup Wizard](https://homeassistant-ai.github.io/ha-mcp/setup/).
+- **From a Git checkout (source):** ha-mcp is a **Python** package — it is **not** published to npm, and `npx`/`npm install` cannot install it (the `ha-mcp` package that exists on npm is an unrelated project by a different author). After cloning or downloading this repository, install [uv](https://docs.astral.sh/uv/) and run:
+
+  ```bash
+  uv sync                                   # install dependencies into .venv
+  cp .env.example .env                      # set HOMEASSISTANT_URL and HOMEASSISTANT_TOKEN
+  uv run ha-mcp-web                         # HTTP server at http://127.0.0.1:8086/mcp
+  ```
+
+  Point your client at that URL, or for a stdio client use `"command": "uv", "args": ["run", "--directory", "/path/to/ha-mcp", "ha-mcp"]` with the same environment variables. `uv run ha-mcp` runs the stdio server directly (subject to the stdio caveat below).
 - **Local stdio (not recommended):** runs ha-mcp on your own machine over stdio. The one-command installers in the **Demo server** section below use this path; the [Setup Wizard](https://homeassistant-ai.github.io/ha-mcp/setup/) covers connecting it to your own Home Assistant.
 - **OIDC authentication:** gate remote access behind an external identity provider (Authentik, Keycloak, Auth0, etc.) instead of a secret URL — all authenticated users share the server's Home Assistant credentials. See [OIDC Mode](docs/oidc.md).
 
