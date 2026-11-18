@@ -4,12 +4,13 @@ The script is the mechanical link between ha-mcp's direct dependencies and
 HA core's ``package_constraints.txt``: where HA pins exactly we must admit
 the pin, and where HA is loose we must not pin exactly (the forced in-place
 replacement that tears packages). These tests pin the two rules offline; the
-lockfile CI job runs the script against the live constraints of the HA
+Fast Checks CI lane runs the script against the live constraints of the HA
 version the e2e lanes test.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -27,7 +28,7 @@ _CONSTRAINTS_SAMPLE = """
 websockets>=15.0.1
 httpx==0.28.1
 PyJWT==2.12.1
-grpcio==1.72.1;python_version<'3.14'
+grpcio==1.72.1;python_version>='3.11'
 not a requirement line
 """
 
@@ -95,29 +96,193 @@ class TestRepoPyprojectIsAligned:
     Uses a constraints sample frozen from the HA release the suite pins
     (HA_TEST_IMAGE / HA_IMAGE_GHCR), covering the packages ha-mcp actually
     shares with HA — the live check against that same version runs in CI
-    (lockfile job), where drift on either side should fail the PR that
-    introduces it, not this offline test.
+    (the Fast Checks lane), where drift on either side should fail the PR
+    that introduces it, not this offline test.
     """
 
     def test_current_pyproject_has_no_violations(self):
         dependencies = checker.direct_dependencies(
             (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
         )
-        # Verbatim from homeassistant/package_constraints.txt @ 2026.8.0.
-        frozen_2026_8_0 = "\n".join(
+        # Verbatim from homeassistant/package_constraints.txt @ 2026.9.0.
+        frozen_2026_9_0 = "\n".join(
             [
                 "websockets>=15.0.1",
                 "httpx==0.28.1",
                 "pydantic==2.13.4",
                 "cryptography==48.0.1",
                 "packaging>=23.1",
-                "typing-extensions>=4.15.0,<5.0",
+                "typing-extensions>=4.16.0,<5.0",
             ]
         )
         violations = checker.check_alignment(
-            dependencies, checker.parse_requirement_lines(frozen_2026_8_0)
+            dependencies, checker.parse_requirement_lines(frozen_2026_9_0)
         )
         assert violations == []
+
+
+_LOCK_SAMPLE = """
+version = 1
+
+[[package]]
+name = "ha-mcp"
+version = "1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "pydantic", extra = ["email"] },
+    { name = "httpx" },
+]
+
+[package.dev-dependencies]
+dev = [{ name = "openai" }]
+
+[[package]]
+name = "pydantic"
+version = "2.13.5"
+dependencies = [{ name = "pydantic-core" }]
+
+[package.optional-dependencies]
+email = [{ name = "email-validator" }]
+
+[[package]]
+name = "pydantic-core"
+version = "2.46.5"
+
+[[package]]
+name = "email-validator"
+version = "2.3.0"
+
+[[package]]
+name = "httpx"
+version = "0.28.1"
+dependencies = [{ name = "httpx" }]
+
+[[package]]
+name = "openai"
+version = "3.37.0"
+"""
+
+
+class TestLockAlignment:
+    def test_closure_follows_extras_and_leaves_out_dev_tools(self):
+        locked = checker.locked_runtime_versions(_LOCK_SAMPLE)
+        assert locked == {
+            "pydantic": "2.13.5",
+            "pydantic-core": "2.46.5",
+            "email-validator": "2.3.0",
+            "httpx": "0.28.1",
+        }
+
+    def test_runtime_package_off_ha_pin_names_the_sync_command(self):
+        violations = checker.check_lock_alignment(
+            checker.locked_runtime_versions(_LOCK_SAMPLE),
+            checker.parse_requirement_lines("pydantic==2.14.1\nhttpx==0.28.1\n"),
+        )
+        assert len(violations) == 1
+        assert "pydantic==2.14.1" in violations[0]
+        assert "--sync-lock" in violations[0]
+
+    def test_dev_tool_off_ha_pin_is_not_a_violation(self):
+        violations = checker.check_lock_alignment(
+            checker.locked_runtime_versions(_LOCK_SAMPLE),
+            checker.parse_requirement_lines("openai==3.26.0\n"),
+        )
+        assert violations == []
+
+    def test_loose_ha_constraint_does_not_bind_the_lock(self):
+        violations = checker.check_lock_alignment(
+            checker.locked_runtime_versions(_LOCK_SAMPLE),
+            checker.parse_requirement_lines("pydantic>=2\n"),
+        )
+        assert violations == []
+
+    def test_main_fails_on_lock_drift_only_when_lock_is_given(self, tmp_path):
+        lock = tmp_path / "uv.lock"
+        lock.write_text(_LOCK_SAMPLE, encoding="utf-8")
+        constraints = tmp_path / "cons.txt"
+        constraints.write_text("pydantic-core==2.50.1\n", encoding="utf-8")
+        assert checker.main(["--constraints-file", str(constraints)]) == 0
+        assert (
+            checker.main(["--constraints-file", str(constraints), "--lock", str(lock)])
+            == 1
+        )
+
+    def test_lock_missing_a_referenced_package_exits_two(self, tmp_path):
+        """An unreadable lock is not a constraint violation (exit 1)."""
+        lock = tmp_path / "uv.lock"
+        lock.write_text(
+            '[[package]]\nname = "ha-mcp"\nversion = "1.0"\n'
+            'dependencies = [{ name = "missing" }]\n',
+            encoding="utf-8",
+        )
+        constraints = tmp_path / "cons.txt"
+        constraints.write_text("pydantic==2.14.1\n", encoding="utf-8")
+        assert (
+            checker.main(["--constraints-file", str(constraints), "--lock", str(lock)])
+            == 2
+        )
+
+
+class TestSyncLock:
+    def test_relocks_each_runtime_package_onto_ha_pin(self, tmp_path, monkeypatch):
+        lock = tmp_path / "uv.lock"
+        lock.write_text(_LOCK_SAMPLE, encoding="utf-8")
+        commands: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            lock.write_text(
+                _LOCK_SAMPLE.replace('version = "2.13.5"', 'version = "2.14.1"'),
+                encoding="utf-8",
+            )
+
+        monkeypatch.setattr(checker.subprocess, "run", fake_run)
+        constraints = checker.parse_requirement_lines(
+            "pydantic==2.14.1\nopenai==3.26.0\nhttpx==0.28.1\n"
+        )
+        assert checker.sync_lock(lock, constraints) == 0
+        assert commands == [["uv", "lock", "--upgrade-package", "pydantic==2.14.1"]]
+
+    def test_reports_a_pin_the_relock_could_not_reach(self, tmp_path, monkeypatch):
+        lock = tmp_path / "uv.lock"
+        lock.write_text(_LOCK_SAMPLE, encoding="utf-8")
+        monkeypatch.setattr(checker.subprocess, "run", lambda *a, **k: None)
+        constraints = checker.parse_requirement_lines("pydantic==2.14.1\n")
+        assert checker.sync_lock(lock, constraints) == 1
+
+    def test_aligned_lock_is_left_alone(self, tmp_path, monkeypatch):
+        lock = tmp_path / "uv.lock"
+        lock.write_text(_LOCK_SAMPLE, encoding="utf-8")
+
+        def fail_run(*args, **kwargs):
+            raise AssertionError("uv lock ran on an aligned lock")
+
+        monkeypatch.setattr(checker.subprocess, "run", fail_run)
+        constraints = checker.parse_requirement_lines("pydantic==2.13.5\n")
+        assert checker.sync_lock(lock, constraints) == 0
+
+    def test_failed_relock_exits_two(self, tmp_path, monkeypatch):
+        lock = tmp_path / "uv.lock"
+        lock.write_text(_LOCK_SAMPLE, encoding="utf-8")
+
+        def failing_run(command, **kwargs):
+            raise checker.subprocess.CalledProcessError(1, command)
+
+        monkeypatch.setattr(checker.subprocess, "run", failing_run)
+        constraints = checker.parse_requirement_lines("pydantic==2.14.1\n")
+        assert checker.sync_lock(lock, constraints) == 2
+
+    def test_dev_group_core_pins_follow_the_e2e_image(self):
+        """Renovate moves all three together; uv.lock is checked against this Core."""
+        image = re.search(
+            r'^_DEFAULT_HA_TEST_IMAGE = "ghcr\.io/home-assistant/home-assistant:(.+)"$',
+            (_REPO_ROOT / "tests" / "test_constants.py").read_text(encoding="utf-8"),
+            re.M,
+        )
+        assert image is not None
+        pyproject = (_REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+        assert checker.dev_group_core_version(pyproject) == image.group(1)
+        assert f'"pytest-homeassistant=={image.group(1)}"' in pyproject
 
 
 class TestMarkerAndOperatorHandling:
@@ -151,7 +316,7 @@ class TestMarkerAndOperatorHandling:
 
 
 class TestMainExitCodes:
-    """The lockfile CI job invokes main(); its exit codes are the contract."""
+    """The Fast Checks CI lane invokes main(); its exit codes are the contract."""
 
     def test_clean_alignment_exits_zero(self, tmp_path):
         constraints = tmp_path / "cons.txt"
@@ -159,9 +324,9 @@ class TestMainExitCodes:
         assert checker.main(["--constraints-file", str(constraints)]) == 0
 
     def test_violation_exits_one(self, tmp_path):
-        # HA pinning fastmcp to a version our exact pin excludes -> rule 1.
+        # HA pinning python-dotenv to a version our exact pin excludes -> rule 1.
         constraints = tmp_path / "cons.txt"
-        constraints.write_text("fastmcp==0.0.1\n", encoding="utf-8")
+        constraints.write_text("python-dotenv==0.0.1\n", encoding="utf-8")
         assert checker.main(["--constraints-file", str(constraints)]) == 1
 
     def test_unparseable_constraints_exit_two(self, tmp_path):
@@ -173,17 +338,18 @@ class TestMainExitCodes:
 class TestFetchFailurePath:
     """The fetch budget the CI job's timeout is sized against.
 
-    pr.yml raised the lockfile job to 5 minutes and treats
+    pr.yml runs this check as a step of the Fast Checks lane and treats
     EXIT_CONSTRAINTS_UNREACHABLE as a fail-open warning on the reasoning
-    that a fetch failure resolves FAST and distinctly. Restoring a long
-    timeout or a trailing sleep would push the worst case past the job
-    budget, turning that clean exit into an opaque runner kill — the exact
-    outcome the comments say must not happen.
+    that a fetch failure resolves FAST and distinctly. That lane's 15-minute
+    budget is shared with every other fast check, so restoring a long timeout
+    or a trailing sleep would push the worst case past it, turning that clean
+    exit into an opaque runner kill — the exact outcome the comments say must
+    not happen.
     """
 
     def _patch_fetch(self, monkeypatch, *, sleeps, attempts):
         def boom(*_args, **_kwargs):
-            attempts.append(1)
+            attempts.append(len(sleeps))  # waits taken before this attempt
             raise checker.urllib.error.URLError("network down")
 
         monkeypatch.setattr(checker.urllib.request, "urlopen", boom)
@@ -239,6 +405,7 @@ class TestFetchFailurePath:
         limit — the exact outcome the sentinel exists to prevent.
         """
         attempts: list[int] = []
+        sleeps: list[float] = []
 
         def throttled(*_args, **_kwargs):
             attempts.append(1)
@@ -247,24 +414,26 @@ class TestFetchFailurePath:
             )
 
         monkeypatch.setattr(checker.urllib.request, "urlopen", throttled)
-        monkeypatch.setattr(checker.time, "sleep", lambda _s: None)
+        monkeypatch.setattr(checker.time, "sleep", sleeps.append)
 
         assert (
             checker.main(["--ha-version", "2026.8.0"])
             == checker.EXIT_CONSTRAINTS_UNREACHABLE
         )
         assert len(attempts) == checker._FETCH_ATTEMPTS
+        assert len(sleeps) == checker._FETCH_ATTEMPTS - 1
 
     def test_exactly_three_attempts_with_no_trailing_sleep(self, monkeypatch):
         sleeps: list[float] = []
         attempts: list[int] = []
         self._patch_fetch(monkeypatch, sleeps=sleeps, attempts=attempts)
         checker.main(["--ha-version", "2026.8.0"])
-        assert len(attempts) == checker._FETCH_ATTEMPTS == 3
+        assert attempts == [0, 1, 2], "each retry follows one more wait"
         assert len(sleeps) == checker._FETCH_ATTEMPTS - 1, (
             "a sleep after the final attempt is pure waste and pushes the "
             "worst case toward the job timeout"
         )
+        assert all(delay > 0 for delay in sleeps), "a retry must wait"
 
     def test_worst_case_fits_well_inside_the_job_timeout(self):
         budget = checker._FETCH_ATTEMPTS * checker._FETCH_TIMEOUT_SECONDS + sum(
@@ -272,9 +441,9 @@ class TestFetchFailurePath:
             for n in range(checker._FETCH_ATTEMPTS - 1)
         )
         assert budget <= 60, (
-            f"worst-case fetch is {budget}s; the lockfile job also checks the "
-            "lockfile and resolves packages, so keep this well under its "
-            "timeout-minutes or exit 2 becomes an opaque kill"
+            f"worst-case fetch is {budget}s; the Fast Checks lane shares one "
+            "timeout-minutes across every fast check, so keep this well under "
+            "it or the fail-open exit becomes an opaque kill"
         )
 
     def test_unreadable_local_file_exits_two(self, tmp_path):

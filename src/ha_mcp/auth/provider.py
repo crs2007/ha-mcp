@@ -16,18 +16,23 @@ import os
 import secrets
 import time
 from base64 import urlsafe_b64decode, urlsafe_b64encode
-from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
-from fastmcp.server.auth.auth import (
+from pydantic import AnyHttpUrl, Field, ValidationError
+from starlette.requests import Request
+from starlette.responses import HTMLResponse, RedirectResponse, Response
+from starlette.routing import Route
+from starlette.types import ASGIApp
+
+from ha_mcp._vendor.fastmcp.server.auth.auth import (
     AccessToken,  # FastMCP version has claims field
     ClientRegistrationOptions,
     OAuthProvider,
     RevocationOptions,
 )
-from mcp.server.auth.provider import (
+from ha_mcp._vendor.mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
     AuthorizeError,
@@ -35,28 +40,31 @@ from mcp.server.auth.provider import (
     TokenError,
     construct_redirect_uri,
 )
-from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
-from pydantic import AnyHttpUrl, ValidationError
-from starlette.requests import Request
-from starlette.responses import HTMLResponse, RedirectResponse, Response
-from starlette.routing import Route
+from ha_mcp._vendor.mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 
 from ..utils.data_paths import get_data_dir
 from .consent_form import create_consent_html, create_error_html
+from .iss_stamp import StampIssOnErrorRedirects
 
 logger = logging.getLogger(__name__)
 
-# Token expiration times
-AUTH_CODE_EXPIRY_SECONDS = 5 * 60  # 5 minutes
-ACCESS_TOKEN_EXPIRY_SECONDS = 60 * 60  # 1 hour
-REFRESH_TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60  # 7 days
+# Expiry windows
+PENDING_AUTHORIZATION_EXPIRY_SECONDS = 5 * 60  # window to submit the consent form
+AUTH_CODE_EXPIRY_SECONDS = 5 * 60
+ACCESS_TOKEN_EXPIRY_SECONDS = 60 * 60
+REFRESH_TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60
 
 
-class HomeAssistantCredentials:
-    """Temporary HA credentials held between consent form and token exchange."""
+class HomeAssistantAuthorizationCode(AuthorizationCode):
+    """Authorization code carrying the LLAT the consent form bound to it.
 
-    def __init__(self, ha_token: str):
-        self.ha_token = ha_token
+    The token travels with the code rather than in a per-client store so that
+    two consent submissions for the same client can never hand one submitter's
+    credential to the other at the token endpoint.
+    """
+
+    # repr=False keeps the secret out of logs and tracebacks that print the code.
+    ha_token: str = Field(repr=False, min_length=1)
 
 
 class HomeAssistantOAuthProvider(OAuthProvider):
@@ -132,12 +140,10 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         # DCR client registry — persisted to disk so clients survive restarts.
         self.clients: dict[str, OAuthClientInformationFull] = self._load_clients()
 
-        # Short-lived in-memory state (no persistence needed or wanted)
-        self.auth_codes: dict[str, AuthorizationCode] = {}
-
-        # Home Assistant credentials storage (keyed by client_id)
-        # Temporary: only held between consent form submission and token exchange
-        self.ha_credentials: dict[str, HomeAssistantCredentials] = {}
+        # Short-lived in-memory state (no persistence needed or wanted). Each
+        # code carries the LLAT submitted for it, held until exchanged or
+        # evicted as expired.
+        self.auth_codes: dict[str, HomeAssistantAuthorizationCode] = {}
 
         # Pending authorization requests (for consent form flow)
         self.pending_authorizations: dict[str, dict[str, Any]] = {}
@@ -396,11 +402,8 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         params.append(("iss", self._issuer()))
         return urlunparse(parsed._replace(query=urlencode(params)))
 
-    def _wrap_authorize_with_iss(
-        self, endpoint: "Callable[[Request], Awaitable[Response]]"
-    ) -> "Callable[[Request], Awaitable[Response]]":
-        """Wrap the SDK's ``/authorize`` endpoint to stamp ``iss`` on its
-        error redirects.
+    def _wrap_authorize_with_iss(self, endpoint: ASGIApp) -> ASGIApp:
+        """Wrap the SDK's ``/authorize`` app to stamp ``iss`` on its error redirects.
 
         The SDK's ``AuthorizationHandler`` builds OAuth error authorization
         responses (invalid scope, ``authorize()`` raising after redirect-URI
@@ -409,27 +412,16 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         is a same-origin redirect to the consent form (no ``error``), which is
         not an authorization response and stays untouched.
         """
-
-        async def authorize_with_iss(request: Request) -> Response:
-            response: Response = await endpoint(request)
-            location = response.headers.get("location", "")
-            if (
-                response.status_code in (302, 303, 307)
-                and location
-                and "error" in parse_qs(urlparse(location).query)
-            ):
-                response.headers["location"] = self._ensure_single_iss(location)
-            return response
-
-        return authorize_with_iss
+        return StampIssOnErrorRedirects(endpoint, self._ensure_single_iss)
 
     def get_routes(self, mcp_path: str | None = None) -> list[Route]:
         """
         Get OAuth routes including custom consent form routes.
 
         This extends the base OAuth routes with:
-        - GET /authorize - Shows the consent form
-        - POST /authorize - Handles consent form submission
+        - /authorize - the SDK handler, its error redirects stamped with ``iss``;
+          success redirects to /consent
+        - GET/POST /consent - the consent form and its submission
         - Custom /.well-known/oauth-authorization-server with enhanced metadata
         """
         # Get base OAuth routes
@@ -442,7 +434,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
 
         async def enhanced_metadata_handler(request: Request) -> Response:
             """Enhanced OAuth metadata handler with Claude.ai compatibility."""
-            from mcp.server.auth.routes import build_metadata
+            from ha_mcp._vendor.mcp.server.auth.routes import build_metadata
 
             # Get base metadata from MCP SDK
             metadata = build_metadata(
@@ -492,7 +484,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 isinstance(route, Route)
                 and route.path == "/.well-known/oauth-authorization-server"
             ):
-                from mcp.server.auth.routes import cors_middleware
+                from ha_mcp._vendor.mcp.server.auth.routes import cors_middleware
 
                 enhanced_routes.append(
                     Route(
@@ -520,7 +512,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         # ChatGPT expects /.well-known/openid-configuration (OpenID Connect Discovery)
         # in addition to /.well-known/oauth-authorization-server (OAuth 2.1)
         # Per RFC 8414, many servers support both endpoints with identical metadata
-        from mcp.server.auth.routes import cors_middleware
+        from ha_mcp._vendor.mcp.server.auth.routes import cors_middleware
 
         enhanced_routes.append(
             Route(
@@ -611,6 +603,8 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 error_description=f"Client '{client.client_id}' not registered.",
             )
 
+        self._evict_expired(time.time())
+
         # Generate a unique transaction ID for this authorization
         txn_id = secrets.token_urlsafe(32)
 
@@ -632,6 +626,49 @@ class HomeAssistantOAuthProvider(OAuthProvider):
 
         logger.debug(f"Redirecting to consent form: {consent_url}")
         return consent_url
+
+    @staticmethod
+    def _pending_expired(pending: dict[str, Any], now: float) -> bool:
+        created_at = float(pending["created_at"])
+        return now - created_at > PENDING_AUTHORIZATION_EXPIRY_SECONDS
+
+    def _evict_expired(self, now: float) -> None:
+        """Drop pending transactions and codes past their expiry.
+
+        A lookup only drops the one expired entry it finds, so an abandoned
+        consent form, or an unredeemed code and its LLAT, would otherwise stay
+        in memory for the life of the process.
+        """
+        stale_txns = [
+            txn_id
+            for txn_id, pending in self.pending_authorizations.items()
+            if self._pending_expired(pending, now)
+        ]
+        for txn_id in stale_txns:
+            del self.pending_authorizations[txn_id]
+        stale_codes = [
+            code for code, auth in self.auth_codes.items() if auth.expires_at < now
+        ]
+        for code in stale_codes:
+            del self.auth_codes[code]
+        if stale_txns or stale_codes:
+            logger.debug(
+                "Evicted %d expired consent transactions and %d expired "
+                "authorization codes",
+                len(stale_txns),
+                len(stale_codes),
+            )
+
+    def _reject_expired_pending(self, txn_id: str) -> Response:
+        """Drop the expired transaction and render the expired-request page."""
+        del self.pending_authorizations[txn_id]
+        return HTMLResponse(
+            create_error_html(
+                "expired_request",
+                "Authorization request has expired. Please start over.",
+            ),
+            status_code=400,
+        )
 
     async def _consent_get(self, request: Request) -> Response:
         """Handle GET request to consent form."""
@@ -657,16 +694,8 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 status_code=400,
             )
 
-        # Check if authorization request is expired (5 minutes)
-        if time.time() - pending["created_at"] > 300:
-            del self.pending_authorizations[txn_id]
-            return HTMLResponse(
-                create_error_html(
-                    "expired_request",
-                    "Authorization request has expired. Please start over.",
-                ),
-                status_code=400,
-            )
+        if self._pending_expired(pending, time.time()):
+            return self._reject_expired_pending(txn_id)
 
         redirect_uri = pending.get("redirect_uri", "")
         if not redirect_uri:
@@ -690,12 +719,17 @@ class HomeAssistantOAuthProvider(OAuthProvider):
 
     async def _consent_post(self, request: Request) -> Response:
         """Handle POST request from consent form."""
-        logger.info("=== CONSENT FORM POST RECEIVED ===")
         form = await request.form()
 
         txn_id = form.get("txn_id")
         ha_token = form.get("ha_token")
-        logger.info(f"Form data: txn_id={txn_id}, has_token={ha_token is not None}")
+        # The txn_id stays out of the log: it is what binds a submitted LLAT
+        # to the code the client receives.
+        logger.debug(
+            "Consent form submitted (has_txn=%s, has_token=%s)",
+            txn_id is not None,
+            ha_token is not None,
+        )
 
         if not txn_id:
             return HTMLResponse(
@@ -705,8 +739,9 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 ),
                 status_code=400,
             )
+        txn_id = str(txn_id)
 
-        pending = self.pending_authorizations.get(str(txn_id))
+        pending = self.pending_authorizations.get(txn_id)
         if not pending:
             return HTMLResponse(
                 create_error_html(
@@ -716,7 +751,11 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 status_code=400,
             )
 
-        if not ha_token:
+        if self._pending_expired(pending, time.time()):
+            return self._reject_expired_pending(txn_id)
+
+        # A multipart upload in the token field is not a token.
+        if not isinstance(ha_token, str) or not ha_token.strip():
             # Redirect back to form with error
             base = str(self.base_url).rstrip("/")
             error_params = urlencode(
@@ -730,15 +769,9 @@ class HomeAssistantOAuthProvider(OAuthProvider):
                 status_code=303,
             )
 
-        # Store credentials (no server-side validation - the token will be
-        # validated on first actual API call to the configured HA instance)
+        # The token is not validated here; the first API call to the
+        # configured HA instance does that. It is bound to this code alone.
         client_id = pending["client_id"]
-        self.ha_credentials[client_id] = HomeAssistantCredentials(
-            ha_token=str(ha_token),
-        )
-        logger.info(f"Stored HA credentials for client {client_id}")
-
-        # Generate authorization code
         auth_code_value = f"ha_auth_code_{secrets.token_hex(16)}"
         expires_at = time.time() + AUTH_CODE_EXPIRY_SECONDS
 
@@ -746,7 +779,7 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         if isinstance(scopes_list, str):
             scopes_list = scopes_list.split()
 
-        auth_code = AuthorizationCode(
+        auth_code = HomeAssistantAuthorizationCode(
             code=auth_code_value,
             client_id=client_id,
             redirect_uri=AnyHttpUrl(pending["redirect_uri"]),
@@ -756,11 +789,12 @@ class HomeAssistantOAuthProvider(OAuthProvider):
             scopes=scopes_list,
             expires_at=expires_at,
             code_challenge=pending.get("code_challenge"),  # type: ignore[arg-type]  # None is valid per PKCE spec (RFC 7636 §4.3); empty string would break validation
+            ha_token=ha_token.strip(),
         )
         self.auth_codes[auth_code_value] = auth_code
 
         # Clean up pending authorization
-        del self.pending_authorizations[str(txn_id)]
+        del self.pending_authorizations[txn_id]
 
         # Redirect back to client with auth code. RFC 9207: the authorization
         # response carries the issuer that produced it, so a client registered
@@ -798,45 +832,34 @@ class HomeAssistantOAuthProvider(OAuthProvider):
         self, client: OAuthClientInformationFull, authorization_code: AuthorizationCode
     ) -> OAuthToken:
         """Exchange authorization code for stateless access and refresh tokens."""
-        if authorization_code.code not in self.auth_codes:
+        # Consume the auth code. The parameter is typed as the SDK's
+        # AuthorizationCode; the stored copy is the one carrying the LLAT.
+        stored = self.auth_codes.pop(authorization_code.code, None)
+        if stored is None:
             raise TokenError(
                 "invalid_grant", "Authorization code not found or already used."
             )
 
-        # Consume the auth code
-        del self.auth_codes[authorization_code.code]
-
         if client.client_id is None:
             raise TokenError("invalid_client", "Client ID is required")
 
-        # Get HA credentials for this client to encode in token
-        ha_credentials = self.ha_credentials.get(client.client_id)
-        if not ha_credentials:
-            raise TokenError(
-                "invalid_client",
-                f"No Home Assistant credentials found for client {client.client_id}",
-            )
-
-        scopes = authorization_code.scopes
+        scopes = stored.scopes
         access_token_expires_at = int(time.time() + ACCESS_TOKEN_EXPIRY_SECONDS)
         refresh_token_expires_at = int(time.time() + REFRESH_TOKEN_EXPIRY_SECONDS)
 
         # Both tokens are stateless — no server-side storage needed.
         access_token_value = self._encode_token(
-            ha_credentials.ha_token,
+            stored.ha_token,
             token_type="access",
             expires_at=access_token_expires_at,
         )
         refresh_token_value = self._encode_token(
-            ha_credentials.ha_token,
+            stored.ha_token,
             token_type="refresh",
             client_id=client.client_id,
             scopes=scopes,
             expires_at=refresh_token_expires_at,
         )
-
-        # Clean up temporary credentials (no longer needed after token issued)
-        self.ha_credentials.pop(client.client_id, None)
 
         logger.info(f"Issued stateless tokens for client {client.client_id}")
 
@@ -981,11 +1004,3 @@ class HomeAssistantOAuthProvider(OAuthProvider):
             "Token revocation requested (no-op for stateless tokens; "
             "revoke the LLAT in Home Assistant to invalidate)"
         )
-
-    def get_ha_credentials(self, client_id: str) -> HomeAssistantCredentials | None:
-        """Get temporarily stored HA credentials for a client.
-
-        Only valid between consent form submission and token exchange.
-        After token issuance, credentials are deleted from this store.
-        """
-        return self.ha_credentials.get(client_id)

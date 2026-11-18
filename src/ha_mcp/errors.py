@@ -10,8 +10,13 @@ The structured error format enables AI agents to:
 - Understand the context and details of failures
 """
 
+import logging
 from enum import StrEnum
 from typing import Any
+
+# Level FastMCP logs ha-mcp's ToolErrors at: user-facing failures, not server
+# bugs. A ToolError built without it logs at FastMCP's default, ERROR.
+TOOL_ERROR_LOG_LEVEL = logging.WARNING
 
 
 class ErrorCode(StrEnum):
@@ -32,7 +37,6 @@ class ErrorCode(StrEnum):
     # Connection errors
     CONNECTION_FAILED = "CONNECTION_FAILED"
     CONNECTION_TIMEOUT = "CONNECTION_TIMEOUT"
-    WEBSOCKET_DISCONNECTED = "WEBSOCKET_DISCONNECTED"
     WEBSOCKET_NOT_AUTHENTICATED = "WEBSOCKET_NOT_AUTHENTICATED"
 
     # Authentication errors
@@ -100,6 +104,16 @@ class ErrorCode(StrEnum):
     USER_DENIED = "USER_DENIED"
     POLICY_LOAD_FAILED = "POLICY_LOAD_FAILED"
 
+    # Distinct from POLICY_LOAD_FAILED above: the policy file itself loaded
+    # fine, but this call's own arguments were too deeply nested to
+    # evaluate against it safely (see normalize_stringified_containers'
+    # RecursionError handling in middleware.py). A different failure with a
+    # different, caller-shaped remedy ("reduce the nesting depth and
+    # retry") -- sharing POLICY_LOAD_FAILED would make the two
+    # indistinguishable to anything grouping on the code (a dashboard, an
+    # operator grepping logs after "my policy broke").
+    POLICY_ARGS_TOO_DEEPLY_NESTED = "POLICY_ARGS_TOO_DEEPLY_NESTED"
+
     # Read Only Mode (discussion #1569). A write operation was blocked
     # because the server-wide Read Only Mode toggle is on.
     READ_ONLY_MODE = "READ_ONLY_MODE"
@@ -136,11 +150,6 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
         "Home Assistant may be overloaded or slow to respond",
         "Check network latency to Home Assistant",
         "Try increasing the timeout value if available",
-    ],
-    ErrorCode.WEBSOCKET_DISCONNECTED: [
-        "WebSocket connection was lost",
-        "Check Home Assistant logs for errors",
-        "The operation may need to be retried",
     ],
     ErrorCode.WEBSOCKET_NOT_AUTHENTICATED: [
         "WebSocket connection is not authenticated",
@@ -210,6 +219,10 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
         "Check documentation for required fields",
         "Ensure all required parameters are provided",
     ],
+    ErrorCode.VALIDATION_FAILED: [
+        "Check the parameter values and format against the tool documentation",
+        "Review the message and details fields for the specific constraint that failed",
+    ],
     ErrorCode.VALIDATION_INVALID_JSON: [
         "Ensure the parameter is valid JSON",
         "Check for syntax errors in JSON",
@@ -230,7 +243,10 @@ DEFAULT_SUGGESTIONS: dict[ErrorCode, list[str]] = {
         "Report this issue if it persists",
     ],
     ErrorCode.COMPONENT_NOT_INSTALLED: [
-        "Install the required custom component via HACS",
+        (
+            "Install the required custom component via HACS (the Marketplace on "
+            "Home Assistant 2026.11+)"
+        ),
         "Restart Home Assistant after installation",
     ],
 }
@@ -291,7 +307,8 @@ def create_error_response(
         # Include first suggestion as primary, all suggestions in list
         error_dict["suggestion"] = error_suggestions[0]
         if len(error_suggestions) > 1:
-            error_dict["suggestions"] = error_suggestions
+            # A copy: the defaults are module-level lists shared by every call.
+            error_dict["suggestions"] = list(error_suggestions)
 
     response: dict[str, Any] = {
         "success": False,
@@ -310,11 +327,34 @@ def create_connection_error(
     details: str | None = None,
     timeout: bool = False,
     context: dict[str, Any] | None = None,
+    suggestions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Create a connection error response."""
-    code = ErrorCode.CONNECTION_TIMEOUT if timeout else ErrorCode.CONNECTION_FAILED
-    return create_error_response(code, message, details, context=context)
+    """Create a connection error response.
 
+    ``suggestions`` overrides ``DEFAULT_SUGGESTIONS[CONNECTION_FAILED/TIMEOUT]``
+    (network/URL/connectivity checks) for a caller whose failure is
+    CONNECTION_FAILED-shaped (unavailable, not the caller's fault to fix by
+    editing input) but not actually a network problem — e.g. malformed local
+    registry data or an unloadable local config file, where "check your
+    HOMEASSISTANT_URL" is not an actionable next step.
+    """
+    code = ErrorCode.CONNECTION_TIMEOUT if timeout else ErrorCode.CONNECTION_FAILED
+    return create_error_response(
+        code, message, details, suggestions=suggestions, context=context
+    )
+
+
+# The in-process server (HA-MCP integration) runs with an administrator token
+# saved in its config entry (#2427), not a HOMEASSISTANT_TOKEN.
+_EMBEDDED_AUTH_INVALID_SUGGESTIONS: list[str] = [
+    "Home Assistant no longer accepts the administrator access token saved in "
+    + "the HA-MCP Server entry: it was revoked, or its account was deactivated "
+    + "or is no longer an administrator",
+    "Replace it under Settings -> Devices & services -> HA-MCP Server -> "
+    + "Configure -> Replace the administrator access token",
+    "Or reload the HA-MCP Server entry: it then stops the server and files a "
+    + "repair that asks for a new token",
+]
 
 # Authentication-error suggestions for Home Assistant add-on installs. On the
 # add-on the token is managed by the Supervisor, not a user-editable
@@ -357,9 +397,11 @@ def create_auth_error(
         # Lazy import keeps this low-level module free of an import-time
         # dependency on ._version; is_running_in_addon reads SUPERVISOR_TOKEN
         # live so it reflects the current environment.
-        from ._version import is_running_in_addon
+        from ._version import is_embedded, is_running_in_addon
 
-        if is_running_in_addon():
+        if is_embedded():
+            suggestions = _EMBEDDED_AUTH_INVALID_SUGGESTIONS
+        elif is_running_in_addon():
             suggestions = _ADDON_AUTH_INVALID_SUGGESTIONS
 
     return create_error_response(
@@ -377,6 +419,36 @@ def create_entity_not_found_error(
         f"Entity '{entity_id}' not found",
         details=details or f"No entity with ID '{entity_id}' exists in Home Assistant",
         context={"entity_id": entity_id},
+    )
+
+
+def create_entity_unavailable_after_dispatch_error(entity_id: str) -> dict[str, Any]:
+    """Create an ENTITY_UNAVAILABLE error for a target whose command already dispatched.
+
+    Distinct from a bare "unavailable" report: by the time this fires, the
+    confirmation wait has already lapsed, which only happens AFTER the
+    service call reached Home Assistant. The caller must not read this as
+    "the command never went out" and blindly retry a non-idempotent service
+    (e.g. ``toggle``) — that would double-apply a write that may have already
+    landed. ``context["dispatched"]`` makes that explicit for a caller that
+    only inspects structured fields rather than the message.
+    """
+    return create_error_response(
+        ErrorCode.ENTITY_UNAVAILABLE,
+        f"Entity '{entity_id}' exists but is currently unavailable",
+        details=(
+            f"The service call for '{entity_id}' was already dispatched to Home "
+            "Assistant -- it may have taken effect even though the entity's "
+            "state could not be confirmed within the timeout."
+        ),
+        suggestions=[
+            "The command was already sent -- check the entity's current state "
+            + "with ha_get_state before retrying",
+            "Avoid re-issuing a non-idempotent service (e.g. toggle) that could "
+            + "double-apply if the original command did land",
+            "Check if the device is powered on and connected",
+        ],
+        context={"entity_id": entity_id, "dispatched": True},
     )
 
 
@@ -406,6 +478,7 @@ def create_validation_error(
     details: str | None = None,
     invalid_json: bool = False,
     context: dict[str, Any] | None = None,
+    suggestions: list[str] | None = None,
 ) -> dict[str, Any]:
     """Create a validation error response."""
     code = (
@@ -420,7 +493,11 @@ def create_validation_error(
     if parameter:
         final_context["parameter"] = parameter
     return create_error_response(
-        code, message, details, context=final_context if final_context else None
+        code,
+        message,
+        details,
+        suggestions=suggestions,
+        context=final_context if final_context else None,
     )
 
 

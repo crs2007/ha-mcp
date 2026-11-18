@@ -5,6 +5,7 @@ The ``(edits, diff)`` path maps exceptions raised by
 
     FileNotFoundError         -> RESOURCE_NOT_FOUND
     (ValueError, LookupError) -> VALIDATION_INVALID_PARAMETER
+    TodoListNotLoaded         -> ENTITY_UNAVAILABLE
     ToolError                 -> re-raised unchanged (guard-pattern passthrough)
     any other Exception       -> exception_to_structured_error (INTERNAL_ERROR here)
 
@@ -22,53 +23,32 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastmcp.exceptions import ToolError
 
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp.backup_todo import TodoListNotLoaded
 from ha_mcp.errors import ErrorCode
+
+from ._backup_restore_helpers import _backup_settings as _backup_settings
+from ._backup_restore_helpers import _dispatcher as _dispatcher
 
 # A well-formed auto-backup name so the pre-dispatch ``_require`` guard passes
 # and control reaches the ``diff_snapshot`` call under test.
 _BNAME = "automation.kitchen_lights.20260521_153000.yaml"
 
 
-def _dispatcher() -> Any:
-    """Resolve the raw ``ha_manage_backup`` closure from the ``@tool`` stack.
-
-    Mirrors the addon-tool tests: a fake ``mcp`` captures the decorated
-    function, then ``__wrapped__`` is unwound past ``@log_tool_usage`` so the
-    dispatcher is called directly, bypassing the FastMCP transport.
-    """
-    from ha_mcp.tools.backup import register_backup_tools
-
-    captured: dict[str, Any] = {}
-
-    class _MockMCP:
-        def tool(self, *args: Any, **kwargs: Any) -> Any:
-            def deco(fn: Any) -> Any:
-                captured.setdefault(fn.__name__, fn)
-                return fn
-
-            return deco
-
-    register_backup_tools(_MockMCP(), MagicMock())
-    fn = captured["ha_manage_backup"]
-    while hasattr(fn, "__wrapped__"):
-        fn = fn.__wrapped__
-    return fn
-
-
 def _patched(diff_exc: BaseException) -> tuple[Any, Any]:
     """Patch the ``scope="edits"`` dispatch seams.
 
-    ``settings`` is irrelevant to the diff path (it is threaded through but
-    unused by ``_edits_diff``), so a bare ``MagicMock`` suffices;
+    Real settings keep the dispatcher's access checks representative;
     ``get_backup_manager`` yields a manager whose ``diff_snapshot`` raises
     ``diff_exc``.
     """
     mgr = MagicMock()
     mgr.diff_snapshot = AsyncMock(side_effect=diff_exc)
     return (
-        patch("ha_mcp.tools.backup.get_global_settings", return_value=MagicMock()),
+        patch(
+            "ha_mcp.tools.backup.get_global_settings", return_value=_backup_settings()
+        ),
         patch("ha_mcp.tools.backup.get_backup_manager", return_value=mgr),
     )
 
@@ -93,6 +73,11 @@ def _patched(diff_exc: BaseException) -> tuple[Any, Any]:
             LookupError("missing key"),
             ErrorCode.VALIDATION_INVALID_PARAMETER,
             id="lookup_error_to_validation",
+        ),
+        pytest.param(
+            TodoListNotLoaded("todo.tasks"),
+            ErrorCode.ENTITY_UNAVAILABLE,
+            id="todo_list_not_loaded_to_entity_unavailable",
         ),
         # A neutral message ("boom" matches no keyword bucket in
         # _classify_by_message) so the generic funnel lands on INTERNAL_ERROR

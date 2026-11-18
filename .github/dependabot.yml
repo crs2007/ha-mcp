@@ -45,12 +45,75 @@ updates:
       # single-shot `Monty(code, ...)` + `run_async(external_functions=...)`
       # API with a subprocess worker pool (`AsyncMonty` -> `checkout()` ->
       # `feed_run(external_lookup=...)`), which breaks every code path in
-      # src/ha_mcp/tools/tools_code.py. FastMCP's own code-mode extra still
-      # pins ==0.0.17 for the same reason, so nothing in the ecosystem is
-      # pulling us forward. Monty is 0.0.x, so every release is a patch by
-      # semver and there is no narrower update-type that holds the line.
+      # src/ha_mcp/tools/tools_code.py. The FastMCP version we vendor pins
+      # ==0.0.18 for its code-mode extra as well, so nothing is pulling us
+      # forward. Monty is 0.0.x, so every release is a patch by semver and
+      # there is no narrower update-type that holds the line.
       # Drop this entry when tools_code.py is ported to the pool API.
       - dependency-name: "pydantic-monty"
+      # Renovate moves the dev pin with the version the component installs
+      # (custom_components/ha_mcp_tools/card_runtime.py) in one update; a
+      # Dependabot bump of the dev pin alone would only fail the unit tests.
+      - dependency-name: "quickjs-ng"
+      # A shared mcp stays on HA Core's 1.x line; ha-mcp's own 2.x SDK is
+      # vendored under src/ha_mcp/_vendor.
+      - dependency-name: "mcp"
+        update-types:
+          - "version-update:semver-major"
+      # The dev group's Core and its test package follow the e2e image's Core
+      # version; Renovate bumps them with the image pin and re-locks.
+      - dependency-name: "homeassistant"
+      - dependency-name: "pytest-homeassistant"
+      # pytest-homeassistant pins these exactly (Core's own test versions), so
+      # they move with it when Renovate bumps Core; a bump of one alone cannot
+      # resolve.
+      - dependency-name: "pytest"
+      - dependency-name: "pytest-asyncio"
+      - dependency-name: "pytest-xdist"
+      # Runtime dependencies Core pins exactly: uv.lock must hold Core's pin
+      # (check_ha_constraint_alignment.py rule 3), so Renovate's Core bump
+      # moves them (uv lock, then --sync-lock) and a Dependabot bump would
+      # only fail Fast Checks.
+      - dependency-name: "anyio"
+      - dependency-name: "cryptography"
+      - dependency-name: "httpx"
+      - dependency-name: "httpx2"
+      - dependency-name: "pydantic"
+      - dependency-name: "pyjwt"
+      - dependency-name: "pyyaml"
+      - dependency-name: "truststore"
+      # Dev pins that equal the dev group Core's integration manifests.
+      # scripts/sync_dev_integration_pins.py rewrites everything between the
+      # markers, and the matching pins in pyproject.toml, when Renovate bumps
+      # Core; a Dependabot bump of one alone would only fail the unit tests.
+      # core-integration-pins:start
+      - dependency-name: "aiohasupervisor"
+      - dependency-name: "aiousbwatcher"
+      - dependency-name: "av"
+      - dependency-name: "gazetteer-matcher"
+      - dependency-name: "ha-silabs-firmware-client"
+      - dependency-name: "hassil"
+      - dependency-name: "home-assistant-frontend"
+      - dependency-name: "home-assistant-intents"
+      - dependency-name: "ical"
+      - dependency-name: "infrared-protocols"
+      - dependency-name: "knx-frontend"
+      - dependency-name: "knx-telegram-store"
+      - dependency-name: "matter-ble-proxy"
+      - dependency-name: "matter-python-client"
+      - dependency-name: "numpy"
+      - dependency-name: "pygbl"
+      - dependency-name: "pyroute2"
+      - dependency-name: "python-otbr-api"
+      - dependency-name: "pyturbojpeg"
+      - dependency-name: "serialx"
+      - dependency-name: "universal-silabs-flasher"
+      - dependency-name: "xknx"
+      - dependency-name: "xknxproject"
+      - dependency-name: "zha"
+      - dependency-name: "zha-quirks"
+      - dependency-name: "zwave-js-server-python"
+      # core-integration-pins:end
     groups:
       # Group dev dependencies together
       dev-dependencies:
@@ -66,9 +129,20 @@ updates:
       # Group production dependencies
       production-dependencies:
         patterns:
-          - "fastmcp"
-          - "httpx"
-          - "pydantic"
           - "websockets"
         update-types:
           - "patch"
+
+  # Renovate alone updates src/ha_mcp/_vendor/requirements.txt, because each
+  # pin bump must regenerate its vendored tree (renovate.json). Dependabot
+  # security updates still scan the file and would open a pin-only duplicate
+  # that fails the vendored-tree tests; this entry ignores every dependency
+  # there for both update kinds. The alerts themselves stay on: Renovate's
+  # vulnerabilityAlerts reads them to open its own security PR.
+  - package-ecosystem: "pip"
+    directory: "/src/ha_mcp/_vendor"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    ignore:
+      - dependency-name: "*"

@@ -1,13 +1,13 @@
 """Warning accumulator and skill-reference routing for the best-practice checks.
 
 Split out of :mod:`best_practice_checker` so a check module can emit a warning
-without importing the checker back (AGENTS.md - Module Size). Nothing here
-inspects a config; it only carries warnings and builds the ' See ...' suffix.
+without importing the checker back (see `.gemini/styleguide.md` § Tool
+Consolidation and Module Size). Nothing here inspects a config; it only carries
+warnings and builds the ' See ...' suffix.
 """
 
 _SKILL_URI_PREFIX = "skill://home-assistant-best-practices/references"
 _DEFAULT_SKILL_PREFIX = _SKILL_URI_PREFIX
-_SKILL_NAME = "home-assistant-best-practices"
 
 
 class BestPracticeCheckResult(list[str]):
@@ -43,6 +43,8 @@ def _emit(
     message: str,
     skill_prefix: str | None,
     file_ref: str,
+    *,
+    also_embed: tuple[str, ...] = (),
 ) -> None:
     """Append a warning with the 2-route ' See ...' suffix and track the file.
 
@@ -55,14 +57,19 @@ def _emit(
         file_ref: File path relative to the ``references/`` directory of
             the home-assistant-best-practices skill, optionally with a
             ``#anchor`` suffix
-            (e.g. ``"automation-patterns.md#native-conditions"``). The
+            (e.g. ``"triggers-and-conditions.md#native-conditions"``). The
             anchor is preserved end-to-end: in the ``skill://`` URI for
             display, and in ``referenced_files`` so the auto-embed path
             ships only the matching markdown section instead of the
             whole 10-20 KB reference file.
+        also_embed: Further refs in the ``file_ref`` format, embedded but
+            not cited in the ``See ...`` suffix — for a warning whose
+            message names alternatives that ``file_ref`` does not cover.
     """
     warnings.append(message + _skill_route_suffix(skill_prefix, file_ref))
-    warnings.referenced_files.add(f"references/{file_ref}")
+    warnings.referenced_files.update(
+        f"references/{ref}" for ref in (file_ref, *also_embed)
+    )
 
 
 def _skill_route_suffix(skill_prefix: str | None, file_ref: str) -> str:
@@ -75,7 +82,7 @@ def _skill_route_suffix(skill_prefix: str | None, file_ref: str) -> str:
 
     1. ``skill://`` URI — for clients that auto-fetch resource URIs.
        Anchor preserved.
-    2. ``ha_get_skill_guide(skill=..., file=...)`` — explicit tool call,
+    2. ``ha_get_skill_guide(file=...)``: explicit tool call,
        works on every MCP client. Anchor stripped (the tool reads the
        whole file).
 
@@ -90,6 +97,6 @@ def _skill_route_suffix(skill_prefix: str | None, file_ref: str) -> str:
     bare_file = f"references/{file_ref.split('#', 1)[0]}"
     routes = [
         f"{skill_prefix}/{file_ref}",
-        f"call ha_get_skill_guide(skill={_SKILL_NAME!r}, file={bare_file!r})",
+        f"call ha_get_skill_guide(file={bare_file!r})",
     ]
     return " See " + " | ".join(routes)

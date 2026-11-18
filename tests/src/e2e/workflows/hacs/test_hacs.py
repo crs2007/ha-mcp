@@ -6,7 +6,8 @@ custom integrations, Lovelace cards, themes, and more from the HACS store.
 
 Note: These tests require HACS to be installed in the test environment.
 The test environment includes HACS in custom_components/ with a pre-configured
-config entry.
+config entry. Home Assistant 2026.11+ migrates that entry to the built-in
+Marketplace, which the same tools then drive.
 
 HACS requires a valid GitHub token to fully function. Without a valid token,
 HACS may be in a partially disabled state but the WebSocket API still responds.
@@ -16,15 +17,20 @@ Tests should handle both fully functional and partially disabled states.
 import logging
 
 import pytest
-from fastmcp.exceptions import ToolError
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 
 from ...utilities.assertions import (
+    MCPAssertions,
     parse_mcp_result,
     safe_call_tool,
     tool_error_to_result,
 )
 
 logger = logging.getLogger(__name__)
+
+# The stores' own name for what HA-MCP also accepts as "lovelace".
+_NATIVE_CATEGORY = {"lovelace": "plugin"}
 
 
 def extract_hacs_data(raw_result) -> dict:
@@ -226,11 +232,10 @@ class TestHacsSearchInstalled:
                 f"Category filter should be {category}"
             )
 
-            # All returned results should match the category
+            # Results carry the store's own category name
+            native = _NATIVE_CATEGORY.get(category, category)
             for repo in data["results"]:
-                assert repo["category"] == category, (
-                    f"Repo category should be {category}"
-                )
+                assert repo["category"] == native, f"Repo category should be {native}"
 
             logger.info(f"Category {category}: {data['total_matches']} installed")
 
@@ -307,10 +312,10 @@ class TestHacsSearch:
             "Category filter should be lovelace"
         )
 
-        # All results should be in the lovelace category
+        # Results carry the store's own name for the lovelace category
         for result_item in data["results"]:
-            assert result_item["category"] == "lovelace", (
-                "Result category should be lovelace"
+            assert result_item["category"] == "plugin", (
+                "Result category should be plugin"
             )
 
         logger.info(f"Search 'card' in lovelace: {data['total_matches']} matches")
@@ -645,6 +650,55 @@ class TestHacsWriteOperations:
 
         logger.info("Remove store-only repository test passed")
 
+    async def test_tools_use_the_store_this_home_assistant_has(
+        self, mcp_client, ha_client
+    ):
+        """Test: the Marketplace on 2026.11+, HACS before; Marketplace gates hold.
+
+        On the Marketplace an install waits until the connected user has
+        accepted its first-run warning, and Core keeps that per user: the
+        refusal must name the confirmed accept action, which accepts it for the
+        server's own user (Supervisor's on the in-app lane, which nobody can log
+        in as) and lets the download/remove roundtrip below run on every lane.
+        """
+        marketplace = await ha_client.send_websocket_message(
+            {"type": "marketplace/info"}
+        )
+        search = await safe_hacs_call(
+            mcp_client, "ha_get_hacs_info", {"action": "search", "max_results": 1}
+        )
+        assert search.get("success"), f"Store search failed: {search.get('error')}"
+        expected = "marketplace" if marketplace.get("success") else "hacs"
+        assert search["store"]["api"] == expected
+
+        if expected == "hacs":
+            return
+        # The server's user, not the test user, is the one the gate checks, and
+        # Core has no command to take an acceptance back.
+        if search["store"]["warning_accepted"]:
+            pytest.skip("The server's user already accepted the Marketplace warning")
+        if not search.get("results"):
+            pytest.skip("The Marketplace index returned no repository to install")
+        async with MCPAssertions(mcp_client) as mcp:
+            refused = await mcp.call_tool_failure(
+                "ha_manage_hacs",
+                {
+                    "action": "download",
+                    "repository_id": str(search["results"][0]["id"]),
+                },
+            )
+            assert refused.get("store_error") == "warning_not_accepted", refused
+            assert "first-run warning" in str(refused), refused
+            assert "accept_warning" in str(refused), refused
+            await mcp.call_tool_success(
+                "ha_manage_hacs", {"action": "accept_warning", "confirm": True}
+            )
+            readback = await mcp.call_tool_success(
+                "ha_get_hacs_info", {"action": "search", "max_results": 1}
+            )
+        store = readback["data"]["store"]
+        assert store["warning_accepted"] is True, store
+
     async def test_download_then_remove_roundtrip(self, mcp_client):
         """
         Test: Download a disposable repository, then remove it.
@@ -675,6 +729,13 @@ class TestHacsWriteOperations:
         if target is None:
             pytest.skip("No downloadable theme repository available")
         repo_id = str(target["id"])
+        # The Marketplace warning is per user: accept it for the server's user
+        # rather than relying on the gate test running first. HACS has none.
+        if search_data["store"]["api"] == "marketplace":
+            async with MCPAssertions(mcp_client) as mcp:
+                await mcp.call_tool_success(
+                    "ha_manage_hacs", {"action": "accept_warning", "confirm": True}
+                )
 
         download = await safe_hacs_call(
             mcp_client,

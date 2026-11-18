@@ -23,14 +23,26 @@ from typing import TYPE_CHECKING, Any
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from .._vendor.fastmcp.exceptions import ToolError
 from .._version import is_running_in_addon
-from ..backup_manager import get_backup_manager
+from ..backup_manager import (
+    _CAPTURE_TRANSIENT_ERRORS,
+    BackupRestoreError,
+    MandatoryBackupError,
+    SnapshotInUseError,
+    _FlowHelperReadError,
+    _snapshot_validation_message,
+    get_backup_manager,
+    restore_error_code,
+)
+from ..backup_todo import TodoListNotLoaded
 from ..config import (
     BACKUP_OVERRIDE_FIELDS,
-    _reset_global_settings,
     get_backup_setting_origin,
     get_global_settings,
+    reset_global_settings,
 )
+from ..config_registry import SETTING_BOUNDS
 from ..errors import ErrorCode, create_error_response
 from . import _persistence, _supervisor
 
@@ -75,6 +87,7 @@ async def _list_backups(
         limit = int(params.get("limit", "500"))
     except ValueError:
         return _bad_request("'limit' must be an integer")
+    await mgr.ensure_directory_ready()
     # Offload sync directory I/O to keep the request handler async-clean.
     entries = await asyncio.to_thread(
         mgr.list_snapshots,
@@ -108,7 +121,7 @@ async def _view_backup(
     except FileNotFoundError:
         return _not_found(name)
     except ValueError as err:
-        return _bad_request(str(err))
+        return _bad_request(_snapshot_validation_message(err))
     return JSONResponse({"success": True, "data": data})
 
 
@@ -124,28 +137,39 @@ async def _diff_backup(
         return _bad_request("Backup manager unavailable")
     name = request.path_params.get("name", "")
     try:
-        snapshot = await asyncio.to_thread(mgr.read_snapshot, name)
+        snapshot, current = await mgr.snapshot_comparison(name)
     except FileNotFoundError:
         return _not_found(name)
     except ValueError as err:
-        return _bad_request(str(err))
-    handler = mgr.handler_for(snapshot["domain"])
-    if handler is None:
-        return _bad_request(
-            f"No handler for domain {snapshot['domain']!r}; cannot diff",
-            code=ErrorCode.RESOURCE_NOT_FOUND,
-            status=404,
+        return _bad_request(_snapshot_validation_message(err))
+    except LookupError as err:
+        return _bad_request(str(err), code=ErrorCode.RESOURCE_NOT_FOUND, status=404)
+    except TodoListNotLoaded as err:
+        return _bad_request(str(err), code=ErrorCode.ENTITY_UNAVAILABLE, status=409)
+    except _FlowHelperReadError as err:
+        return JSONResponse(
+            create_error_response(
+                ErrorCode.CONFIG_VALIDATION_FAILED,
+                str(err),
+                context={"data": {"reason": err.reason}},
+            ),
+            status_code=409,
         )
-    client = getattr(server, "client", None) or getattr(server, "_client", None)
-    # Narrow to transport / HA-API / FS errors so programming bugs
-    # propagate to the request handler instead of decorating the diff
-    # output with a "_error" sentinel masquerading as entity state.
-    from ..backup_manager import _CAPTURE_TRANSIENT_ERRORS
-
-    try:
-        current = await handler.fetch(client, snapshot["entity_id"])
     except _CAPTURE_TRANSIENT_ERRORS as err:
-        current = {"_error": f"{type(err).__name__}: {err}"}
+        # Transport/HA API/filesystem failures are not evidence of a deleted
+        # entity. Keep their diagnostics without echoing options or raw bodies.
+        status = getattr(err, "status_code", None)
+        logger.warning(
+            "Backup comparison failed for %r (%s, upstream_status=%s)",
+            name,
+            type(err).__name__,
+            status if type(status) is int else None,
+        )
+        return _bad_request(
+            "Could not fetch the current configuration for comparison.",
+            code=ErrorCode.CONNECTION_FAILED,
+            status=502,
+        )
     backup_yaml = yaml.safe_dump(
         snapshot.get("config"), default_flow_style=False, sort_keys=True
     ).splitlines()
@@ -165,8 +189,8 @@ async def _diff_backup(
         {
             "success": True,
             "diff": "\n".join(diff),
-            "backup_present": current is not None
-            and not (isinstance(current, dict) and "_error" in current),
+            "backup_present": current is not None,
+            "warnings": snapshot["warnings"],
         }
     )
 
@@ -184,7 +208,78 @@ async def _restore_backup(
         return _not_found(name)
     except (ValueError, LookupError) as err:
         return _bad_request(str(err))
+    except BackupRestoreError as err:
+        code = restore_error_code(err)
+        return JSONResponse(
+            create_error_response(
+                code,
+                str(err),
+                context={"data": err.outcome},
+                suggestions=[
+                    "Inspect the current configuration and restore outcome before retrying",
+                ]
+                + (
+                    [
+                        "Use safety_backup to inspect or restore the captured previous state"
+                    ]
+                    if err.outcome.get("safety_backup")
+                    else []
+                ),
+            ),
+            status_code={
+                ErrorCode.RESOURCE_NOT_FOUND: 404,
+                ErrorCode.ENTITY_NOT_FOUND: 404,
+                ErrorCode.VALIDATION_INVALID_PARAMETER: 400,
+            }.get(code, 409),
+        )
+    except MandatoryBackupError as err:
+        logger.warning("Restore of %s blocked: %s", name, err.safe_cause)
+        return JSONResponse(
+            create_error_response(
+                ErrorCode.BACKUP_CAPTURE_FAILED,
+                "Restore blocked: the pre-restore safety snapshot could not be "
+                f"captured ({err.safe_cause}). Nothing was changed.",
+                suggestions=err.suggestions,
+                context={
+                    "data": {
+                        "restored_from": name,
+                        "safety_backup": None,
+                        "apply_status": "not_applied",
+                        "verification_status": "not_run",
+                    }
+                },
+            ),
+            status_code=409,
+        )
+    except Exception as err:
+        # A write to Home Assistant failed: keep the error's own code, and the
+        # manager's outcome names the safety backup to revert with (#2632).
+        # The reply carries only the error's message, so the traceback is logged.
+        logger.exception("Restore of %s failed", name)
+        from ..tools.helpers import exception_to_structured_error
+
+        outcome = getattr(err, "restore_outcome", None)
+        response = _structured_tool_error(err)
+        if response is None:
+            response = exception_to_structured_error(
+                err, context={"data": outcome}, raise_error=False
+            )
+        else:
+            response.setdefault("data", outcome)
+        return JSONResponse(response, status_code=409)
     return JSONResponse({"success": True, "data": result})
+
+
+def _structured_tool_error(err: Exception) -> dict[str, Any] | None:
+    """The structured reply a ToolError carries (``COMPONENT_NOT_INSTALLED`` and
+    its fix, say); classifying it again would turn it into an unexpected error."""
+    if not isinstance(err, ToolError):
+        return None
+    try:
+        reply = json.loads(str(err))
+    except ValueError:
+        return None
+    return reply if isinstance(reply, dict) else None
 
 
 async def _delete_backup(
@@ -198,6 +293,18 @@ async def _delete_backup(
         await asyncio.to_thread(mgr.delete_snapshot, name)
     except FileNotFoundError:
         return _not_found(name)
+    except SnapshotInUseError as err:
+        return JSONResponse(
+            create_error_response(
+                ErrorCode.SERVICE_CALL_FAILED,
+                str(err),
+                context={"data": {"reason": "snapshot_in_use"}},
+                suggestions=[
+                    "Retry after the active capture or restore finishes",
+                ],
+            ),
+            status_code=409,
+        )
     except ValueError as err:
         return _bad_request(str(err))
     return JSONResponse({"success": True, "deleted": [name]})
@@ -236,8 +343,7 @@ async def _delete_backups_bulk(
     return JSONResponse(
         {
             "success": True,
-            "deleted": bulk["deleted"],
-            "failed": bulk["failed"],
+            **bulk,
             "count": len(bulk["deleted"]),
             "failed_count": len(bulk["failed"]),
         }
@@ -257,15 +363,17 @@ def backup_config_fields() -> list[dict[str, Any]]:
     fields: list[dict[str, Any]] = []
     for field_name, env_name, _ftype in BACKUP_OVERRIDE_FIELDS:
         origin = get_backup_setting_origin(env_name)
-        fields.append(
-            {
-                "field": field_name,
-                "env_var": env_name,
-                "value": getattr(settings, field_name),
-                "origin": origin,
-                "editable": origin in ("addon", "file", "default"),
-            }
-        )
+        row: dict[str, Any] = {
+            "field": field_name,
+            "env_var": env_name,
+            "value": getattr(settings, field_name),
+            "origin": origin,
+            "editable": origin in ("addon", "file", "default"),
+        }
+        bounds = SETTING_BOUNDS.get(field_name)
+        if bounds is not None:
+            row["min"], row["max"] = bounds
+        fields.append(row)
     return fields
 
 
@@ -280,16 +388,6 @@ async def _get_backup_config(
             "fields": backup_config_fields(),
         }
     )
-
-
-# Inclusive bounds for the integer auto-backup fields; a field absent here
-# takes any parseable int. Keyed by the Settings field name.
-_BACKUP_INT_BOUNDS: dict[str, tuple[int, int]] = {
-    "auto_backup_throttle_minutes": (0, 1440),
-    "auto_backup_retain_per_entity": (1, 10_000),
-    "auto_backup_calendar_lookahead_days": (1, 365),
-    "snapshot_delete_min_age_days": (0, 365),
-}
 
 
 def _coerce_bool_field(field_name: str, raw: Any) -> tuple[Any, str | None]:
@@ -314,11 +412,11 @@ def _coerce_int_field(field_name: str, raw: Any) -> tuple[Any, str | None]:
         return None, f"Invalid integer for {field_name}: {raw!r}"
     try:
         value = int(raw)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         return None, f"Invalid integer for {field_name}: {raw!r}"
-    bounds = _BACKUP_INT_BOUNDS.get(field_name)
+    bounds = SETTING_BOUNDS.get(field_name)
     if bounds is not None and not (bounds[0] <= value <= bounds[1]):
-        return None, f"{field_name} must be {bounds[0]}..{bounds[1]}"
+        return None, f"{field_name} must be {bounds[0]:g}..{bounds[1]:g}"
     return value, None
 
 
@@ -378,7 +476,7 @@ async def _save_backup_config_addon(
     """Add-on-mode branch of ``_save_backup_config``: merge ``clean`` into the
     Supervisor add-on options (full-replacement) and return.
 
-    ``start.py`` re-derives env vars from ``config.yaml`` on the next add-on
+    ``start.py`` re-derives env vars from ``/data/options.json`` on the next add-on
     boot, but the actual restart is fired by the user's global Restart Add-on
     button — not here — so ``restart_required=True`` and no auto-restart.
     """
@@ -391,12 +489,6 @@ async def _save_backup_config_addon(
             code=ErrorCode.INTERNAL_ERROR,
             status=500,
         )
-    # Merge ``clean`` into the *full* current options before posting.
-    # Supervisor validates against the addon schema and rejects any body
-    # missing a required key (notably ``backup_hint`` on the production /
-    # dev manifests). A previous version shipped just the auto-backup
-    # fields, producing ``addon_configuration_invalid_error: Missing option
-    # 'backup_hint' in root`` from supervisor and a confusing 400 in the UI.
     ok, sup_err = await _supervisor._supervisor_merge_and_post_options(
         server.settings.verify_ssl, clean
     )
@@ -466,7 +558,7 @@ def _apply_backup_config_file(clean: dict[str, Any]) -> JSONResponse:
     # File-mode auto-backup settings take effect immediately on the next
     # ``get_global_settings()`` read — no restart needed, hence
     # ``restart_required=False``.
-    _reset_global_settings()
+    reset_global_settings()
     return JSONResponse(
         {"success": True, "applied": clean, "mode": "file", "restart_required": False}
     )
@@ -509,7 +601,7 @@ async def _save_backup_config(
     """
     try:
         payload = await request.json()
-    except (ValueError, json.JSONDecodeError):
+    except ValueError, json.JSONDecodeError:
         return _bad_request("Invalid JSON body")
     clean, err = _validate_backup_payload(payload)
     if err is not None:

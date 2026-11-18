@@ -1,4 +1,7 @@
-from ha_mcp.visibility.model import VisibilityConfig
+from ha_mcp.visibility.model import (
+    VisibilityConfig,
+    wire_has_allowlist_dimensions,
+)
 from ha_mcp.visibility.resolver import config_has_active_hide_dimensions
 
 
@@ -9,6 +12,7 @@ def test_defaults_are_disabled_and_noop():
     assert cfg.exclude_categories == ["diagnostic", "config"]
     assert cfg.deny_entity_ids == []
     assert cfg.enforce is False
+    assert cfg.restrict_report_issue is False
 
 
 def test_roundtrips_through_json():
@@ -28,6 +32,10 @@ def test_enforce_is_not_a_wire_dimension():
     """enforce changes how strongly hiding applies, not which entities hide, so it
     is deliberately absent from the component wire format."""
     assert "enforce" not in VisibilityConfig(enforce=True).to_wire()
+    assert (
+        "restrict_report_issue"
+        not in VisibilityConfig(restrict_report_issue=True).to_wire()
+    )
 
 
 def test_enforce_is_not_an_active_hide_dimension():
@@ -35,3 +43,18 @@ def test_enforce_is_not_an_active_hide_dimension():
     config count as active, or every search would drop off the component fast path."""
     cfg = VisibilityConfig(enabled=True, enforce=True, exclude_categories=[])
     assert config_has_active_hide_dimensions(cfg) is False
+
+
+def test_config_and_wire_allowlist_predicates_agree():
+    """Both predicates answer "are any allow dimensions set", enabled or not."""
+    for config in (
+        VisibilityConfig(enabled=False, allow_labels=["voice"]),
+        VisibilityConfig(enabled=True, allow_labels=["voice"]),
+        VisibilityConfig(allow_entity_ids=["light.a"]),
+        VisibilityConfig(allow_areas=["kitchen"]),
+        VisibilityConfig(),
+    ):
+        assert config.allowlist_active is wire_has_allowlist_dimensions(
+            config.to_wire()
+        )
+    assert VisibilityConfig().allowlist_active is False

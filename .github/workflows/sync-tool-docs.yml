@@ -16,11 +16,11 @@ permissions:
   contents: read
 
 # Shared group for every workflow that pushes to master (semver-release,
-# addon-publish-dev, locale-sync): a doc-sync push landing while
-# semantic-release is mid-run aborts the release un-retryably ("Upstream
-# branch ... has changed"), so master writers must not overlap. This also
-# keeps sync runs from overlapping each other. cancel-in-progress must be
-# false: a running release must never be cancelled by a doc sync.
+# addon-publish-dev, locale-sync, sync-ratchet-baselines): a doc-sync push
+# landing while semantic-release is mid-run aborts the release un-retryably
+# ("Upstream branch ... has changed"), so master writers must not overlap.
+# This also keeps sync runs from overlapping each other. cancel-in-progress
+# must be false: a running release must never be cancelled by a doc sync.
 concurrency:
   group: master-write
   cancel-in-progress: false
@@ -32,6 +32,9 @@ concurrency:
 jobs:
   sync-tools-json:
     name: Regenerate tools.json & README
+    # Post-merge maintenance of this repository only; see
+    # sync-ratchet-baselines.yml for why a fork must not run it.
+    if: github.repository == 'homeassistant-ai/ha-mcp'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -40,12 +43,16 @@ jobs:
     steps:
     - name: Generate GitHub App token
       id: app-token
-      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
       with:
         app-id: ${{ secrets.RELEASE_APP_ID }}
         private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
         permission-contents: write
       continue-on-error: true
+
+    - name: Warn when the App token is unavailable
+      if: steps.app-token.outcome == 'failure'
+      run: echo "::warning::GitHub App token unavailable; falling back to RELEASE_TOKEN or GITHUB_TOKEN, which may not be allowed past branch protection."
 
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
@@ -53,9 +60,9 @@ jobs:
         token: ${{ steps.app-token.outputs.token || secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
     - name: Set up Python
-      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+      uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
       with:
-        python-version: '3.13'
+        python-version: '3.14'
 
     - name: Regenerate tool documentation
       run: python scripts/extract_tools.py
@@ -79,9 +86,17 @@ jobs:
         # is unrelated commits that do not touch the generated files — never
         # a conflict.
         for attempt in 1 2 3 4 5; do
-          if git push; then
+          if out=$(git push 2>&1); then
+            echo "$out"
             echo "Synced tool docs (attempt ${attempt})."
             exit 0
+          fi
+          echo "$out" >&2
+          # Only master moving is worth a retry; a permission, ruleset or
+          # network failure would fail the same way five times.
+          if ! grep -qE 'non-fast-forward|fetch first' <<<"$out"; then
+            echo "::error::Push failed for a reason other than master moving; not retrying."
+            exit 1
           fi
           echo "Push rejected on attempt ${attempt}; rebasing onto origin/master and retrying."
           # A conflicted/failed rebase leaves rebase-in-progress state and the

@@ -9,8 +9,8 @@ surfaced or the caller falls back to its own generic prefix.
 import json
 
 import pytest
-from fastmcp.exceptions import ToolError
 
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 from ha_mcp.errors import ErrorCode, create_error_response
 from ha_mcp.tools.helpers import extract_structured_error_reason
 
@@ -49,6 +49,12 @@ class TestExtractStructuredErrorReason:
     def test_payload_shapes(self, payload, expected):
         assert extract_structured_error_reason(ToolError(json.dumps(payload))) == (
             expected
+        )
+
+    def test_a_message_without_a_full_stop_stays_a_separate_sentence(self):
+        payload = {"error": {"message": "Admin only", "suggestion": "Use a token"}}
+        assert extract_structured_error_reason(ToolError(json.dumps(payload))) == (
+            "Admin only. Use a token"
         )
 
     def test_non_json_and_non_dict_json_return_none(self):

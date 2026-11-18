@@ -17,6 +17,10 @@ is described to the engine by the catalog's own ``meta.native_name``):
   from the tool definitions via ``scripts/extract_tools.py``)
 - ``custom_components/ha_mcp_tools/translations/<code>.json``
 
+Locales listed in ``BEST_EFFORT_LOCALES`` are deliberately excluded from both
+authored surfaces. They remain hand-editable and use the normal English
+fallback without consuming translation quota or making this job fail.
+
 The engine is one function (``_call_gemini``): the Gemini API free tier,
 keyed by ``GEMINI_API_KEY``, with ``GEMINI_MODEL`` / ``GEMINI_API_URL``
 overrides for any Gemini-compatible endpoint. The fallback when the engine is
@@ -25,14 +29,14 @@ down is a HUMAN: hand-edit the translations, run
 ``python scripts/update_locale_baseline.py``, and push — the next pipeline
 run sees nothing stale and no-ops. Hand-edits always win; the machine only
 touches strings whose English changed.
-Every returned string is validated (placeholder parity, the settings UI markup
-allowlist, formatting-tag parity, panel-link parity, and the on-screen names
-Python hardcodes staying untranslated) before it is written; a failure
+Every returned string is validated (placeholder parity, formatting-tag parity
+with English, and the on-screen names Python hardcodes staying untranslated)
+before it is written; a failure
 leaves that string unwritten and the run red rather than shipping a broken
 translation.
 
-Rate limits and outages: requests are paced under the free-tier rate and
-retry transient errors with backoff; a persistently failing batch marks its
+Rate limits and outages: requests use conservative free-tier pacing and retry
+transient errors with backoff; a persistently failing batch marks its
 strings failed and the run continues, and two consecutive dead batches stop
 the run early. Partial runs are resumable — completed work is recorded in
 ``tests/src/unit/locale_sync_progress.json`` and skipped on the rerun; only a
@@ -72,12 +76,11 @@ from update_locale_baseline import (  # type: ignore[import-not-found]  # noqa: 
     _load_test_module,
 )
 
-from ha_mcp.settings_ui._i18n import (  # noqa: E402
-    _ALLOWED_TAGS_RE,
-    _PANEL_LINK_RE,
+from ha_mcp.settings_ui.i18n import (  # noqa: E402
     _PLACEHOLDER_RE,
     _TAG_LIKE_RE,
 )
+from ha_mcp.settings_ui.locale_policy import is_best_effort_locale  # noqa: E402
 
 LOCALES_DIR = REPO_ROOT / "src" / "ha_mcp" / "settings_ui" / "locales"
 COMPONENT_DIR = REPO_ROOT / "custom_components" / "ha_mcp_tools" / "translations"
@@ -91,8 +94,9 @@ SETTINGS_SURFACE = "src/ha_mcp/settings_ui/locales"
 COMPONENT_SURFACE = "custom_components/ha_mcp_tools/translations"
 TOOLS_SURFACE = "settings UI tool titles and descriptions"
 
-DEFAULT_MODEL = "gemini-2.5-flash"
-# Free-tier pacing: stay comfortably under the strictest published RPM.
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
+# Free-tier pacing goal. Active RPM/RPD limits are project- and tier-specific
+# and are shown in Google AI Studio.
 _SECONDS_BETWEEN_REQUESTS = 7.0
 # Self-imposed wall-clock bound, kept below the workflow's job timeout: when
 # it trips, the run degrades exactly like a quota hit — remaining strings
@@ -240,7 +244,11 @@ def _changed_keys(module: Any) -> dict[str, set[str]]:
 
 
 def _target_locales() -> list[str]:
-    return sorted(p.stem for p in LOCALES_DIR.glob("*.json") if p.stem != "en")
+    return sorted(
+        p.stem
+        for p in LOCALES_DIR.glob("*.json")
+        if p.stem != "en" and not is_best_effort_locale(p.stem)
+    )
 
 
 def _flatten(value: Any, prefix: str = "") -> dict[str, str]:
@@ -388,7 +396,7 @@ def _plan_component(plan: Plan, changed: dict[str, set[str]]) -> None:
     changed_component = changed.get(COMPONENT_SURFACE, set())
     progress = _progress_load()
     for path in sorted(COMPONENT_DIR.glob("*.json")):
-        if path.stem == "en":
+        if path.stem == "en" or is_best_effort_locale(path.stem):
             continue
         flat = _flatten(_load_json(path))
         loc_changed = {
@@ -489,20 +497,14 @@ def _validate(item: WorkItem, translated: Any) -> str | None:
         _PLACEHOLDER_RE.findall(translated)
     ):
         return "placeholder set differs from English"
-    if item.section == "messages":
-        for tag in _TAG_LIKE_RE.findall(translated):
-            if _ALLOWED_TAGS_RE.fullmatch(tag) is None:
-                return f"markup {tag!r} not in the settings UI allowlist"
-        # Multiset parity, like panel links: a dropped </strong> or an
-        # invented <code> is all-allowlisted yet malforms what tHtml restores.
-        if Counter(_TAG_LIKE_RE.findall(translated)) != Counter(
-            _TAG_LIKE_RE.findall(item.english)
-        ):
-            return "formatting-tag set differs from English"
-        if Counter(_PANEL_LINK_RE.findall(translated)) != Counter(
-            _PANEL_LINK_RE.findall(item.english)
-        ):
-            return "panel-link targets differ from English"
+    # The same tags as English, as a multiset: a dropped </strong> or an
+    # invented <code> malforms what tHtml restores. English passed the settings
+    # UI's markup allowlist when i18n loaded it, and panel links are tags, so
+    # equal tags also keep the markup allowlisted and the panel links the same.
+    if item.section == "messages" and Counter(
+        _TAG_LIKE_RE.findall(translated)
+    ) != Counter(_TAG_LIKE_RE.findall(item.english)):
+        return "formatting-tag set differs from English"
     # The same comparison the merge gate runs, so the engine cannot produce
     # what that gate will later refuse. Without it a single dropped
     # identifier is accepted, lands as a backfilled key no later run
@@ -510,16 +512,7 @@ def _validate(item: WorkItem, translated: Any) -> str | None:
     # push is held back whole, the progress file is discarded, and the run
     # re-spends its quota planning the same work again. Rejecting the one
     # string instead costs one retry and leaves the key for tomorrow.
-    #
-    # Asked at the engine's setting, which narrows three arms the merge gate
-    # runs in full (``locale_rules._parity_fault`` names each). Numbers are
-    # the reason the dial exists: the two recorded tolerances are number
-    # entries and the engine cannot read them, so a full multiset here would
-    # refuse two correct strings on every run -- while asking nothing left a
-    # freshly written key unchecked here and checked there, which lands the
-    # fault and holds the whole tree back. Both failures cost a human one
-    # tolerance entry; only this one keeps the cost to a single key.
-    fault = locale_rules._parity_fault(item.english, translated, gate="engine")
+    fault = locale_rules.parity_fault(item.english, translated)
     if fault:
         return f"contradicts the English source: {fault}"
     return None
@@ -666,10 +659,9 @@ def _prompt(
 
 def _call_gemini(prompt: str) -> dict[str, Any]:
     """One engine call. The single place a provider swap would touch."""
-    # Deadline-guarded at entry AND before every retry sleep: a worst-case
-    # call (five 180s timeouts plus backoff) runs ~20 minutes, which would
-    # otherwise blow straight through the time budget's slack and into the
-    # job timeout — the one path that loses uncommitted work.
+    # Deadline-guarded at entry AND before every retry sleep: a worst-case call
+    # (five 180s timeouts plus 200s of backoff) runs ~18 minutes, past the time
+    # budget's slack into the job timeout, the one path losing uncommitted work.
     if _out_of_time():
         raise SystemExit("time budget exhausted before the engine call")
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -682,10 +674,7 @@ def _call_gemini(prompt: str) -> dict[str, Any]:
     )
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.2,
-            "response_mime_type": "application/json",
-        },
+        "generationConfig": {"response_mime_type": "application/json"},
     }
     last_error = ""
     for attempt in range(1, 6):
@@ -697,37 +686,84 @@ def _call_gemini(prompt: str) -> dict[str, Any]:
             # Connect/read timeouts, DNS failures, resets — as transient as a
             # 5xx; retry with the same bounded backoff.
             last_error = f"transport error: {exc!r}"
-            if _out_of_time():
-                last_error += " (time budget exhausted; not retrying)"
+        else:
+            parsed, last_error, retryable = _read_answer(response)
+            if parsed is not None:
+                return parsed
+            if not retryable:
                 break
-            delay = 20 * attempt
-            print(f"  engine {last_error}; retrying in {delay}s", file=sys.stderr)
-            time.sleep(delay)
-            continue
-        if response.status_code == 200:
-            payload = response.json()
-            try:
-                text = payload["candidates"][0]["content"]["parts"][0]["text"]
-                parsed: dict[str, Any] = json.loads(text)
-            except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-                # An empty/filtered candidate list or non-JSON answer should
-                # read like the HTTP failures, not a raw traceback.
-                raise SystemExit(
-                    f"Gemini API returned an unusable response ({exc!r}): "
-                    f"{json.dumps(payload)[:300]}"
-                ) from exc
-            return parsed
-        last_error = f"HTTP {response.status_code}: {response.text[:300]}"
-        if response.status_code in (429, 500, 502, 503, 504):
-            if _out_of_time():
-                last_error += " (time budget exhausted; not retrying)"
-                break
-            delay = 20 * attempt
-            print(f"  engine {last_error}; retrying in {delay}s", file=sys.stderr)
-            time.sleep(delay)
-            continue
-        break
+        if attempt == 5:
+            break
+        if _out_of_time():
+            last_error += " (time budget exhausted; not retrying)"
+            break
+        delay = 20 * attempt
+        print(f"  engine {last_error}; retrying in {delay}s", file=sys.stderr)
+        time.sleep(delay)
     raise SystemExit(f"Gemini API call failed: {last_error}")
+
+
+def _read_answer(response: httpx.Response) -> tuple[dict[str, Any] | None, str, bool]:
+    """``(parsed, error, retryable)`` for one engine response."""
+    if response.status_code != 200:
+        error = f"HTTP {response.status_code}: {response.text[:300]}"
+        return None, error, response.status_code in (429, 500, 502, 503, 504)
+    try:
+        envelope = response.json()
+    except ValueError as exc:
+        # Not JSON at all — a proxy's HTML error page behind a 200.
+        return None, _describe_unusable({}, exc, response.text), True
+    # A JSON body that is not an object (``[]`` from a proxy) must reach the
+    # same report and retry, not an AttributeError on the lookups below.
+    payload: dict[str, Any] = envelope if isinstance(envelope, dict) else {}
+    try:
+        text = payload["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            raise TypeError(f"answer is a JSON {type(parsed).__name__}, not an object")
+    except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+        # An empty/filtered candidate list or non-JSON answer reads like the
+        # HTTP failures, not a raw traceback — and retries like them: the
+        # engine has answered a 200 carrying a JSON object cut off a third of
+        # the way in, for a chunk the identical prompt completed on the next
+        # call. Failing on the spot marked every string of that chunk failed
+        # and counted toward declaring the engine dead. A prompt-level block
+        # is the one shape that is deterministic; it is reported at once.
+        feedback = payload.get("promptFeedback")
+        blocked = isinstance(feedback, dict) and bool(feedback.get("blockReason"))
+        return None, _describe_unusable(payload, exc, response.text), not blocked
+    return parsed, "", True
+
+
+def _describe_unusable(payload: dict[str, Any], exc: Exception, body: str) -> str:
+    """One line naming why a 200 carried no parseable JSON object.
+
+    The finish reason and token usage are what tell a cut-off answer
+    (MAX_TOKENS, SAFETY, RECITATION) from a malformed one (STOP); the first
+    300 characters of the raw payload, which is what used to be logged,
+    reach neither, so a failed run could not say which it had seen. With no
+    candidate text to show, the start of the raw body stands in for it.
+    """
+    candidates = payload.get("candidates")
+    first = candidates[0] if isinstance(candidates, list) and candidates else None
+    candidate = first if isinstance(first, dict) else {}
+    text = ""
+    try:
+        text = str(candidate["content"]["parts"][0]["text"])
+    except KeyError, IndexError, TypeError:
+        pass  # no candidate text at all; the raw body stands in below
+    shown = (
+        f"text[{len(text)} chars] ends {text[-200:]!r}"
+        if text
+        else f"body starts {body[:200]!r}"
+    )
+    return (
+        f"unusable response ({exc!r}); "
+        f"finishReason={candidate.get('finishReason')}; "
+        f"promptFeedback={json.dumps(payload.get('promptFeedback'))}; "
+        f"usageMetadata={json.dumps(payload.get('usageMetadata'))}; "
+        f"{shown}"
+    )
 
 
 def _chunk(batch: dict[str, str]) -> list[dict[str, str]]:
@@ -760,9 +796,11 @@ def _accept_or_retry(
     surface: Section,
     queued_keys: Container[str],
 ) -> None:
-    """Validate one translated string, retrying once with the reason."""
+    """Validate one string, retrying once with the reason while the budget lasts."""
     reason = _validate(item, translated)
-    if reason is not None:
+    if reason is not None and _out_of_time():  # _call_gemini would refuse the retry
+        reason += " (time budget exhausted; not retrying)"
+    elif reason is not None:
         try:
             retry = _call_gemini(
                 _prompt(locale, {_string_id(item): item.english}, surface, queued_keys)
@@ -770,13 +808,15 @@ def _accept_or_retry(
                 "Fix that and return the corrected JSON."
             )
         except SystemExit as exc:
-            # The retry is best-effort; an engine failure here degrades to the
-            # original (rejected) answer failing validation below.
+            # Best effort: the rejected answer fails with its original reason.
             print(f"  retry call failed: {exc}", file=sys.stderr)
+            if _out_of_time():
+                reason += " (retry failed; time budget exhausted)"
         else:
             translated = retry.get(_string_id(item))
-        time.sleep(_SECONDS_BETWEEN_REQUESTS)
-        reason = _validate(item, translated)
+            reason = _validate(item, translated)
+        if not _out_of_time():  # past the deadline the wait paces no request
+            time.sleep(_SECONDS_BETWEEN_REQUESTS)
     if reason is None:
         results[(item.section, item.key)] = str(translated)
     else:
@@ -848,19 +888,20 @@ def _translate_surface(
             return True, consecutive_engine_failures
         try:
             response = _call_gemini(_prompt(locale, chunk, surface, queued_keys))
+            consecutive_engine_failures = 0
         except SystemExit as exc:
             consecutive_engine_failures += 1
+            reason = f"engine call failed ({exc})"
             for sid in chunk:
                 item = by_id[sid]
-                failures.append(
-                    f"{locale}/{item.section}/{item.key}: engine call failed ({exc})"
-                )
+                failures.append(f"{locale}/{item.section}/{item.key}: {reason}")
                 failed.add((item.section, item.key))
             if consecutive_engine_failures >= _ENGINE_GIVE_UP_AFTER:
                 return True, consecutive_engine_failures
+        if not _out_of_time():  # past the deadline the wait paces no request
+            time.sleep(_SECONDS_BETWEEN_REQUESTS)
+        if consecutive_engine_failures:  # the call failed: no answer to accept
             continue
-        consecutive_engine_failures = 0
-        time.sleep(_SECONDS_BETWEEN_REQUESTS)
         for sid in chunk:
             _accept_or_retry(
                 locale,
@@ -886,8 +927,8 @@ def _translate_locale(
     identifiers rather than deduplicated by English text — the same English
     may legitimately need different wording per key (Spanish genders
     "enabled" as ``activado``/``activada`` depending on the noun), and the
-    key gives the model that context. The one pair *required* to share
-    wording across the authored surfaces is aligned afterwards by
+    key gives the model that context. Authored copies required to share
+    wording across surfaces are aligned afterwards by
     ``_align_authored_shared``. A chunk-level engine failure marks that
     chunk's strings failed and moves on, so one blocked or truncated batch
     cannot take down the whole run.
@@ -1014,39 +1055,125 @@ def _apply_component(
         print(f"updated {path.relative_to(REPO_ROOT)}")
 
 
+def _authored_shared_refs(
+    where: tuple[tuple[str, str], ...],
+) -> list[tuple[Section, str]]:
+    """Convert authored catalog locations to translation-result references."""
+    refs: list[tuple[Section, str]] = []
+    for surface, key in where:
+        if surface == SETTINGS_SURFACE and key.startswith("messages."):
+            refs.append(("messages", key.removeprefix("messages.")))
+        elif surface == COMPONENT_SURFACE:
+            refs.append(("component", key))
+    return refs
+
+
+def _reuse_existing_authored_shared(
+    locale: str, items: list[WorkItem], module: Any
+) -> tuple[dict[tuple[str, str], str], list[WorkItem]]:
+    """Copy current shared wording before sending the remaining work out."""
+    planned = {(item.section, item.key): item for item in items}
+    settings = _load_json(LOCALES_DIR / f"{locale}.json")
+    existing: dict[tuple[str, str], str] = {
+        ("messages", key): value
+        for key, value in settings.get("messages", {}).items()
+        if isinstance(value, str) and value
+    }
+    component_path = COMPONENT_DIR / f"{locale}.json"
+    if component_path.exists():
+        existing.update(
+            {
+                ("component", key): value
+                for key, value in _flatten(_load_json(component_path)).items()
+                if value
+            }
+        )
+
+    reused: dict[tuple[str, str], str] = {}
+    replaced: set[tuple[Section, str]] = set()
+    fallback_items: list[WorkItem] = []
+    for english, where in module._authored_shared_groups():
+        refs = _authored_shared_refs(where)
+        planned_refs = set(refs) & planned.keys()
+        if not planned_refs:
+            continue
+        current_values = {
+            existing[ref]
+            for ref in refs
+            if ref not in planned and ref in existing and existing[ref] != english
+        }
+        if len(current_values) == 1:
+            value = next(iter(current_values))
+            if all(_validate(planned[ref], value) is None for ref in planned_refs):
+                for ref in planned_refs:
+                    reused[ref] = value
+                continue
+
+        # Component answers are validated under looser markup rules. When no
+        # sibling is reusable, queue one settings reference so the value later
+        # aligned across the group passes the strictest destination gate.
+        settings_refs = {ref for ref in refs if ref[0] == "messages"}
+        if not settings_refs or settings_refs & planned_refs:
+            continue
+        canonical_ref = next(ref for ref in refs if ref in settings_refs)
+        replaced.update(planned_refs)
+        fallback_items.append(
+            WorkItem(
+                locale,
+                canonical_ref[0],
+                canonical_ref[1],
+                english,
+                changed=any(planned[ref].changed for ref in planned_refs),
+            )
+        )
+
+    if reused:
+        print(f"  {locale}: reused existing wording for {len(reused)} shared string(s)")
+    remaining = [
+        item
+        for item in items
+        if (item.section, item.key) not in reused
+        and (item.section, item.key) not in replaced
+    ]
+    remaining.extend(fallback_items)
+    return reused, remaining
+
+
 def _align_authored_shared(
     locale: str, results: dict[tuple[str, str], str], module: Any
 ) -> None:
     """Byte-align the wording shared across the two authored surfaces.
 
     Per-key contextual translation may word the settings and component copies
-    of one shared English string differently;
-    ``test_authored_shared_strings_read_the_same`` requires them identical.
-    The settings side wins (the historical rule); when only the component
-    side was retranslated this run, the locale's existing settings
-    translation is the reference.
+    of one shared English string differently, while
+    ``test_authored_shared_strings_read_the_same`` requires them identical. An
+    eligible existing sibling was already copied into ``results`` by
+    ``_reuse_existing_authored_shared``; otherwise an engine result becomes the
+    reference only after it passes every destination's validation. The settings
+    result wins when both surfaces were translated, preserving the historical
+    rule.
     """
-    for _english, where in module._authored_shared_groups():
-        settings_keys = [
-            key.removeprefix("messages.")
-            for surface, key in where
-            if surface == SETTINGS_SURFACE and key.startswith("messages.")
-        ]
-        component_keys = [key for surface, key in where if surface == COMPONENT_SURFACE]
-        if not settings_keys:
+    for english, where in module._authored_shared_groups():
+        refs = _authored_shared_refs(where)
+        settings_refs = [ref for ref in refs if ref[0] == "messages"]
+        affected = [ref for ref in refs if ref in results]
+        if not settings_refs or not affected:
             continue
-        value = results.get(("messages", settings_keys[0]))
-        if value is None:
-            catalog = _load_json(LOCALES_DIR / f"{locale}.json")
-            value = catalog.get("messages", {}).get(settings_keys[0])
-        if value is None:
+        value = next(
+            (results[ref] for ref in settings_refs if ref in results),
+            results[affected[0]],
+        )
+        if any(
+            _validate(WorkItem(locale, section, key, english), value) is not None
+            for section, key in refs
+        ):
+            # Do not let a looser component-only partial result bypass the
+            # settings gate or mark the rest of the shared group complete.
+            for ref in affected:
+                results.pop(ref, None)
             continue
-        for key in settings_keys[1:]:
-            if ("messages", key) in results:
-                results[("messages", key)] = value
-        for key in component_keys:
-            if ("component", key) in results:
-                results[("component", key)] = value
+        for ref in refs:
+            results[ref] = value
 
 
 def _translate_and_apply(
@@ -1063,19 +1190,24 @@ def _translate_and_apply(
     engine_dead = False
     try:
         for locale in _target_locales():
-            results: dict[tuple[str, str], str] = {}
-            if locale in by_locale and engine_dead:
+            locale_items = by_locale.get(locale, [])
+            results, remaining = _reuse_existing_authored_shared(
+                locale, locale_items, module
+            )
+            if remaining and engine_dead:
                 failures.append(
-                    f"{locale}: {len(by_locale[locale])} string(s) skipped — "
+                    f"{locale}: {len(remaining)} string(s) skipped — "
                     "the engine was declared unavailable earlier in this run"
                 )
-            elif locale in by_locale:
-                results, locale_failures, _failed, engine_dead = _translate_locale(
-                    locale, by_locale[locale]
+            elif remaining:
+                translated, locale_failures, _failed, engine_dead = _translate_locale(
+                    locale, remaining
                 )
+                results.update(translated)
                 failures += locale_failures
+            if locale_items:
                 _align_authored_shared(locale, results, module)
-                for item in by_locale[locale]:
+                for item in locale_items:
                     if item.changed and (item.section, item.key) in results:
                         completed.setdefault((item.section, item.key), set()).add(
                             locale

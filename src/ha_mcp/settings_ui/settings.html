@@ -173,10 +173,13 @@
     ⚠ Changes saved. Restart HA-MCP for them to take effect. On next
     startup, HA-MCP fully removes disabled tools from the MCP tool list.
     Then reconnect or refresh the MCP server in your AI client (e.g.
-    refresh tool list on claude.ai, re-add/refresh the connector in
-    ChatGPT, or close and reopen Claude Desktop) so it reloads the tool
-    list. Restarting the App (add-on) or Home Assistant does NOT refresh your
-    client's cached tool list.
+    refresh tool list on claude.ai; in ChatGPT open Settings, then the
+    plugin settings, select the connector and click Refresh tools;
+    disconnect and reconnect a Claude Desktop custom connector; or quit
+    and reopen Claude Desktop for a server in claude_desktop_config.json)
+    so it reloads the tool list, then start a new conversation. Restarting
+    the App (add-on) or Home Assistant does NOT refresh your client's
+    cached tool list.
   </span>
   <button class="restart-btn" id="restartBtn" style="display:none" data-i18n="actions.restart_addon">Restart App (add-on)</button>
 </div>
@@ -232,8 +235,11 @@
       Settings on this tab save automatically. Changes take effect only after
       you restart the App (add-on) (applies them server-side) and reconnect or
       refresh the MCP server in your AI client (reloads the tool list), e.g.
-      refresh tool list on claude.ai, re-add or refresh the connector in
-      ChatGPT, or close and reopen Claude Desktop.
+      refresh tool list on claude.ai; in ChatGPT open Settings, then the
+      plugin settings, select the connector and click Refresh tools;
+      disconnect and reconnect a Claude Desktop custom connector; or quit
+      and reopen Claude Desktop for a server in claude_desktop_config.json;
+      then start a new conversation.
     </div>
   </div>
 
@@ -242,6 +248,14 @@
        same as the Tools tab. A toast confirms each save. Changes still
        need a restart to take effect (see the banner above). -->
   <div id="featuresBody"></div>
+
+  <!-- The embedded server's OAuth callback allowlist (#2427). Hidden unless the
+       server runs inside the HA-MCP integration; it saves with its own button
+       and applies to the next sign-in without a restart. -->
+  <div id="oauthCallbacksSection" hidden>
+    <h2 class="adv-section-title" data-i18n="server.sections.remote_access">Remote access</h2>
+    <div id="oauthCallbacksBody" class="adv-section"></div>
+  </div>
 
   <!-- Advanced settings sections. The "Connection
        (display only)" section was removed per user feedback — it
@@ -302,10 +316,13 @@
 <div class="panel" id="panel-tool-security-policies" role="tabpanel" aria-labelledby="tab-tool-security-policies" tabindex="0">
   <h2 data-i18n="policies.title">Tool Security Policies</h2>
   <p class="features-sub" data-i18n-html="policies.intro">
-    Per-tool approval gating for high-stakes calls. Use the
-    <strong>Tools</strong> tab to enable gating for a tool, then refine
-    the matching conditions and approval lifetime here. Condition operators:
-    equals, is one of, regex, contains, is present, greater than, less than.
+    Per-tool approval gating for high-stakes calls. The <strong>security
+    gated</strong> switch on the <strong>Tools</strong> tab decides whether a
+    whole tool needs approval; refine it here with conditions. In a block list
+    a rule names calls that need approval and can keep an approval for a
+    while; in an allow list a rule names calls that run without one. Condition
+    operators: equals, is one of, regex, contains, is present, greater than,
+    less than.
   </p>
 
   <section id="policy-global-settings" style="margin-bottom:16px">
@@ -373,6 +390,20 @@
     </div>
     <div class="feature-row">
       <div class="feature-info">
+        <div class="feature-name" id="policy-rule-effect-label" data-i18n="policies.global.rule_effect.label">Approval mode</div>
+        <div class="feature-help" data-i18n-html="policies.global.rule_effect.help">
+          <strong>Block list</strong> (default): the rules below list the calls that need your approval, and every other call runs. <strong>Allow list</strong>: the rules below list the calls that run without approval, and every other call needs it, reads included; only tool search and managing pending approvals stay exempt. Applies from the next call after you save. An allow list matches strictly: exact case, every value a wildcard path or a list reaches, every branch of a wildcard path holding the field, and objects only by equals or is one of. Regex and contains still match substrings, so anchor a regex with <code>^…$</code>; does NOT equal and is NOT one of approve everything they do not name. Text with a comma or surrounding whitespace matches no condition except is present. A rule constrains only the arguments it names.
+        </div>
+      </div>
+      <div class="feature-control">
+        <select id="policy-rule-effect" aria-labelledby="policy-rule-effect-label">
+          <option value="require_approval" data-i18n="policies.global.rule_effect.require_approval">Require approval for matching calls (block list)</option>
+          <option value="allow" data-i18n="policies.global.rule_effect.allow">Require approval unless a rule matches (allow list)</option>
+        </select>
+      </div>
+    </div>
+    <div class="feature-row">
+      <div class="feature-info">
         <div class="feature-name" data-i18n="policies.global.wait.label">Wait seconds (5-600)</div>
         <div class="feature-help" data-i18n="policies.global.wait.help">How long the middleware waits for an approval before timing out.</div>
       </div>
@@ -389,6 +420,62 @@
         <input type="number" id="policy-ttl-minutes" min="1" max="60" aria-label="Approval TTL minutes (1-60)" data-i18n-aria-label="policies.global.ttl.label">
       </div>
     </div>
+    <!-- Deciding a pending request from the event bus (issue #2502).
+         Sits under the timing rows because it changes WHO may decide, not
+         how long a request waits. -->
+    <div class="feature-row">
+      <div class="feature-info">
+        <div class="feature-name" id="policy-event-decisions-label" data-i18n="policies.global.event_decisions.label">Allow approve/deny from Home Assistant events</div>
+        <div class="feature-help" data-i18n-html="policies.global.event_decisions.help">
+          Off by default. While on, an <code>ha_mcp_approval_response</code>
+          event carrying a pending request's token, a decision and the PIN
+          below decides that request — so your own notification automation
+          can approve it from a phone. Needs a PIN before it can be switched
+          on.
+        </div>
+      </div>
+      <div class="feature-control">
+        <label class="switch">
+          <input type="checkbox" id="policy-event-decisions-toggle" aria-labelledby="policy-event-decisions-label">
+          <span class="slider"></span>
+        </label>
+      </div>
+    </div>
+    <div class="ha-alert ha-alert-warning" role="note">
+      <svg class="ha-alert-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M12,2L1,21H23M12,6L19.53,19H4.47M11,10V14H13V10M11,16V18H13V16"/>
+      </svg>
+      <div class="ha-alert-body" data-i18n="policies.global.event_decisions.warning">
+        An AI agent with enough access can guess or obtain this PIN — by asking
+        you for it, or by writing an automation that reads it out of a response
+        event — and then approve its own requests. Home Assistant cannot tell an
+        event fired by your automation from one fired by an agent, so the PIN is
+        the only thing between them. Switching this on accepts that limitation.
+        Deciding in the Pending list is unaffected — on the settings UI the
+        server itself serves. The stdio sidecar's settings page sets the PIN
+        and the policy, but cannot list or decide pending approvals: those
+        live in the server process it cannot reach.
+      </div>
+    </div>
+    <div class="feature-row">
+      <div class="feature-info">
+        <div class="feature-name" data-i18n="policies.global.pin.label">Approval PIN</div>
+        <div class="feature-help" data-i18n="policies.global.pin.help">
+          At least 4 characters. Stored as a salted hash and never shown
+          again, and kept out of the policy document so nothing that reads
+          or writes policy carries it. Five wrong PINs within five minutes
+          close the channel for the rest of that window — the Pending list
+          on the server's own settings UI keeps working (the stdio sidecar
+          page cannot show it).
+        </div>
+        <div class="feature-locked-note" id="policy-pin-status" role="status" aria-live="polite"></div>
+      </div>
+      <div class="feature-control" style="display:flex; gap:8px; align-items:center; flex-wrap:wrap">
+        <input type="password" id="policy-decision-pin" autocomplete="new-password" aria-label="Approval PIN" data-i18n-aria-label="policies.global.pin.label">
+        <button id="policy-set-pin-btn" class="restart-btn" data-i18n="policies.global.pin.set">Set PIN</button>
+        <button id="policy-clear-pin-btn" class="restart-btn" data-i18n="policies.global.pin.clear">Remove PIN</button>
+      </div>
+    </div>
     <div style="margin-top:10px; display:flex; align-items:center; gap:12px">
       <button id="policy-save-global-btn" class="restart-btn" data-i18n="policies.global.save">Save global settings</button>
       <span id="policy-global-save-status" class="status" role="status" aria-live="polite"></span>
@@ -398,10 +485,24 @@
   <section id="policy-pending" style="margin-bottom:16px">
     <h3 style="font-size:1rem;margin-bottom:8px" data-i18n="policies.pending.title">Pending approvals</h3>
     <div id="policy-pending-list" class="backup-empty" data-i18n="policies.pending.empty">No pending approvals.</div>
+    <div id="policy-pending-announcement" class="visually-hidden" role="status" aria-live="polite"></div>
   </section>
 
   <section id="policy-rules">
-    <h3 style="font-size:1rem;margin-bottom:8px" data-i18n="policies.rules.title">Gated tools</h3>
+    <h3 id="policy-rules-title" style="font-size:1rem;margin-bottom:8px" data-i18n="policies.rules.title">Gated tools</h3>
+    <!-- Issue #2515: a rule is keyed on the tool name, so a second tool that
+         reaches the same capability is not covered by it. Stated where the
+         rules are written rather than only in the FAQ. -->
+    <div class="ha-alert ha-alert-info" role="note">
+      <svg class="ha-alert-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M11,9H13V7H11M12,20C7.59,20 4,16.41 4,12C4,7.59 7.59,4 12,4C16.41,4 20,7.59 20,12C20,16.41 16.41,20 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2M11,17H13V11H11V17Z"/>
+      </svg>
+      <div class="ha-alert-body" data-i18n-html="policies.rules.scope_notice">
+        Policies apply to individual tools. Other tools may perform the same
+        action. For example, requiring approval for <code>ha_call_event</code>
+        does not restrict event firing through <code>ha_call_service</code>.
+      </div>
+    </div>
     <div id="policy-load-error" style="display:none;background:var(--danger);color:white;padding:8px 12px;border-radius:6px;margin-bottom:8px;font-size:0.85rem;"></div>
     <div id="policy-rules-empty" class="backup-empty" style="display:none;" data-i18n-html="policies.rules.empty">
       No tools currently security-gated. Enable per-tool gating from the
@@ -485,8 +586,10 @@
 
   <section class="a11y-section">
     <h2 class="a11y-section-title" data-i18n="visibility.enforce.title">Enforce mode</h2>
-    <p class="a11y-section-help" data-i18n="visibility.enforce.help">Extends the filter from decluttering search and overview to every tool read. A direct read of a hidden entity returns &ldquo;not found&rdquo;, and a content read (dashboard, template, automation, trace, log, or file) that would surface a hidden entity is refused. Best-effort concealment against incidental exposure, not a hardened security boundary.</p>
-    <label class="a11y-option"><input type="checkbox" id="visibility-enforce"> <span data-i18n="visibility.enforce.only_enforced">Make hidden entities unreadable across all tools (not just search)</span></label>
+    <p class="a11y-section-help" data-i18n="visibility.enforce.help">Extends the filter from decluttering search and overview to every tool read except ha_report_issue by default. A direct read of a hidden entity returns &ldquo;not found&rdquo;, and a content read that would surface one is refused. The report-tool exception is controlled below. Best-effort concealment against incidental exposure, not a hardened security boundary.</p>
+    <label class="a11y-option"><input type="checkbox" id="visibility-enforce"> <span data-i18n="visibility.enforce.only_enforced">Make hidden entities unreadable across tool reads (except issue reports by default)</span></label>
+    <p class="a11y-section-help" data-i18n="visibility.enforce.report_issue_help">While this is off, ha_report_issue and all of its diagnostic output&mdash;including logs&mdash;stay outside enforce mode on every call, even when visibility data is healthy or unavailable. Turn it on to scan and refuse that tool like other reads.</p>
+    <label class="a11y-option"><input type="checkbox" id="visibility-restrict-report-issue"> <span data-i18n="visibility.enforce.restrict_report_issue">Apply enforce mode to ha_report_issue</span></label>
   </section>
 
   <section class="a11y-section">
@@ -516,7 +619,7 @@
 
   <section class="a11y-section">
     <h2 class="a11y-section-title" data-i18n="visibility.allowlist.title">Restrict to an allowlist</h2>
-    <p class="a11y-section-help" data-i18n="visibility.allowlist.help">Advanced: when any allowlist field is set the filter inverts – only entities matching an allowlist stay visible, everything else is hidden (including entities added later). Leave all three empty to disable.</p>
+    <p class="a11y-section-help" data-i18n="visibility.allowlist.help">Advanced: when any allowlist field is set, nonmatching entities are hidden (including entities added later). A match overrides category, Home Assistant hidden-state, and Assist filters; denied entity IDs and excluded areas or labels still win. Leave all three empty to disable.</p>
     <label class="visibility-field"><span data-i18n="visibility.allowlist.areas">Allowed areas</span> <input type="text" id="visibility-allow-areas" placeholder="living_room, kitchen"></label>
     <label class="visibility-field"><span data-i18n="visibility.allowlist.labels">Allowed labels</span> <input type="text" id="visibility-allow-labels" placeholder="voice, main_floor"></label>
     <p class="a11y-section-help" data-i18n="visibility.allowlist.entities_help">Allowed entity IDs, one per line.</p>
@@ -526,7 +629,7 @@
 
   <section class="a11y-section">
     <h2 class="a11y-section-title" data-i18n="visibility.assist.title">Respect Assist exposure</h2>
-    <p class="a11y-section-help" data-i18n="visibility.assist.help">Hide entities not exposed to Home Assistant's Assist (&ldquo;conversation&rdquo;) voice assistant, mirroring the Settings &gt; Voice assistants &gt; Expose list. Adds two websocket reads per search while enabled.</p>
+    <p class="a11y-section-help" data-i18n="visibility.assist.help">Hide entities not exposed to Home Assistant's Assist (&ldquo;conversation&rdquo;) voice assistant, mirroring the Settings &gt; Voice assistants &gt; Expose list. Not applied while an allowlist is active; otherwise adds two websocket reads per search.</p>
     <label class="a11y-option"><input type="checkbox" id="visibility-respect-assist"> <span data-i18n="visibility.assist.only_exposed">Only show entities exposed to Assist</span></label>
   </section>
 

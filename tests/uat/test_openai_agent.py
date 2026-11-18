@@ -57,6 +57,36 @@ class TestArgParsing:
         assert "--mcp-config" in result.stdout
 
 
+class TestAgentLogsReachStderr:
+    """The agent's log lines are the BAT runner's only view of a run: the
+    runner copies ``[tool]`` lines into ``tool_trace`` and shows stderr for a
+    failed phase. If they never reach stderr, a failed run reports nothing."""
+
+    def test_warmup_failure_is_reported_on_stderr(self):
+        """A backend that is down fails the warmup; the reason must be on stderr."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(AGENT_SCRIPT),
+                "--prompt",
+                "hi",
+                "--mcp-config",
+                "unused.json",
+                "--base-url",
+                "http://127.0.0.1:9/v1",
+                "--model",
+                "any-model",
+                "--timeout",
+                "5",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        assert result.returncode == 1, f"stderr: {result.stderr}"
+        assert "Model warmup failed" in result.stderr, f"stderr: {result.stderr}"
+
+
 class TestToolConversion:
     """Test MCP tool schema to OpenAI function format conversion."""
 
@@ -65,7 +95,7 @@ class TestToolConversion:
         mcp_tool = MagicMock()
         mcp_tool.name = "search_entities"
         mcp_tool.description = "Search for entities"
-        mcp_tool.inputSchema = {
+        mcp_tool.input_schema = {
             "type": "object",
             "properties": {
                 "query": {"type": "string", "description": "Search term"},
@@ -95,7 +125,7 @@ class TestToolConversion:
         mcp_tool = MagicMock()
         mcp_tool.name = "get_version"
         mcp_tool.description = "Get HA version"
-        mcp_tool.inputSchema = None
+        mcp_tool.input_schema = None
 
         result = openai_agent.mcp_tool_to_openai(mcp_tool)
 

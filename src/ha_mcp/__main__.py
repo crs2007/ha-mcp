@@ -1,20 +1,5 @@
 """Home Assistant MCP Server."""
 
-import sys
-
-if sys.version_info < (3, 13):  # noqa: UP036 — uvx can bypass requires-python and run on 3.12
-    # Write directly to stderr (not print) so this import-time version gate
-    # fires before any 3.13-only syntax in the rest of the module is parsed.
-    sys.stderr.write(
-        f"ERROR: ha-mcp requires Python 3.13+, but you are running Python "
-        f"{sys.version_info.major}.{sys.version_info.minor}.\n"
-        "If using uvx, add '--python 3.13' to your config args:\n"
-        '  "args": ["--python", "3.13", "--refresh", "ha-mcp@latest"]\n'
-        "Or install Python 3.13: brew install python@3.13 (macOS) / "
-        "sudo apt install python3.13 (Linux)\n"
-    )
-    sys.exit(1)
-
 import truststore
 
 truststore.inject_into_ssl()
@@ -33,19 +18,16 @@ import threading  # noqa: E402
 from collections.abc import Coroutine  # noqa: E402
 from typing import TYPE_CHECKING, Any, NoReturn  # noqa: E402
 
-from fastmcp.exceptions import ToolError  # noqa: E402
-from pydantic import ValidationError as PydanticValidationError  # noqa: E402
-
 from ha_mcp.browser_landing import (  # noqa: E402
     register_browser_landing as _register_landing_route,
 )
 from ha_mcp.browser_landing import (  # noqa: E402
     register_healthz as _register_healthz_route,
 )
+from ha_mcp.log_filters import install_sdk_log_filters  # noqa: E402
 
 if TYPE_CHECKING:
-    from fastmcp import FastMCP
-
+    from ha_mcp._vendor.fastmcp import FastMCP
     from ha_mcp.client.rest_client import HomeAssistantClient
     from ha_mcp.config import Settings
     from ha_mcp.server import HomeAssistantSmartMCPServer
@@ -68,10 +50,9 @@ class OAuthProxyClient:
         self._oauth_clients: dict[str, HomeAssistantClient] = {}
         self._lock = threading.Lock()
 
-    def _get_oauth_client(self) -> "HomeAssistantClient":
-        """Get the OAuth client for the current request context."""
-        from fastmcp.server.dependencies import get_access_token
-
+    def current_client(self) -> HomeAssistantClient:
+        """The requesting user's client; per-user caches key on it, not the proxy."""
+        from ha_mcp._vendor.fastmcp.server.dependencies import get_access_token
         from ha_mcp.client.rest_client import (
             HomeAssistantAuthError,
             HomeAssistantClient,
@@ -120,7 +101,7 @@ class OAuthProxyClient:
 
     def __getattr__(self, name: str) -> Any:
         """Forward all attribute access to the OAuth client."""
-        client = self._get_oauth_client()
+        client = self.current_client()
         return getattr(client, name)
 
 
@@ -186,7 +167,7 @@ To fix this, you need to provide your Home Assistant connection details:
   1. HOMEASSISTANT_URL - Your Home Assistant instance URL
      Example: http://homeassistant.local:8123
 
-  2. HOMEASSISTANT_TOKEN - A long-lived access token
+  2. HOMEASSISTANT_TOKEN - A long-lived access token (an administrator's is recommended)
      Get one from: Home Assistant -> Profile -> Long-Lived Access Tokens
 
 Configuration options:
@@ -219,7 +200,7 @@ def _check_stdin_available() -> bool:
     try:
         fd = sys.stdin.fileno()
         mode = os.fstat(fd).st_mode
-    except (ValueError, OSError):
+    except ValueError, OSError:
         # fileno() or fstat() can raise if stdin is not a real file
         return False
 
@@ -275,7 +256,7 @@ For setup instructions, see:
     sys.exit(1)
 
 
-def _validate_standard_credentials(settings: "Settings") -> None:
+def _validate_standard_credentials(settings: Settings) -> None:
     """Exit with error if HA credentials are OAuth sentinels in standard (non-OAuth) mode."""
     from ha_mcp.config import OAUTH_MODE_TOKEN, OAUTH_MODE_URL
 
@@ -295,7 +276,7 @@ def _validate_standard_credentials(settings: "Settings") -> None:
 
 def _get_show_banner() -> bool:
     """Check if server banner should be shown (respects FASTMCP_SHOW_SERVER_BANNER env var)."""
-    import fastmcp
+    from ha_mcp._vendor import fastmcp
 
     return fastmcp.settings.show_server_banner
 
@@ -323,19 +304,23 @@ def _http_run_kwargs(host: str, port: int, path: str) -> dict[str, Any]:
         "path": path,
         "stateless_http": True,
         "show_banner": _get_show_banner(),
-        "uvicorn_config": {"log_config": _get_timestamped_uvicorn_log_config()},
+        # ws="none": uvicorn's default imports the shared websockets package.
+        "uvicorn_config": {
+            "log_config": _get_timestamped_uvicorn_log_config(),
+            "ws": "none",
+        },
     }
 
 
-def _create_server() -> "HomeAssistantSmartMCPServer":
+def _create_server() -> HomeAssistantSmartMCPServer:
     """Create server instance (deferred to avoid import during smoke test)."""
     from pydantic import ValidationError
 
     # Every deferred-``mcp`` entry point funnels through here before its
-    # Streamable-HTTP app is built -- ha-mcp-web, the add-on, and the
-    # ``fastmcp run fastmcp-http.json`` container path -- so default fastmcp's
-    # DNS-rebinding guard off once, here, for all of them. Direct-construction
-    # paths (_run_oauth_server, the in-process component server) call it themselves.
+    # Streamable-HTTP app is built -- ha-mcp-web and the add-on -- so default
+    # fastmcp's DNS-rebinding guard off once, here, for all of them.
+    # Direct-construction paths (_run_oauth_server, the in-process component
+    # server) call it themselves.
     from ha_mcp.transport_security import ensure_host_origin_guard_default_off
 
     ensure_host_origin_guard_default_off()
@@ -350,10 +335,10 @@ def _create_server() -> "HomeAssistantSmartMCPServer":
 
 
 # Lazy server creation - only create when needed
-_server: "HomeAssistantSmartMCPServer | None" = None
+_server: HomeAssistantSmartMCPServer | None = None
 
 
-def _get_mcp() -> "FastMCP":
+def _get_mcp() -> FastMCP:
     """Get the MCP instance, creating server if needed."""
     global _server
     if _server is None:
@@ -361,7 +346,7 @@ def _get_mcp() -> "FastMCP":
     return _server.mcp
 
 
-def _get_server() -> "HomeAssistantSmartMCPServer":
+def _get_server() -> HomeAssistantSmartMCPServer:
     """Get the server instance, creating if needed."""
     global _server
     if _server is None:
@@ -369,7 +354,7 @@ def _get_server() -> "HomeAssistantSmartMCPServer":
     return _server
 
 
-# For module-level access (e.g., fastmcp.json referencing ha_mcp.__main__:mcp)
+# For module-level access (homeassistant-addon/start.py imports ``mcp``)
 # This is accessed when the module is imported, so we need deferred creation
 class _DeferredMCP:
     """Wrapper that defers MCP creation until actually accessed."""
@@ -382,68 +367,6 @@ mcp = _DeferredMCP()
 
 
 _LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-
-
-class StatelessSessionLogFilter(logging.Filter):
-    """Suppress the routine 'Terminating session: None' log from the MCP SDK.
-
-    In stateless HTTP mode every request creates and tears down a temporary
-    session whose id is ``None``, so the SDK emits an INFO
-    ``Terminating session: None`` (mcp/server/streamable_http.py) on *every*
-    request. The line is routine but looks alarming and has repeatedly
-    confused users into thinking the connection is broken.
-
-    Returning ``False`` drops the record at this logger before it reaches any
-    handler. (Merely downgrading the level to DEBUG did not work: the level
-    gate is applied before the filter runs, so the record was already admitted
-    and still emitted -- just relabelled.) Real session terminations carry an
-    actual id and are not matched, so they still log.
-
-    # TODO: remove when modelcontextprotocol/python-sdk#2329 is resolved
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.name != "mcp.server.streamable_http":
-            return True
-        try:
-            message = record.getMessage()
-        except (ValueError, TypeError):
-            # A malformed %-format record on this logger is not our target, and
-            # a filter must not raise: filters run in Logger.handle() with no
-            # exception handling, so a raise would crash the logging call.
-            return True
-        # Drop the stateless teardown noise; keep everything else.
-        return "Terminating session: None" not in message
-
-
-class ToolValidationLogFilter(logging.Filter):
-    """Demote fastmcp tool-failure tracebacks to single-line warnings.
-
-    Pydantic ValidationError and tool-raised ToolError aren't server bugs,
-    so the traceback through fastmcp/pydantic internals is just noise. The
-    structured error detail is preserved in the WARNING message; stack is
-    intentionally dropped because these are user-input errors, not bugs.
-    """
-
-    def filter(self, record: logging.LogRecord) -> bool:
-        if record.name != "fastmcp.server.server" or not record.exc_info:
-            return True
-
-        msg = record.getMessage()
-        err = record.exc_info[1]
-        if "Error validating tool" in msg and isinstance(err, PydanticValidationError):
-            record.msg = f"{msg}: {err.errors(include_url=False)}"
-        elif "Error calling tool" in msg and isinstance(err, ToolError):
-            record.msg = f"{msg}: {err}"
-        else:
-            return True
-
-        record.args = ()
-        record.levelno = logging.WARNING
-        record.levelname = "WARNING"
-        record.exc_info = None
-        record.exc_text = None
-        return True
 
 
 class ProbeAccessLogFilter(logging.Filter):
@@ -505,8 +428,7 @@ def _setup_logging(log_level_str: str, force: bool = True) -> None:
     """
     log_level = getattr(logging, log_level_str)
 
-    import fastmcp
-
+    from ha_mcp._vendor import fastmcp
     from ha_mcp.utils.usage_logger import preserve_startup_collector
 
     with preserve_startup_collector():
@@ -528,10 +450,7 @@ def _setup_logging(log_level_str: str, force: bool = True) -> None:
         # disabled. Prevent that NOTSET namespace from inheriting our root handler.
         fastmcp_logger.setLevel(logging.CRITICAL + 1)
 
-    logging.getLogger("mcp.server.streamable_http").addFilter(
-        StatelessSessionLogFilter()
-    )
-    logging.getLogger("fastmcp.server.server").addFilter(ToolValidationLogFilter())
+    install_sdk_log_filters()
 
 
 def _log_startup_version() -> None:
@@ -568,7 +487,7 @@ def _log_startup_version() -> None:
             "A newer ha-mcp release is available: %s (you have %s). %s",
             info.latest,
             info.current,
-            update_command_hint(info.current),
+            update_command_hint(info.current, info),
         )
 
 
@@ -600,7 +519,7 @@ async def _cleanup_resources() -> None:
         logger.debug("WebSocket listener stopped")
     except ImportError:
         logger.debug("WebSocket listener module not available")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"WebSocket listener cleanup failed: {e}")
 
     # Close WebSocket manager connections
@@ -611,7 +530,7 @@ async def _cleanup_resources() -> None:
         logger.debug("WebSocket manager disconnected")
     except ImportError:
         logger.debug("WebSocket manager module not available")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"WebSocket manager cleanup failed: {e}")
 
     # Close the server's HTTP client
@@ -619,13 +538,13 @@ async def _cleanup_resources() -> None:
         try:
             await _server.close()
             logger.debug("Server closed")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Server cleanup failed: {e}")
 
     logger.info("Server resources cleaned up")
 
 
-def _log_cleanup_result(task: "asyncio.Future[None]") -> None:
+def _log_cleanup_result(task: asyncio.Future[None]) -> None:
     """Consume the cleanup task's outcome so a failure is never silent.
 
     ``asyncio.wait`` does not retrieve results, and the timeout path
@@ -683,7 +602,7 @@ async def _run_with_shutdown(server_coro: Coroutine[Any, Any, Any]) -> None:
     shutdown_task = asyncio.create_task(_shutdown_event.wait())
 
     try:
-        done, pending = await asyncio.wait(
+        done, _ = await asyncio.wait(
             [server_task, shutdown_task],
             return_when=asyncio.FIRST_COMPLETED,
         )
@@ -742,7 +661,7 @@ async def _run_with_shutdown(server_coro: Coroutine[Any, Any, Any]) -> None:
 
         try:
             await _cancel_tasks(server_task, shutdown_task)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             # Teardown must never mask the exception being propagated from the
             # try block (Python drops the original if finally raises).
             logger.warning(f"Task cancellation during shutdown failed: {e}")
@@ -846,7 +765,7 @@ def _force_exit(code: int) -> NoReturn:
         for stream in (sys.stdout, sys.stderr):
             try:
                 stream.flush()
-            except Exception:  # nothing actionable at exit
+            except Exception:  # nothing actionable at exit  # noqa: BLE001
                 pass
 
     try:
@@ -1107,7 +1026,7 @@ def _is_running_in_container() -> bool:
     so the bind host alone can't tell a loopback-only deployment from a
     LAN-reachable one — the default-path warning would be a false positive
     for every container. Container deployments are hardened through the
-    published guidance instead (AGENTS.md -> Docker; the add-on
+    published guidance instead (docs/agents/development.md -> Docker; the add-on
     auto-generates a secret path).
     """
     # Docker writes /.dockerenv; Podman writes /run/.containerenv.
@@ -1204,7 +1123,7 @@ def _oidc_allowed_client_redirect_uris() -> list[str] | None:
 
 
 def register_browser_landing(
-    mcp_instance: "FastMCP | _DeferredMCP",
+    mcp_instance: FastMCP | _DeferredMCP,
     path: str,
 ) -> None:
     """Register the friendly browser landing page and tidy the uvicorn access log.
@@ -1343,8 +1262,8 @@ def _resolve_settings_secret_path() -> str | None:
 
 
 def _register_settings_ui_secret_path(
-    mcp: "FastMCP",
-    server: "HomeAssistantSmartMCPServer",
+    mcp: FastMCP,
+    server: HomeAssistantSmartMCPServer,
     host: str,
     port: int,
     mcp_path: str,

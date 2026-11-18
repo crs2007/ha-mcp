@@ -3,12 +3,14 @@
 The canonical store is ``src/ha_mcp/settings_ui/locales/<code>.json`` — one
 file per language holding every translatable string, including the add-on
 option strings under ``addon.<key>.*`` / ``addon_stable.<key>.*`` and the
-shared feature strings under ``features.<key>.*``. The derived catalogs stay
+strings shared with the settings UI under ``features.<key>.*``,
+``advanced.<key>.*`` and ``backup.fields.<key>.*``. The derived catalogs stay
 committed at the fixed paths Supervisor and the web UI read them from:
 
 - ``homeassistant-addon/translations/<code>.yaml``
 - ``homeassistant-addon-dev/translations/<code>.yaml``
-- the ``FEATURE_META`` block in ``src/ha_mcp/settings_ui/settings.js``
+- the ``FEATURE_META`` block in
+  ``src/ha_mcp/settings_ui/settings_js/05_feature_flags.js``
 
 Each add-on flavor's key list comes from its own ``config.yaml`` ``schema:``,
 so the two flavors project different subsets of the one canonical store. Per
@@ -17,13 +19,22 @@ key and field the text is resolved in override order:
 1. ``addon_<flavor>.<key>.<name|description>`` — flavor-specific wording
 2. ``features.<key>.<label|help>`` — strings shared with the settings UI
 3. ``addon.<key>.<name|description>`` — add-on-only options
+4. ``advanced.<key>.<label|help>`` and ``backup.fields.<key>.<label|help>`` —
+   the settings UI's own rows for an option it also shows
 
 A locale that lacks a key falls back to English, mirroring the settings UI's
 own per-key fallback, so every generated catalog is structurally complete.
+An option whose schema type carries a range (``int(0,32)``) gets
+``common.range`` appended to its description.
+
+Best-effort locales are still generated when their canonical catalog is valid.
+If one is invalid, generation uses an empty override map (therefore English
+fallback), and ``--check`` reports any best-effort output drift as a warning
+instead of returning failure.
 
 ``FEATURE_META`` (the settings UI's English fallback for feature rows, and
 the row order) is generated from ``en.json``'s ``features.*`` keys between
-marker comments in ``settings.js``.
+marker comments in ``settings_js/05_feature_flags.js``.
 
 Usage::
 
@@ -42,11 +53,14 @@ from pathlib import Path
 
 import yaml  # type: ignore[import-untyped]
 
-from ha_mcp.settings_ui._i18n import _validate_string_map
+from ha_mcp.settings_ui.i18n import _validate_string_map
+from ha_mcp.settings_ui.locale_policy import is_best_effort_locale
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LOCALES_DIR = REPO_ROOT / "src" / "ha_mcp" / "settings_ui" / "locales"
-SETTINGS_JS = REPO_ROOT / "src" / "ha_mcp" / "settings_ui" / "settings.js"
+SETTINGS_JS = (
+    REPO_ROOT / "src" / "ha_mcp" / "settings_ui" / "settings_js" / "05_feature_flags.js"
+)
 ADDON_FLAVORS = {
     "stable": REPO_ROOT / "homeassistant-addon",
     "dev": REPO_ROOT / "homeassistant-addon-dev",
@@ -56,6 +70,30 @@ FEATURE_META_BEGIN = "// FEATURE_META:BEGIN GENERATED (scripts/generate_locales.
 FEATURE_META_END = "// FEATURE_META:END GENERATED"
 
 _FEATURE_KEY_RE = re.compile(r"^features\.([a-z0-9_]+)\.label$")
+_SCHEMA_RANGE_RE = re.compile(r"^(?:int|float)\(([^,]+),([^)]+)\)\??$")
+
+
+def _validate_best_effort_messages(
+    value: object, *, context: str, path: Path
+) -> dict[str, str]:
+    """Drop invalid entries while retaining valid best-effort translations."""
+    if not isinstance(value, dict):
+        return _validate_string_map(value, context=context)
+
+    result: dict[str, str] = {}
+    for key, text in value.items():
+        try:
+            result.update(_validate_string_map({key: text}, context=context))
+        except ValueError as exc:
+            entry = (
+                f"{context}.{key}" if isinstance(key, str) else f"{context}[{key!r}]"
+            )
+            print(
+                f"::warning file={path}::Ignoring invalid best-effort locale "
+                f"entry {entry}: {exc}",
+                file=sys.stderr,
+            )
+    return result
 
 
 def load_catalogs() -> dict[str, dict[str, str]]:
@@ -67,19 +105,51 @@ def load_catalogs() -> dict[str, dict[str, str]]:
     """
     catalogs: dict[str, dict[str, str]] = {}
     for path in sorted(LOCALES_DIR.glob("*.json")):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        catalogs[path.stem] = _validate_string_map(
-            data.get("messages"), context=f"{path.name}.messages"
-        )
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError(f"{path.name} must contain a JSON object")
+            context = f"{path.name}.messages"
+            messages = data.get("messages")
+            if is_best_effort_locale(path.stem):
+                catalogs[path.stem] = _validate_best_effort_messages(
+                    messages, context=context, path=path
+                )
+            else:
+                catalogs[path.stem] = _validate_string_map(messages, context=context)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            if not is_best_effort_locale(path.stem):
+                raise
+            print(
+                f"::warning file={path}::Using English fallback for best-effort "
+                f"locale {path.stem} because its catalog is invalid: {exc}",
+                file=sys.stderr,
+            )
+            catalogs[path.stem] = {}
     if "en" not in catalogs:
         raise SystemExit(f"no en.json in {LOCALES_DIR}")
     return catalogs
 
 
-def schema_keys(addon_dir: Path) -> list[str]:
-    """The option keys of one flavor's ``config.yaml``, in schema order."""
+def schema(addon_dir: Path) -> dict[str, str]:
+    """One flavor's ``config.yaml`` ``schema:``, in schema order."""
     config = yaml.safe_load((addon_dir / "config.yaml").read_text(encoding="utf-8"))
-    return list(config["schema"])
+    return {key: str(value) for key, value in config["schema"].items()}
+
+
+def range_sentence(
+    messages: dict[str, str], english: dict[str, str], schema_type: str
+) -> str:
+    """``common.range`` filled from an ``int(min,max)`` schema type, or "".
+
+    The catalog sentences leave ranges out; the settings UI renders them
+    from the same metadata the schema is generated from.
+    """
+    match = _SCHEMA_RANGE_RE.match(schema_type)
+    if match is None:
+        return ""
+    template = messages.get("common.range", english["common.range"])
+    return template.replace("{min}", match.group(1)).replace("{max}", match.group(2))
 
 
 def feature_keys_in_order(english: dict[str, str]) -> list[str]:
@@ -104,6 +174,8 @@ def resolve_text(
         f"addon_{flavor}.{key}.{field}",
         f"features.{key}.{ui_field}",
         f"addon.{key}.{field}",
+        f"advanced.{key}.{ui_field}",
+        f"backup.fields.{key}.{ui_field}",
     )
     # Locale-then-English per candidate, not all-locale-then-all-English: a
     # flavor override that the locale has not translated yet must fall back
@@ -117,13 +189,14 @@ def resolve_text(
             return english[candidate]
     raise SystemExit(
         f"no canonical string for add-on option {key!r} field {field!r} — add "
-        f"addon.{key}.{field} (or features.{key}.{ui_field}) to en.json"
+        f"addon.{key}.{field} (or features.{key}.{ui_field}, "
+        f"advanced.{key}.{ui_field} or backup.fields.{key}.{ui_field}) to en.json"
     )
 
 
 def addon_yaml(
     flavor: str,
-    keys: list[str],
+    option_schema: dict[str, str],
     messages: dict[str, str],
     english: dict[str, str],
     code: str,
@@ -132,9 +205,16 @@ def addon_yaml(
     configuration = {
         key: {
             "name": resolve_text(messages, english, flavor, key, "name"),
-            "description": resolve_text(messages, english, flavor, key, "description"),
+            "description": " ".join(
+                part
+                for part in (
+                    resolve_text(messages, english, flavor, key, "description"),
+                    range_sentence(messages, english, schema_type),
+                )
+                if part
+            ),
         }
-        for key in keys
+        for key, schema_type in option_schema.items()
     }
     body: str = yaml.safe_dump(
         {"configuration": configuration},
@@ -146,14 +226,14 @@ def addon_yaml(
         "---\n"
         f"# GENERATED FILE — do not edit. Translations live in\n"
         f"# src/ha_mcp/settings_ui/locales/{code}.json (keys addon.*, "
-        "features.*,\n"
-        f"# addon_{flavor}.*); regenerate with: python scripts/generate_locales.py\n"
-        + body
+        "features.*, advanced.*,\n"
+        f"# backup.fields.*, addon_{flavor}.*); regenerate with: "
+        "python scripts/generate_locales.py\n" + body
     )
 
 
 def feature_meta_block(english: dict[str, str]) -> str:
-    """The generated ``FEATURE_META`` region for ``settings.js``.
+    """The generated ``FEATURE_META`` region for the settings script.
 
     English fallback for feature rows when the i18n payload lacks a
     ``features.<field>`` key; the object's key order is the row render order
@@ -184,7 +264,7 @@ def feature_meta_block(english: dict[str, str]) -> str:
 
 
 def settings_js_with_block(block: str) -> str:
-    """``settings.js`` with the marker region replaced by ``block``."""
+    """The ``FEATURE_META`` part file with the marker region replaced by ``block``."""
     text = SETTINGS_JS.read_text(encoding="utf-8")
     begin = text.find(FEATURE_META_BEGIN)
     end = text.find(FEATURE_META_END)
@@ -202,22 +282,50 @@ def generated_files() -> dict[Path, str]:
     english = catalogs["en"]
     outputs: dict[Path, str] = {}
     for flavor, addon_dir in ADDON_FLAVORS.items():
-        keys = schema_keys(addon_dir)
+        option_schema = schema(addon_dir)
         for code, messages in catalogs.items():
             outputs[addon_dir / "translations" / f"{code}.yaml"] = addon_yaml(
-                flavor, keys, messages, english, code
+                flavor, option_schema, messages, english, code
             )
     outputs[SETTINGS_JS] = settings_js_with_block(feature_meta_block(english))
     return outputs
 
 
+def _committed_text(path: Path) -> str:
+    """Read generated output, tolerating corrupt best-effort locale bytes."""
+    if not path.exists():
+        return ""
+    try:
+        return path.read_text(encoding="utf-8")
+    except UnicodeError as exc:
+        if not is_best_effort_locale(path.stem):
+            raise
+        relative = path.relative_to(REPO_ROOT)
+        print(
+            f"::warning file={relative}::best-effort locale output is not "
+            f"valid UTF-8 and will be treated as stale: {exc}",
+            file=sys.stderr,
+        )
+        return ""
+
+
 def check() -> int:
     """Exit 1 naming every derived file that no longer matches the canon."""
     stale: list[str] = []
+    best_effort_stale: list[str] = []
     for path, content in generated_files().items():
-        committed = path.read_text(encoding="utf-8") if path.exists() else ""
+        committed = _committed_text(path)
         if committed != content:
-            stale.append(str(path.relative_to(REPO_ROOT)))
+            relative = str(path.relative_to(REPO_ROOT))
+            if is_best_effort_locale(path.stem):
+                print(
+                    f"::warning file={relative}::best-effort locale output is "
+                    "out of sync; run python scripts/generate_locales.py to refresh it",
+                    file=sys.stderr,
+                )
+                best_effort_stale.append(relative)
+            else:
+                stale.append(relative)
             diff = difflib.unified_diff(
                 committed.splitlines()[:20],
                 content.splitlines()[:20],
@@ -232,6 +340,12 @@ def check() -> int:
             file=sys.stderr,
         )
         return 1
+    if best_effort_stale:
+        print(
+            "strict derived locale catalogs are in sync; best-effort locale "
+            f"drift was reported above for: {best_effort_stale}"
+        )
+        return 0
     print("derived locale catalogs are in sync")
     return 0
 
@@ -239,7 +353,7 @@ def check() -> int:
 def write() -> int:
     changed = 0
     for path, content in generated_files().items():
-        if not path.exists() or path.read_text(encoding="utf-8") != content:
+        if _committed_text(path) != content:
             path.write_text(content, encoding="utf-8", newline="\n")
             changed += 1
             print(f"wrote {path.relative_to(REPO_ROOT)}")

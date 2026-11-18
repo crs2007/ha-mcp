@@ -1,6 +1,9 @@
 """Test Docker image builds successfully and contains expected components."""
 
+import json
 import subprocess
+
+from tests.addon.docker_build import python_base_args
 
 DATA_DIR = "/home/mcpuser/.ha-mcp"
 
@@ -11,7 +14,7 @@ class TestDockerBuild:
     def test_dockerfile_builds_successfully(self):
         """Verify Dockerfile builds without errors."""
         result = subprocess.run(
-            ["docker", "build", "-t", "ha-mcp-test", "."],
+            ["docker", "build", "-t", "ha-mcp-test", *python_base_args(), "."],
             capture_output=True,
             text=True,
             check=False,
@@ -37,14 +40,33 @@ class TestDockerBuild:
         )
 
     def test_ha_mcp_command_exists(self):
-        """Verify ha-mcp command is installed."""
+        """Verify the stdio default and the Compose HTTP entry point are installed."""
+        for command in ("ha-mcp", "ha-mcp-web"):
+            result = subprocess.run(
+                ["docker", "run", "--rm", "ha-mcp-test", "which", command],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert result.returncode == 0, f"{command} is not on the image PATH"
+
+    def test_default_command_is_the_stdio_entry_point(self):
+        """``docker run -i IMAGE`` starts ha-mcp itself, not a removed config file."""
         result = subprocess.run(
-            ["docker", "run", "--rm", "ha-mcp-test", "which", "ha-mcp"],
+            [
+                "docker",
+                "image",
+                "inspect",
+                "--format",
+                "{{json .Config.Cmd}}",
+                "ha-mcp-test",
+            ],
             capture_output=True,
             text=True,
             check=False,
         )
-        assert result.returncode == 0
+        assert result.returncode == 0, result.stderr
+        assert json.loads(result.stdout) == ["ha-mcp"]
 
     def test_runs_as_non_root_user(self):
         """Verify container runs as non-root user for security."""

@@ -19,6 +19,8 @@ permissions:
 jobs:
   # Skip if commit is from semantic-release (version bump commits)
   check-skip:
+    # Dev publishing of this repository only; every later job depends on this one.
+    if: github.repository == 'homeassistant-ai/ha-mcp'
     runs-on: ubuntu-latest
     outputs:
       should_skip: ${{ steps.check.outputs.should_skip }}
@@ -50,25 +52,35 @@ jobs:
           # Full history: the dev version number is the commit count.
           fetch-depth: 0
 
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # renovate: datasource=github-releases depName=astral-sh/uv
+          version: "0.13.7"
+
       - name: Generate dev version
         id: version
         run: |
-          # Get base version from pyproject.toml
-          BASE_VERSION=$(grep '^version = ' pyproject.toml | sed 's/version = "\(.*\)"/\1/')
           SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          # dev N = commit count on master: the same commit produces the SAME
-          # number in every workflow (PyPI/Docker in publish-dev, the dev
-          # add-on here), so all surfaces report one dev version. run_number
-          # was per-workflow, which is how the add-on drifted ~300 builds
-          # behind the PyPI counter and made version reports incomparable.
-          # Count origin/master (not HEAD): a workflow_dispatch on an older
-          # ref would otherwise mint a LOWER number that collides with an
-          # existing dev release and clobbers it.
-          DEV_VERSION="${BASE_VERSION}.dev$(git rev-list --count origin/master)"
+          # <next release>.dev<commit count>: the same commit produces the
+          # SAME number in every workflow (PyPI/Docker here, the dev app), so
+          # all surfaces report one dev version. See the script for why the
+          # base is the NEXT release and which commit it counts.
+          DEV_VERSION=$(scripts/dev_version.sh)
 
-          echo "dev_version=$DEV_VERSION" >> $GITHUB_OUTPUT
-          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "dev_version=$DEV_VERSION" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$SHORT_SHA" >> "$GITHUB_OUTPUT"
           echo "Dev version: $DEV_VERSION (sha: $SHORT_SHA)"
+          echo "$DEV_VERSION" > dev-version.txt
+
+      # The mirror sync pins the HACS pre-release to exactly this build, so it
+      # reads the number from here rather than recomputing it.
+      - name: Hand the dev version to the mirror sync
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: dev-version
+          path: dev-version.txt
+          retention-days: 7
 
   publish-pypi-dev:
     name: Publish PyPI (dev channel)
@@ -89,7 +101,10 @@ jobs:
           submodules: true
 
       - name: Install uv
-        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          # renovate: datasource=github-releases depName=astral-sh/uv
+          version: "0.13.7"
 
       - name: Temporarily set package name and version for dev build
         run: |
@@ -109,7 +124,7 @@ jobs:
         run: uv build
 
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1
         with:
           packages-dir: dist
           skip-existing: true
@@ -128,17 +143,17 @@ jobs:
           submodules: true
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push Docker image (dev tags)
-        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        uses: ./.github/actions/docker-build-python-base-fallback
         with:
           context: .
           file: ./Dockerfile
@@ -159,7 +174,11 @@ jobs:
 
   create-prerelease:
     name: Create GitHub pre-release
-    needs: prepare
+    # HACS installs this tag, and Home Assistant then installs its pin from
+    # PyPI: only master's build is the dev pre-release (a branch dispatch
+    # computes master's number), and only once PyPI serves it.
+    needs: [prepare, publish-pypi-dev]
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -167,66 +186,85 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
+          # The notes list the commits since the previous dev build's tag.
+          fetch-depth: 0
+          fetch-tags: true
+
+      # HACS installs a pre-release from the commit its tag names, so that
+      # commit must carry the component stamped with this build's version and
+      # its ha-mcp-dev pin (#2763). The stamp goes on a commit of its own that
+      # only the tag references; master is untouched.
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.14"
+      - name: Wait for the build on PyPI
+        env:
+          VERSION: ${{ needs.prepare.outputs.dev_version }}
+        run: |
+          for _ in $(seq 1 60); do
+            if curl -fsS -o /dev/null "https://pypi.org/pypi/ha-mcp-dev/${VERSION}/json"; then
+              echo "PyPI serves ha-mcp-dev ${VERSION}"
+              exit 0
+            fi
+            sleep 30
+          done
+          echo "::error::PyPI never served ha-mcp-dev ${VERSION}; not tagging a component that pins it."
+          exit 1
+
+      - name: Stamp the component for this build
+        env:
+          VERSION: ${{ needs.prepare.outputs.dev_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          python3 scripts/stamp_component_version.py \
+            --component-dir custom_components/ha_mcp_tools \
+            --version "${VERSION%.dev*}" --pin "$VERSION" --dist ha-mcp-dev
+          git commit --quiet -am "chore(internal): stamp the component for dev build ${VERSION} [skip ci]"
 
       - name: Create pre-release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.prepare.outputs.dev_version }}
+          SHORT_SHA: ${{ needs.prepare.outputs.short_sha }}
         run: |
-          VERSION="${{ needs.prepare.outputs.dev_version }}"
           TAG="v${VERSION}"
-          SHORT_SHA="${{ needs.prepare.outputs.short_sha }}"
 
-          # Create release notes
-          cat > release_notes.md << EOF
-          ## Development Build
+          # One line per pull request merged since the previous dev build,
+          # then the other ways to install this build.
+          python3 scripts/build_mirror_release_notes.py \
+            --dev-pin "$VERSION" --dist ha-mcp-dev \
+            --source "$GITHUB_SHA" --source-label "${GITHUB_REPOSITORY}@${SHORT_SHA}" \
+            --out release_notes.md
+          cat >> release_notes.md << EOF
 
-          **Version:** ${VERSION}
-          **Commit:** ${SHORT_SHA}
-          **Branch:** master
+          ### Other installs
 
-          This is an automated development build. Use at your own risk.
+          **Docker (dev channel):** \`docker pull ghcr.io/${GITHUB_REPOSITORY}:dev\`
 
-          For stable releases, download from the [latest release](https://github.com/${{ github.repository }}/releases/latest).
-
-          ### Installation
-
-          **Docker (dev channel):**
-          \`\`\`bash
-          docker pull ghcr.io/${{ github.repository }}:dev
-          \`\`\`
-
-          **PyPI (dev channel):**
-          \`\`\`bash
-          pip install ha-mcp-dev
-          \`\`\`
+          **PyPI (dev channel):** \`pip install ha-mcp-dev\`
           EOF
 
           # Delete old pre-release with same tag if exists
           gh release delete "$TAG" --yes 2>/dev/null || true
           gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/$TAG" 2>/dev/null || true
 
-          # Create new draft pre-release (binaries will be added by build-and-release workflow)
+          # Forced both ways: a re-run holds this tag from the checkout's
+          # fetch, and the remote one stays if its deletion above failed.
+          git tag -f "$TAG" HEAD
+          git push --quiet --force "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "refs/tags/$TAG"
           gh release create "$TAG" \
+            --verify-tag \
             --title "Dev Build $VERSION" \
             --notes-file release_notes.md \
-            --prerelease \
-            --draft
+            --prerelease
 
-          echo "✓ Created draft pre-release $TAG (waiting for binaries)"
-
-  # Build binaries and attach to release
-  build-and-release:
-    needs: [prepare, create-prerelease]
-    uses: ./.github/workflows/_build-and-release.yml
-    with:
-      release_tag: v${{ needs.prepare.outputs.dev_version }}
-      is_prerelease: true
-    permissions:
-      contents: write
+          echo "✓ Created pre-release $TAG"
 
   cleanup-old-prereleases:
     name: Cleanup old pre-releases
-    needs: build-and-release
+    needs: create-prerelease
     runs-on: ubuntu-latest
     permissions:
       contents: write

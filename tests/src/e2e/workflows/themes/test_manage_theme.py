@@ -12,10 +12,12 @@ import logging
 import pytest
 
 from ...utilities.assertions import (
+    MCPAssertions,
     extract_error_message,
     parse_mcp_result,
     safe_call_tool,
 )
+from ...utilities.cleanup import CleanupSteps
 
 logger = logging.getLogger(__name__)
 
@@ -160,15 +162,16 @@ class TestManageTheme:
         finally:
             # Cleanup: restore container to clean state for sibling tests.
             # Reset light mode to 'default' and clear dark override with 'none'.
-            await mcp_client.call_tool(
-                "ha_manage_theme",
-                {"action": "set", "theme_name": "default"},
-            )
-            await mcp_client.call_tool(
-                "ha_manage_theme",
-                {"action": "set", "theme_name": "none", "mode": "dark"},
-            )
-            logger.info("Cleaned up theme state (reset to default/none)")
+            with CleanupSteps() as cleanup:
+                with cleanup.step():
+                    await MCPAssertions(mcp_client).call_tool_success(
+                        "ha_manage_theme", {"action": "set", "theme_name": "default"}
+                    )
+                with cleanup.step():
+                    await MCPAssertions(mcp_client).call_tool_success(
+                        "ha_manage_theme",
+                        {"action": "set", "theme_name": "none", "mode": "dark"},
+                    )
 
     async def test_set_unknown_theme_fails(self, mcp_client):
         """action='set' with a non-installed theme surfaces HA's validation error."""
@@ -195,4 +198,56 @@ class TestManageTheme:
         error = data.get("error") or {}
         assert error.get("code") == "VALIDATION_MISSING_PARAMETER", (
             f"Expected VALIDATION_MISSING_PARAMETER, got: {data}"
+        )
+
+    async def test_set_engine_theme_without_value_fails(self, mcp_client):
+        """action='set_engine_theme' without value returns a validation error.
+
+        This check runs before any engine resolution, so it is deterministic
+        whether or not a screenshot engine is configured for the run.
+        """
+        data = await safe_call_tool(
+            mcp_client, "ha_manage_theme", {"action": "set_engine_theme"}
+        )
+
+        assert data.get("success") is False
+        error = data.get("error") or {}
+        assert error.get("code") == "VALIDATION_MISSING_PARAMETER", (
+            f"Expected VALIDATION_MISSING_PARAMETER, got: {data}"
+        )
+
+    async def test_get_engine_theme_fails_actionably_without_an_engine(
+        self, mcp_client
+    ):
+        """The engine-account read never crashes: it succeeds or explains.
+
+        The e2e instance has no screenshot engine, so this exercises the
+        failure contract — a structured error naming why the engine account
+        could not be reached, rather than a raw exception or a silent read of
+        ha-mcp's OWN profile (which is the bug the identity guard prevents).
+        """
+        data = await safe_call_tool(
+            mcp_client, "ha_manage_theme", {"action": "get_engine_theme"}
+        )
+
+        if data.get("success") is True:
+            # An engine IS configured for this run: the value must be the
+            # user-data shape (dict) or None when never configured.
+            theme = data["data"]["theme"]
+            assert theme is None or isinstance(theme, dict), (
+                f"Unexpected engine theme payload: {data}"
+            )
+            return
+
+        assert data.get("success") is False, (
+            f"Expected an explicit failure, got: {data}"
+        )
+        # Assert the structured-error contract rather than matching wording:
+        # the message varies with WHY the engine is unavailable (not
+        # configured, not installed, not started, unidentifiable account).
+        error = data.get("error") or {}
+        assert error.get("code"), f"Failure must carry an error code: {data}"
+        assert extract_error_message(data), f"Failure must carry a message: {data}"
+        assert error.get("suggestions"), (
+            f"Engine failures must be actionable, not bare: {data}"
         )

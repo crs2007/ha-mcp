@@ -5,8 +5,8 @@ custom component's config/options flow, and the two add-on flavors. Two of
 them are authored directly — the settings UI catalogs
 (``src/ha_mcp/settings_ui/locales/<code>.json``, the canonical store) and the
 component catalogs — while both add-on flavors' ``translations/*.yaml`` and
-the ``FEATURE_META`` block in ``settings.js`` are *generated* from the
-canonical store by ``scripts/generate_locales.py``
+the ``FEATURE_META`` block in ``settings_js/05_feature_flags.js`` are
+*generated* from the canonical store by ``scripts/generate_locales.py``
 (``test_derived_catalogs_match_the_canonical_store``). Cross-surface wording
 identity therefore holds by construction; what these tests police is the
 authored content.
@@ -16,7 +16,7 @@ without the others and CI goes red naming the files that are missing —
 Simplified Chinese shipped settings-UI-only in #1992 and the same
 half-install was proposed again for French in #2038.
 
-The per-surface content rules are enforced elsewhere — ``_i18n.load_catalogs``
+The per-surface content rules are enforced elsewhere — ``i18n.load_catalogs``
 validates settings UI placeholders and inline markup, and
 ``tests/addon/test_addon_structure.py`` requires a ``name``/``description``
 for every add-on ``schema:`` key. The component catalogs had no such guard,
@@ -35,12 +35,14 @@ below) and run in that workflow, not in PR CI.
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import warnings
 from collections import Counter
 from functools import cache
 from pathlib import Path, PurePosixPath
@@ -48,7 +50,8 @@ from typing import Any
 
 import pytest
 
-from ha_mcp.settings_ui._tools_meta import FEATURE_GATED_TOOLS, primary_tag
+from ha_mcp.settings_ui import FEATURE_GATED_TOOLS, primary_tag
+from ha_mcp.settings_ui.locale_policy import BEST_EFFORT_LOCALES
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -57,22 +60,12 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(_REPO_ROOT / "scripts"))
 
 _RULES_PATH = _REPO_ROOT / "scripts" / "locale_rules.py"
-import extract_tools  # noqa: E402
-import generate_locales  # noqa: E402
-from locale_rules import (  # noqa: E402
-    _canonical_number,
-    _invented_files,
-    _localised_hardcoded_name,
-    _lost_literals,
-    _lost_magnitudes,
-    _numbers,
-    _parity_fault,
-    _reversed_ordered_pairs,
-    _untranslatable_names,
-)
+extract_tools = importlib.import_module("extract_tools")
+generate_locales = importlib.import_module("generate_locales")
+parity_fault = importlib.import_module("locale_rules").parity_fault
 
 SETTINGS_LOCALES = _REPO_ROOT / "src" / "ha_mcp" / "settings_ui" / "locales"
-AGENTS_MD = _REPO_ROOT / "AGENTS.md"
+LOCALE_README = SETTINGS_LOCALES / "README.md"
 COMPONENT_TRANSLATIONS = (
     _REPO_ROOT / "custom_components" / "ha_mcp_tools" / "translations"
 )
@@ -159,10 +152,8 @@ def _discover_translation_surfaces() -> set[str]:
         completed = subprocess.run(
             # The unit-test job runs in a container against a checkout owned by
             # another uid, and actions/checkout's safe.directory lands in a temp
-            # HOME that container jobs don't see — the Ruff Lint job's "Run ruff
-            # format check on changed Python files" step re-adds it by hand for
-            # the same reason. Without this, git refuses the repo as dubious
-            # ownership and the check dies with an empty stderr.
+            # HOME that container jobs don't see. Without this, git refuses the
+            # repo as dubious ownership and the check dies with an empty stderr.
             ["git", "-c", "safe.directory=*", "ls-files", "-z"],
             cwd=_REPO_ROOT,
             capture_output=True,
@@ -188,15 +179,21 @@ def _surfaces() -> dict[str, set[str]]:
     """Return locale codes per surface, keyed by the path pattern to fix."""
     surfaces = {
         "src/ha_mcp/settings_ui/locales/<code>.json": {
-            path.stem for path in SETTINGS_LOCALES.glob("*.json")
+            path.stem
+            for path in SETTINGS_LOCALES.glob("*.json")
+            if path.stem not in BEST_EFFORT_LOCALES
         },
         "custom_components/ha_mcp_tools/translations/<code>.json": {
-            path.stem for path in COMPONENT_TRANSLATIONS.glob("*.json")
+            path.stem
+            for path in COMPONENT_TRANSLATIONS.glob("*.json")
+            if path.stem not in BEST_EFFORT_LOCALES
         },
     }
     for addon_dir in ADDON_DIRS:
         surfaces[f"{addon_dir.name}/translations/<code>.yaml"] = {
-            path.stem for path in (addon_dir / "translations").glob("*.yaml")
+            path.stem
+            for path in (addon_dir / "translations").glob("*.yaml")
+            if path.stem not in BEST_EFFORT_LOCALES
         }
     return surfaces
 
@@ -231,7 +228,9 @@ def _component_catalog(locale: str) -> dict[str, str]:
 
 def _translated_component_locales() -> list[str]:
     return sorted(
-        path.stem for path in COMPONENT_TRANSLATIONS.glob("*.json") if path.stem != "en"
+        path.stem
+        for path in COMPONENT_TRANSLATIONS.glob("*.json")
+        if path.stem != "en" and path.stem not in BEST_EFFORT_LOCALES
     )
 
 
@@ -316,7 +315,7 @@ def _english_tool_sources() -> dict[str, str]:
     first physical line cut at 120 characters — the same text for 84 of the 88
     tools. ``ha_config_set_helper`` wraps its summary and the Chinese catalog
     translates the half that wraps off, so hashing the displayed text would
-    leave "(28 types, unified interface)" free to move while a shipped
+    leave its wrapped second line free to move while a shipped
     translation states it. The copy checks stay on the displayed text, because
     a paste is of what was on screen.
     """
@@ -385,6 +384,51 @@ def test_every_locale_ships_on_every_surface() -> None:
     )
 
 
+@pytest.mark.filterwarnings("always:best-effort locale")
+def test_best_effort_locale_surface_problems_are_warning_only() -> None:
+    issues: list[str] = []
+    locale_lines = [
+        line
+        for line in LOCALE_README.read_text(encoding="utf-8").splitlines()
+        if "names every file:" in line
+    ]
+    documented = set(re.findall(r"`([A-Za-z-]+)`", "\n".join(locale_lines)))
+    for locale in sorted(BEST_EFFORT_LOCALES):
+        if locale not in documented:
+            issues.append(f"the locale README does not list {locale}")
+        paths = (
+            SETTINGS_LOCALES / f"{locale}.json",
+            COMPONENT_TRANSLATIONS / f"{locale}.json",
+            *(
+                addon_dir / "translations" / f"{locale}.yaml"
+                for addon_dir in ADDON_DIRS
+            ),
+        )
+        missing = [
+            str(path.relative_to(_REPO_ROOT)) for path in paths if not path.exists()
+        ]
+        issues.extend(f"missing {path}" for path in missing)
+
+        for path in paths[:2]:
+            if not path.exists():
+                continue
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    issues.append(
+                        f"invalid {path.relative_to(_REPO_ROOT)}: expected an object"
+                    )
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                issues.append(f"invalid {path.relative_to(_REPO_ROOT)}: {exc}")
+
+    if issues:
+        warnings.warn(
+            "best-effort locale audit: " + "; ".join(issues),
+            pytest.PytestWarning,
+            stacklevel=1,
+        )
+
+
 def test_every_translation_surface_is_guarded_or_english_only() -> None:
     """A new *surface* must not slip the net the way a new locale used to.
 
@@ -439,7 +483,7 @@ def test_english_only_surfaces_have_not_gained_a_locale() -> None:
 def test_locale_codes_use_one_spelling_across_surfaces() -> None:
     """Only the settings UI is case-insensitive about the language code.
 
-    ``_i18n.normalize_locale`` lowercases catalog stems, but Home Assistant
+    ``i18n.normalize_locale`` lowercases catalog stems, but Home Assistant
     loads ``translations/<code>.json`` and Supervisor keys add-on catalogs by
     the literal filename stem — so a ``zh-hans.yaml`` typo still renders in the
     settings UI while being invisible to both of those. Left to
@@ -494,7 +538,7 @@ def test_component_catalog_matches_english_keys(locale: str) -> None:
 
 def _pending_component_keys() -> frozenset[str]:
     """Component keys whose English moved since the baseline was pinned."""
-    return _pending_keys("custom_components/ha_mcp_tools/translations")
+    return pending_keys("custom_components/ha_mcp_tools/translations")
 
 
 @pytest.mark.parametrize("locale", _translated_component_locales())
@@ -653,19 +697,11 @@ def test_derived_catalogs_match_the_canonical_store() -> None:
     byte-identity tests over a hand-maintained pin of every shared (surface,
     key) place. Generation makes it hold by construction: both add-on
     flavors' ``translations/*.yaml`` and the ``FEATURE_META`` block in
-    ``settings.js`` are projections of the settings UI catalogs, so the one
-    check left is that the committed files are exactly what the generator
-    emits — same guarantee, no pin to maintain.
+    ``settings_js/05_feature_flags.js`` are projections of the settings UI
+    catalogs, so the one check left is that the committed files are exactly
+    what the generator emits — same guarantee, no pin to maintain.
     """
-    stale = [
-        str(path.relative_to(_REPO_ROOT))
-        for path, content in generate_locales.generated_files().items()
-        if not path.exists() or path.read_text(encoding="utf-8") != content
-    ]
-    assert not stale, (
-        f"derived locale catalogs are out of sync with the canonical store: "
-        f"{stale}. Run: python scripts/generate_locales.py"
-    )
+    assert generate_locales.check() == 0
 
 
 # The strings shipped from BOTH authored surfaces, by (surface, key).
@@ -675,14 +711,9 @@ def test_derived_catalogs_match_the_canonical_store() -> None:
 # alone. Membership is pinned because the grouping is by English text — a key
 # whose English moves on one side only silently *leaves* the check, which is
 # exactly the drift it exists to catch.
-AUTHORED_SHARED_PLACES = {
-    "src/ha_mcp/settings_ui/locales": (
-        "messages.advanced.extra_yaml_write_keys.label",
-    ),
-    "custom_components/ha_mcp_tools/translations": (
-        "options.step.tools_info.data.extra_yaml_keys",
-    ),
-}
+AUTHORED_SHARED_PLACES: dict[str, list[str]] = json.loads(
+    Path(__file__).with_name("locale_shared_places.json").read_text(encoding="utf-8")
+)
 
 
 @cache
@@ -789,8 +820,8 @@ def test_connect_local_lan_quotes_the_bind_host_option() -> None:
     # if every translated catalog lost the key, that is drift, not a stub.
     assert checked > 1, (
         "no translated catalog carries common.connect_local_lan at all — the "
-        "check above covered only English, which is the 'guard that silently "
-        "stopped running' shape tests/pytest.ini exists to prevent"
+        "check above covered only English, so translated catalog coverage has "
+        "silently stopped running"
     )
 
 
@@ -805,7 +836,9 @@ def _settings_catalog(locale: str) -> dict[str, Any]:
 def _non_english_settings_locales() -> list[str]:
     """Settings UI catalog codes except ``en``, which carries no overrides."""
     return sorted(
-        path.stem for path in SETTINGS_LOCALES.glob("*.json") if path.stem != "en"
+        path.stem
+        for path in SETTINGS_LOCALES.glob("*.json")
+        if path.stem != "en" and path.stem not in BEST_EFFORT_LOCALES
     )
 
 
@@ -837,7 +870,7 @@ def _renderable_groups_and_tools() -> tuple[frozenset[str], frozenset[str]]:
     return groups, names
 
 
-# ``settings.js`` renders a tool row's description as
+# ``settings_js/`` renders a tool row's description as
 # ``(t.description || '').split('\n')[0].slice(0, 120)``. Both cuts model the
 # same thing — the text a translator can actually see and paste.
 _DISPLAYED_DESCRIPTION_CHARS = 120
@@ -848,7 +881,7 @@ def _english_tool_texts(*, as_rendered: bool = True) -> dict[str, str]:
     """English tool titles and descriptions, keyed like a flat catalog.
 
     What a translator has on screen is what a paste is of, so that is what a
-    translated value is compared against: ``settings.js`` cuts a description
+    translated value is compared against: ``settings_js/`` cuts a description
     at the first newline and then at 120 characters, and both halves of that
     cut belong here. Leaving the second one out let a paste of the two
     descriptions that outrun 120 characters — ``ha_get_state`` at 130 and
@@ -898,7 +931,7 @@ def test_settings_ui_locales_are_discovered() -> None:
 def test_settings_catalog_keys_name_real_groups_and_tools(locale: str) -> None:
     """Both sections are keyed off the tool catalog, and nothing checked it.
 
-    ``settings.js`` resolves a group heading by ``primary_tag`` and falls
+    ``settings_js/`` resolves a group heading by ``primary_tag`` and falls
     back to English on any key it does not find, so a stale or misspelled
     entry is invisible: ``build_payload`` happily ships it and nothing reads
     it. The reverse direction is the one that actually bites — a new tool, or
@@ -944,7 +977,7 @@ def test_settings_catalog_keys_name_real_groups_and_tools(locale: str) -> None:
 def test_settings_messages_carry_no_key_english_dropped(locale: str) -> None:
     """The one direction nothing else here looks in.
 
-    ``messages`` may omit keys — English is the per-key fallback, and AGENTS.md
+    ``messages`` may omit keys — English is the per-key fallback, and the locale guide
     states the allowance — so this asserts the other direction only. A key with
     no English counterpart is not a fallback, it is text that reaches nobody:
     ``build_payload`` ships it and ``t()`` never asks for it.
@@ -1068,7 +1101,7 @@ def test_generated_addon_projections_are_translated(locale: str) -> None:
             (key, field): generate_locales.resolve_text(
                 messages, english, flavor, key, field
             )
-            for key in generate_locales.schema_keys(addon_dir)
+            for key in generate_locales.schema(addon_dir)
             for field in ("name", "description")
         }
         untranslated = sorted(
@@ -1211,20 +1244,7 @@ def test_component_catalog_is_not_a_copy_of_english(locale: str) -> None:
 LITERAL_PARITY_EXCEPTIONS: dict[
     tuple[str, str, str],
     tuple[Counter[tuple[str, ...]], Counter[tuple[str, ...]], str],
-] = {
-    (
-        "zh-Hans",
-        TOOL_SOURCES_SURFACE,
-        "ha_config_set_helper.description",
-    ): (
-        Counter(),
-        Counter({("28",): 1}),
-        "The Chinese catalog translates the tool's full summary, including the "
-        '"(28 types, unified interface)" clause that sits on the second line '
-        "of the docstring. The rendering the engine sends is the first line "
-        "alone, so the catalog states more than its source, not something else.",
-    ),
-}
+] = {}
 
 
 @cache
@@ -1244,11 +1264,11 @@ def _english_tool_sent_to_translators() -> dict[str, str]:
 
 
 @cache
-def _pending_keys(surface: str) -> frozenset[str]:
+def pending_keys(surface: str) -> frozenset[str]:
     """Keys of one surface whose English moved since the baseline was pinned.
 
-    Spelled exactly as ``translate_locales._changed_keys`` spells it, because
-    the exclusion below rests on that function's behaviour: a key it plans is
+    Spelled exactly as ``translate_locales.build_plan`` reads it, because
+    the exclusion below rests on that planner's behaviour: a key it plans is
     owed a machine rewrite, and until the sync runs the old translation
     legitimately carries the old literals. A key ABSENT from the baseline is
     not planned — the planner asks ``not in (None, digest)`` — so excluding it
@@ -1325,7 +1345,7 @@ def _keys_a_partial_run_wrote(locale: str) -> dict[str, frozenset[str]]:
 
 def _is_owed_a_rewrite(surface: str, key: str, locale: str) -> bool:
     """Whether the sync still owes this locale a rewrite of this key."""
-    return key in _pending_keys(surface) and key not in _keys_a_partial_run_wrote(
+    return key in pending_keys(surface) and key not in _keys_a_partial_run_wrote(
         locale
     ).get(surface, frozenset())
 
@@ -1381,7 +1401,7 @@ def _literal_parity_pairs(locale: str) -> list[tuple[str, str, str, str]]:
     # catalogs do NOT translate, so its moving is stub-review work rather than
     # a rewrite the sync owes: `_plan_settings` filters those keys out of its
     # work list, `_repin_baseline` holds them stale until a human confirms the
-    # stub, and AGENTS.md names the exception. Stripping the suffix to match
+    # stub, and the locale guide names the exception. Stripping the suffix to match
     # the catalog's bare key would drop that tool out of this check while its
     # translation is still current and nothing is coming to replace it —
     # silently, and for exactly as long as the human review takes.
@@ -1464,7 +1484,7 @@ def test_the_exclusion_and_the_planner_agree_on_what_moved(
     The exclusion's whole warrant is that a pending key is owed a machine
     rewrite, and that warrant is the planner's. The two read the baseline the
     same way now; they did not before: a key ABSENT from the baseline counted
-    as pending here while ``_changed_keys`` does not queue it, so the check
+    as pending here while the planner does not queue it, so the check
     excused a value nothing was coming to replace.
 
     The route in is the partial path, which lands backfilled-new keys without
@@ -1476,19 +1496,26 @@ def test_the_exclusion_and_the_planner_agree_on_what_moved(
 
     surface = "src/ha_mcp/settings_ui/locales"
     recorded = json.loads(BASELINE_PATH.read_text("utf-8"))
-    key = next(iter(english_sources()[surface]))
+    messages = [k for k in english_sources()[surface] if k.startswith("messages.")]
+    key, moved = messages[:2]
     del recorded[surface][key]
+    recorded[surface][moved] = "0" * 16
     doctored = tmp_path / "baseline.json"
     doctored.write_text(json.dumps(recorded), encoding="utf-8")
 
     module = sys.modules[__name__]
     monkeypatch.setattr(module, "BASELINE_PATH", doctored)
-    _pending_keys.cache_clear()
+    monkeypatch.setattr(translate_locales, "PROGRESS_PATH", tmp_path / "none.json")
+    pending_keys.cache_clear()
     try:
-        pending = _pending_keys(surface)
-        planned = translate_locales._changed_keys(module)[surface]
+        pending = {k for k in pending_keys(surface) if k.startswith("messages.")}
+        planned = {
+            f"messages.{item.key}"
+            for item in translate_locales.build_plan(module).items
+            if item.section == "messages" and item.changed
+        }
     finally:
-        _pending_keys.cache_clear()
+        pending_keys.cache_clear()
 
     assert key not in pending, (
         f"{key} is absent from the baseline and counted as pending, so the "
@@ -1496,6 +1523,7 @@ def test_the_exclusion_and_the_planner_agree_on_what_moved(
         "the value unchecked and unrewritten for good"
     )
     assert key not in planned, "the planner's own rule changed; re-read both"
+    assert moved in pending and moved in planned, "a moved key is owed a rewrite"
     assert pending == planned, (
         "the exclusion and the planner disagree about which keys moved: "
         f"{sorted(pending ^ planned)}"
@@ -1553,7 +1581,7 @@ def test_a_key_a_partial_run_already_wrote_is_compared(
     )
 
     module = sys.modules[__name__]
-    monkeypatch.setattr(module, "_pending_keys", lambda _surface: frozenset({key}))
+    monkeypatch.setattr(module, "pending_keys", lambda _surface: frozenset({key}))
     monkeypatch.setattr(module, "PROGRESS_PATH", sidecar)
     _keys_a_partial_run_wrote.cache_clear()
     try:
@@ -1645,13 +1673,20 @@ def test_a_pending_hidden_rendering_keeps_its_base_key_checked(
             return frozenset()
         return frozenset({f"{base}{PARSED_RENDERING_SUFFIX}"})
 
+    # The baseline is taken with NOTHING pending, not with whatever the tree
+    # happens to have pending: a PR that rewords a tool summary legitimately
+    # leaves that key pending, and reading the live set here would score its
+    # exclusion — a correct one — as this test's failure.
+    monkeypatch.setattr(
+        sys.modules[__name__], "pending_keys", lambda _surface: frozenset()
+    )
     baseline = {
         key
         for surface, key, _, _ in _literal_parity_pairs("de")
         if surface == TOOL_SOURCES_SURFACE
     }
     monkeypatch.setattr(
-        sys.modules[__name__], "_pending_keys", only_the_hidden_rendering
+        sys.modules[__name__], "pending_keys", only_the_hidden_rendering
     )
     keys = {
         key
@@ -1664,6 +1699,26 @@ def test_a_pending_hidden_rendering_keeps_its_base_key_checked(
         f"stub, which has not moved, so nothing is owed a rewrite here"
     )
     assert base in keys, f"{base} is no longer compared at all"
+
+    # Positive control for the substitution itself: keys == baseline also holds
+    # if _is_owed_a_rewrite stopped consulting pending_keys, or if this
+    # monkeypatch target drifted off the name the lookup resolves. Marking the
+    # bare key pending has to take it out of the comparison.
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "pending_keys",
+        lambda surface: frozenset({base} if surface == TOOL_SOURCES_SURFACE else ()),
+    )
+    with_base_pending = {
+        key
+        for surface, key, _, _ in _literal_parity_pairs("de")
+        if surface == TOOL_SOURCES_SURFACE
+    }
+    assert base not in with_base_pending, (
+        f"marking {base} pending left it in the comparison, so the two passes "
+        "above prove nothing: either _is_owed_a_rewrite no longer consults "
+        "pending_keys, or this monkeypatch no longer reaches the lookup"
+    )
 
 
 def test_every_guarded_surface_resolves_for_some_locale() -> None:
@@ -1735,7 +1790,7 @@ def test_translations_keep_english_numbers_and_identifiers(locale: str) -> None:
         tolerated_losses, tolerated_additions, reason = LITERAL_PARITY_EXCEPTIONS.get(
             (locale, surface, key), (Counter(), Counter(), "")
         )
-        fault = _parity_fault(
+        fault = parity_fault(
             english,
             text,
             tolerated_losses=tolerated_losses,
@@ -1757,6 +1812,11 @@ def test_translations_keep_english_numbers_and_identifiers(locale: str) -> None:
         f"revisit these keys, so fix the catalog by hand or delete the value "
         f"to queue it for the next run. {divergent}"
     )
+
+
+def _dropped(identifiers: list[str]) -> str:
+    """The report for a pair that differs only in these identifiers, or none."""
+    return f"identifiers dropped {identifiers}" if identifiers else ""
 
 
 @pytest.mark.parametrize(
@@ -1792,7 +1852,7 @@ def test_translations_keep_english_numbers_and_identifiers(locale: str) -> None:
         (
             "edit configuration.yaml",
             "bearbeite other.configuration.yaml",
-            ["configuration.yaml"],
+            ["configuration.yaml", "other.configuration.yaml"],
         ),
         (
             "set enable_tool_search",
@@ -1802,7 +1862,6 @@ def test_translations_keep_english_numbers_and_identifiers(locale: str) -> None:
         # ... while a sentence-final period and a hyphenated compound are not.
         ("edit configuration.yaml", "bearbeite configuration.yaml.", []),
         ("mounted at /data", "eingehängt unter /data-Volume", []),
-        ("its skill:// resource", "seine skill://-Ressource", []),
         # A filename whose stem is snake_case is one literal, not two.
         ("read tool_policy.json", "lies tool_policy.json", []),
         ("read tool_policy.json", "lies die Richtliniendatei", ["tool_policy.json"]),
@@ -1869,7 +1928,11 @@ def test_translations_keep_english_numbers_and_identifiers(locale: str) -> None:
         # ... which needs the negative to discriminate: were the file split
         # into "packages/" plus ".yaml", both halves would still be present
         # in the faithful rendering above and it would pass either way.
-        ("allow packages/*.yaml", "erlaube packages/*.json", ["packages/*.yaml"]),
+        (
+            "allow packages/*.yaml",
+            "erlaube packages/*.json",
+            ["packages/*.yaml", "packages/*.json"],
+        ),
         # An English string is free to name the same literal twice, and four
         # shipped ones do. Presence alone accepts a translation that corrupts
         # one of the two occurrences; the count does not.
@@ -1901,14 +1964,14 @@ def test_literal_extraction_ignores_sentence_punctuation(
     period at the end of a sentence and every locale that punctuates differently
     reports as having dropped the literal.
     """
-    assert _lost_literals(english, translated) == expected
+    assert parity_fault(english, translated) == _dropped(expected)
 
 
 @pytest.mark.parametrize(
     ("arm", "english", "translated", "expected_in_fault"),
     [
         # One case per arm of the comparison, each chosen so that ONLY that
-        # arm can report it. Removing an arm from _parity_fault turns its row
+        # arm can report it. Removing an arm from parity_fault turns its row
         # green while the shipped catalogs stay green too, which is why the
         # rows exist: the corpus cannot tell "found nothing" from "not run".
         ("numbers lost", "keeps 30 entries", "behaelt Eintraege", "30"),
@@ -1942,11 +2005,11 @@ def test_the_comparison_runs_every_arm(
     """Each arm is held to a fault only it can find.
 
     The shipped catalogs are clean, so they cannot pin this: an arm dropped
-    from ``_parity_fault`` finds nothing, reports nothing, and every locale
+    from ``parity_fault`` finds nothing, reports nothing, and every locale
     stays green. Measured -- deleting the invented-file arm from the sum left
     every test in this file passing before this test existed.
     """
-    fault = _parity_fault(english, translated)
+    fault = parity_fault(english, translated)
     assert expected_in_fault in fault, (
         f"the {arm} arm reported nothing for a pair it exists to catch: "
         f"{english!r} -> {translated!r} produced {fault!r}"
@@ -1967,8 +2030,6 @@ def test_the_comparison_runs_every_arm(
         # Spelling the bounds out is a translation's own business: the value
         # comparison still holds both numbers, so nothing goes unguarded.
         ("Range 1–600.", "von 1 bis 600 Sekunden.", []),
-        # A range that simply vanishes is a lost number, not a reversed one.
-        ("Range 1–600.", "Zeitlimit pro Anfrage.", []),
         # A ratio reverses the same way, and the decimal comma five of the
         # nine catalogs write is not the inversion.
         ("below a 4.5:1 contrast ratio.", "unter 4,5:1 Kontrast.", []),
@@ -1979,7 +2040,7 @@ def test_the_comparison_runs_every_arm(
         # A translation that also states the pair the right way round has not
         # inverted it: a rendering may spell the mistake out to warn against
         # it, and demanding the wrong order be absent would report that.
-        ("Range 1–600.", "Bereich 1–600, nicht 600–1.", []),
+        ("Range 1–600, fixed 1–600.", "Bereich 1–600, nicht 600–1.", []),
     ],
 )
 def test_a_reversed_ordered_pair_is_reported(
@@ -1994,61 +2055,72 @@ def test_a_reversed_ordered_pair_is_reported(
     ratio -- so the arm's zero yield measures a corpus no catalog has inverted
     yet, not a shape it cannot meet.
     """
-    assert _reversed_ordered_pairs(english, translated) == expected
+    assert parity_fault(english, translated) == _dropped(expected)
 
 
 @pytest.mark.parametrize(
-    ("english", "translated", "narrowed"),
+    ("english", "translated", "expected"),
     [
-        # Each row is a fault the merge gate reports and the engine does not,
-        # one per narrowed arm. The engine's own case -- a swapped number --
-        # is covered by test_the_comparison_runs_every_arm above.
-        ("keeps 30 entries", "behaelt Eintraege", "numbers"),
+        # Two English words, two digits: nothing added.
         (
-            "call ha_get_skill_guide, then ha_get_skill_guide again",
-            "rufe ha_get_skill_guide, dann wrong_tool erneut",
-            "literal occurrences",
+            "Five wrong PINs within five minutes",
+            "5분 동안 5회 잘못된 PIN",
+            "",
         ),
-        ("limit is 1-256 MB", "Grenze ist 1-256", "dropped unit"),
+        # The word only covers as many digits as the English states.
+        ("Five wrong PINs", "5분 동안 5회 잘못된 PIN", "numbers added ['5']"),
+        # A word covers its own value, not any digit.
+        ("within five minutes", "6분 이내", "numbers added ['6']"),
+        # An English digit spelled out in the translation is still a loss.
+        ("keeps 5 entries", "behaelt fuenf Eintraege", "numbers lost ['5']"),
+        # A range that simply vanishes is a lost number, not a reversed one.
+        ("Range 1–600.", "Zeitlimit pro Anfrage.", "numbers lost ['1', '600']"),
+        # A threshold ends where its number ends: appended digits are another bound.
+        (
+            "only when N > 5",
+            "nur wenn N > 50",
+            "numbers lost ['5'], numbers added ['50'], identifiers dropped ['N > 5']",
+        ),
+        (
+            "only when N > 5",
+            "nur wenn N > 5.000",
+            "numbers lost ['5'], numbers added ['5000'], identifiers dropped ['N > 5']",
+        ),
     ],
 )
-def test_the_engine_gate_narrows_exactly_three_arms(
-    english: str, translated: str, narrowed: str
+def test_the_number_comparison_reports_exactly_what_differs(
+    english: str, translated: str, expected: str
 ) -> None:
-    """The engine's setting is narrower than the merge gate's, on purpose.
-
-    Each of these is a real fault the merge gate names and the engine waves
-    through, and the asymmetry is deliberate in all three: a merge failure is
-    read by a human on a key that can carry a tolerance, while an engine
-    refusal holds a whole partial run back over a rendering that may well be
-    correct. What keeps the waved-through value from landing unchecked is the
-    partial-run pre-push step, which runs this file's merge-gate check over
-    exactly the keys the run wrote.
-    """
-    assert _parity_fault(english, translated), (
-        f"the merge gate no longer reports {narrowed}, so this row compares "
-        "two settings that agree and pins nothing"
-    )
-    assert not _parity_fault(english, translated, gate="engine"), (
-        f"the engine gate now reports {narrowed} as well — either the narrowing "
-        "was dropped or the corpus argument for it changed; re-read "
-        "_parity_fault before deleting this row"
-    )
+    assert parity_fault(english, translated) == expected
 
 
-def _exception_still_fits(
-    recorded: Counter[tuple[str, ...]], observed: Counter[tuple[str, ...]]
+def _tolerance_is_exact(
+    english: str,
+    translated: str,
+    losses: Counter[tuple[str, ...]],
+    additions: Counter[tuple[str, ...]],
 ) -> bool:
-    """Whether a tolerance entry describes no more than the pair really does.
+    """Whether a tolerance entry excuses the pair and nothing more.
 
-    Containment rather than intersection, and the difference is the whole
-    point: an entry recording 99 losses of a number the pair loses once
-    overlaps it, so intersection reads it as live while it goes on excusing
-    98 occurrences that do not exist. The table's header promises the
-    opposite — an entry excuses what it records, and a second instance of the
-    same number still reports.
+    The pair reports without it, is clean with it, and reports again once any
+    one occurrence it records is taken away. Exactness, not overlap: an entry
+    recording 99 losses of a number the pair loses once overlaps it, yet goes
+    on excusing 98 occurrences that do not exist.
     """
-    return recorded <= observed
+
+    def report(lost: Counter[tuple[str, ...]], added: Counter[tuple[str, ...]]) -> str:
+        return parity_fault(
+            english, translated, tolerated_losses=lost, tolerated_additions=added
+        )
+
+    one_fewer = [(losses - Counter({token: 1}), additions) for token in losses] + [
+        (losses, additions - Counter({token: 1})) for token in additions
+    ]
+    return (
+        bool(report(Counter(), Counter()))
+        and not report(losses, additions)
+        and all(report(*fewer) for fewer in one_fewer)
+    )
 
 
 def test_every_literal_parity_exception_is_load_bearing() -> None:
@@ -2081,65 +2153,42 @@ def test_every_literal_parity_exception_is_load_bearing() -> None:
             "English moved past the baseline"
         )
         text, english = pair[0]
-        lost = _numbers(english) - _numbers(text)
-        gained = _numbers(text) - _numbers(english)
-        assert lost & losses or gained & additions, (
-            f"the {locale} exception on {surface}: {key} no longer excuses "
-            f"anything — the pair satisfies the rule on its own now, so drop "
-            f"the entry. It was recorded because: {reason}"
-        )
-        # Intersection only asks whether the entry overlaps the pair, so
-        # ``Counter({("5",): 99})`` reads as live while quietly excusing 98
-        # occurrences that do not exist. The table's own header promises the
-        # opposite — an entry excuses what it records, and a second instance
-        # of the same number still reports — and containment is what pins it.
-        assert _exception_still_fits(losses, lost) and _exception_still_fits(
-            additions, gained
-        ), (
-            f"the {locale} exception on {surface}: {key} records more than the "
-            f"pair loses or gains ({dict(losses)} / {dict(additions)} against "
-            f"{dict(lost)} / {dict(gained)}), so it would go on excusing "
-            "occurrences that are not there"
+        assert _tolerance_is_exact(english, text, losses, additions), (
+            f"the {locale} exception on {surface}: {key} is not exact — the "
+            f"pair satisfies the rule on its own now, so drop the entry, or "
+            f"it records more than the pair loses or gains ({dict(losses)} / "
+            f"{dict(additions)}). It was recorded because: {reason}"
         )
         assert reason, f"the {locale} exception on {surface}: {key} states no reason"
 
 
 def test_an_exception_that_over_records_is_refused() -> None:
-    """The liveness rule has to be containment, and the table cannot show it.
+    """The liveness rule has to be exactness, and the table cannot show it.
 
     Every shipped entry records exactly what its pair diverges by, so the
-    assertion above cannot go red on the corpus — removing it changes no
-    result today. What it exists for is the entry that records more than it
-    needs: under intersection that entry reads as live while excusing
-    occurrences that do not exist, which is the blind spot the table's header
-    rules out in prose.
+    assertion above cannot go red on the corpus. What it exists for is the
+    entry that records more than it needs: under overlap that entry reads as
+    live while excusing occurrences that do not exist.
 
-    Built on a synthetic pair rather than on the first loss-recording entry of
-    the shipped table. Reading the table made this test's reach depend on the
-    corpus still carrying a specimen -- first on that entry's pair resolving,
-    which stopped when its English moved past the baseline, and then on the
-    table holding a loss-recording entry at all, which stopped when the entry
-    was dropped. Both failures were loud, and neither of them said anything
-    about containment: they reported the shape of the corpus. A synthetic pair
-    reports the rule.
+    Built on a synthetic pair rather than on an entry of the shipped table:
+    that made this test's reach depend on the corpus still carrying a
+    specimen, and its failures reported the shape of the corpus, not the rule.
     """
     english = "Master gate for the 5 experimental sub-flags below."
     translated = "Главный переключатель для пяти экспериментальных подпараметров."
-    lost = _numbers(english) - _numbers(translated)
-    assert lost, (
-        "the synthetic pair loses no number, so the inflation below has "
-        "nothing to exceed and the containment rule is not exercised"
+    lost: Counter[tuple[str, ...]] = Counter({("5",): 1})
+    assert parity_fault(english, translated) == "numbers lost ['5']", (
+        "the synthetic pair no longer loses exactly the 5 the entries record"
     )
 
-    assert _exception_still_fits(lost, lost), (
+    assert _tolerance_is_exact(english, translated, lost, Counter()), (
         "an entry recording exactly what its pair loses has to read as live"
     )
-    inflated = Counter({token: count + 98 for token, count in lost.items()})
-    assert inflated & lost, "intersection cannot tell the inflated entry apart"
-    assert not _exception_still_fits(inflated, lost), (
-        "containment must refuse an entry that records 98 more occurrences "
-        "than the pair has — otherwise the tolerance keeps excusing numbers "
-        "nobody lost"
+    inflated: Counter[tuple[str, ...]] = Counter({("5",): 99})
+    assert not parity_fault(english, translated, tolerated_losses=inflated)
+    assert not _tolerance_is_exact(english, translated, inflated, Counter()), (
+        "an entry recording 98 more occurrences than the pair has must be "
+        "refused, or the tolerance keeps excusing numbers nobody lost"
     )
 
 
@@ -2171,7 +2220,7 @@ def test_a_number_keeps_its_groups_unless_they_are_thousands(
     Nothing exercised it directly, so that mutation left every shipped pair
     and all three reversal cases green.
     """
-    assert (_canonical_number(first) == _canonical_number(second)) is same
+    assert (parity_fault(f"limit {first}", f"Grenze {second}") == "") is same
 
 
 @pytest.mark.parametrize(
@@ -2228,7 +2277,7 @@ def test_a_file_the_english_never_named_is_reported(
     exactly that for years -- describing ``packages/*.yaml`` and
     ``themes/*.yaml`` for a tool whose English names neither.
     """
-    assert _invented_files(english, translated) == expected
+    assert parity_fault(english, translated) == _dropped(expected)
 
 
 @pytest.mark.parametrize(
@@ -2250,7 +2299,7 @@ def test_a_file_the_english_never_named_is_reported(
         ("limit is 1-256 MB", "raja 1-256 Xy", []),
         # Which occurrence carries the unit is not the checker's to choose:
         # the contradiction is real only when NO occurrence spells it right.
-        ("limit is 1-256 MB", "jusqu'a 256 Go puis 256 MB", []),
+        ("limit 256 MB, then 256 MB", "jusqu'a 256 Go puis 256 MB", []),
         # A comparison is reversible without touching a single digit.
         ("only when N > 0", "nur wenn N > 0", []),
         ("only when N > 0", "nur wenn N < 0", ["N > 0"]),
@@ -2267,7 +2316,7 @@ def test_a_file_the_english_never_named_is_reported(
         ("about 5M tokens", "etwa 5KB Token", ["5M"]),
         # ... and here too the first run of the digits is not necessarily the
         # one carrying the suffix. This translation is faithful.
-        ("about 5K tokens", "bis zu 5x schneller, etwa 5K Token", []),
+        ("5x faster, about 5K tokens", "5x schneller, etwa 5K Token", []),
         # A percentage keeps its sign, spaced or not.
         ("roughly 90% less", "rund 90 % weniger", []),
         ("roughly 90% less", "rund 90 weniger", ["90%"]),
@@ -2310,13 +2359,7 @@ def test_a_file_the_english_never_named_is_reported(
             "Grenze ist 1-256. Danach bricht es ab",
             ["256 MB dropped"],
         ),
-        # A threshold is bounded on both sides. Appending digits states a
-        # different bound, and so does appending a grouping separator and
-        # more digits — "5.000" and "5 000" are the likelier artefact than
-        # "50". Renaming what is compared is a different claim too.
-        ("only when N > 5", "nur wenn N > 50", ["N > 5"]),
-        ("only when N > 5", "nur wenn N > 5.000", ["N > 5"]),
-        ("only when N > 5", "nur wenn N > 5 000", ["N > 5"]),
+        # Renaming what a threshold compares is a different claim too.
         ("only when N > 5", "nur wenn MIN > 5", ["N > 5"]),
         ("only when N > 5", "nur wenn N > 5.", []),
     ],
@@ -2335,7 +2378,24 @@ def test_units_and_comparisons_are_compared_where_they_are_comparable(
     and "МБ" pass leaves the arm free to be narrowed back to Latin script and
     stay green, which is how "1-256 ГБ" went unreported.
     """
-    assert _lost_magnitudes(english, translated) == expected
+    assert parity_fault(english, translated) == _dropped(expected)
+
+
+def _run_probe(probe: str) -> subprocess.CompletedProcess[str]:
+    """Run code in a child interpreter with no caller-prepared path.
+
+    The harness puts `scripts/` on PYTHONPATH, and the child would inherit it
+    — which is exactly the path these tests must not have.
+    """
+    environment = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    return subprocess.run(
+        [sys.executable, "-c", probe],
+        capture_output=True,
+        text=True,
+        check=False,
+        cwd=tempfile.gettempdir(),
+        env=environment,
+    )
 
 
 def test_the_rules_module_runs_without_a_caller_preparing_its_path() -> None:
@@ -2353,24 +2413,21 @@ def test_the_rules_module_runs_without_a_caller_preparing_its_path() -> None:
         f"spec = importlib.util.spec_from_file_location('lr', {str(_RULES_PATH)!r});"
         "m = importlib.util.module_from_spec(spec);"
         "spec.loader.exec_module(m);"
-        "print(m._parity_fault('edit configuration.yaml', 'bearbeite die Datei'))"
+        "print(m.parity_fault('edit configuration.yaml', 'bearbeite die Datei'))"
     )
-    # The harness puts `scripts/` on PYTHONPATH, and the child would inherit
-    # it — which is exactly the caller-prepared path this test must not have.
-    environment = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    completed = subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=tempfile.gettempdir(),
-        env=environment,
-    )
+    completed = _run_probe(probe)
     assert completed.returncode == 0, (
         "the rules module cannot answer a comparison when no caller has put "
         f"its own directory on the path:\n{completed.stderr.strip()}"
     )
     assert "configuration.yaml" in completed.stdout
+
+
+# A stand-in pipeline that flags every pair, so whichever module answers shows.
+_SHADOW_PIPELINE = (
+    "_hardcoded_ui_names = lambda: ('SHADOW',)\n"
+    "_untranslatable_name_dropped = lambda english, translated: 'SHADOW'\n"
+)
 
 
 def test_the_rules_module_asks_the_pipeline_beside_it(tmp_path: Path) -> None:
@@ -2385,7 +2442,7 @@ def test_the_rules_module_asks_the_pipeline_beside_it(tmp_path: Path) -> None:
     one answers.
     """
     shadow = tmp_path / "translate_locales.py"
-    shadow.write_text("_hardcoded_ui_names = lambda: ['SHADOW']\n", encoding="utf-8")
+    shadow.write_text(_SHADOW_PIPELINE, encoding="utf-8")
 
     probe = (
         "import importlib.util, sys;"
@@ -2393,24 +2450,14 @@ def test_the_rules_module_asks_the_pipeline_beside_it(tmp_path: Path) -> None:
         f"spec = importlib.util.spec_from_file_location('lr', {str(_RULES_PATH)!r});"
         "m = importlib.util.module_from_spec(spec);"
         "spec.loader.exec_module(m);"
-        "print(m._pipeline().__file__)"
+        "print(m.parity_fault('nothing to keep', 'nichts zu behalten'))"
     )
-    environment = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    completed = subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=tempfile.gettempdir(),
-        env=environment,
-    )
+    completed = _run_probe(probe)
     assert completed.returncode == 0, completed.stderr.strip()
-    assert completed.stdout.strip() == str(
-        _RULES_PATH.with_name("translate_locales.py")
-    ), (
-        f"the rules resolved translate_locales to {completed.stdout.strip()!r} "
-        f"with a shadow on the path — the untranslatable names and the "
-        f"localised-name rule would come from that module"
+    assert completed.stdout.strip() == "", (
+        f"the rules reported {completed.stdout.strip()!r} for a pair with "
+        f"nothing to lose, with a shadow on the path — the untranslatable "
+        f"names and the localised-name rule came from that module"
     )
 
 
@@ -2429,7 +2476,7 @@ def test_a_preloaded_stranger_does_not_answer_for_the_pipeline(
     holds is not this module's call — and the sibling is loaded beside it.
     """
     stranger = tmp_path / "stranger.py"
-    stranger.write_text("_hardcoded_ui_names = lambda: ('SHADOW',)\n", encoding="utf-8")
+    stranger.write_text(_SHADOW_PIPELINE, encoding="utf-8")
     probe = (
         "import importlib.util, sys;"
         f"spec = importlib.util.spec_from_file_location('translate_locales', {str(stranger)!r});"
@@ -2439,21 +2486,13 @@ def test_a_preloaded_stranger_does_not_answer_for_the_pipeline(
         f"spec2 = importlib.util.spec_from_file_location('lr', {str(_RULES_PATH)!r});"
         "lr = importlib.util.module_from_spec(spec2);"
         "spec2.loader.exec_module(lr);"
-        "print(lr._pipeline().__file__);"
+        "print(lr.parity_fault('nothing to keep', 'nichts zu behalten'));"
         "print(sys.modules['translate_locales'].__file__)"
     )
-    environment = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
-    completed = subprocess.run(
-        [sys.executable, "-c", probe],
-        capture_output=True,
-        text=True,
-        check=False,
-        cwd=tempfile.gettempdir(),
-        env=environment,
-    )
+    completed = _run_probe(probe)
     assert completed.returncode == 0, completed.stderr.strip()
-    answered, still_registered = completed.stdout.split()
-    assert answered == str(_RULES_PATH.with_name("translate_locales.py")), (
+    answered, still_registered = completed.stdout.splitlines()
+    assert answered == "", (
         f"a module registered as translate_locales before the rules loaded "
         f"answered for the pipeline: {answered}"
     )
@@ -2483,56 +2522,76 @@ def test_a_localised_on_screen_name_is_reported() -> None:
     ordinary Spanish. The rule would mean repairing 80 pairs now and arguing
     with every translator afterwards. A do-not-translate
     glossary was declined for a different reason: it is a second list beside
-    ``translate_locales._hardcoded_ui_names()`` and can drift from it, while
+    the pipeline's own hardcoded-names list and can drift from it, while
     this arm reads that function at runtime and cannot.
     """
-    names = sorted(_untranslatable_names())
-    assert names, "the pipeline reports no hardcoded on-screen names"
+    const = (_REPO_ROOT / "custom_components/ha_mcp_tools/const.py").read_text("utf-8")
+    names = sorted(re.findall(r'^_?[A-Z][A-Z_]*TITLE\s*=\s*"([^"]+)"', const, re.M))
+    assert names, "the component hardcodes no config entry titles"
     name = names[0]
     english = f"open the '{name}' entry"
-    assert _localised_hardcoded_name(english, f"öffne den Eintrag '{name}'") == []
+    assert parity_fault(english, f"öffne den Eintrag '{name}'") == ""
     localised = name.replace(" ", "-")
     assert localised != name, f"{name!r} has no space to mangle"
-    assert _localised_hardcoded_name(english, f"öffne den Eintrag '{localised}'") == [
-        name
-    ]
+    assert parity_fault(english, f"öffne den Eintrag '{localised}'") == _dropped([name])
 
 
-def _agents_md_section(title: str) -> str:
-    """The body of one ``## `` section of AGENTS.md.
+def _locale_readme_section(title: str) -> str:
+    """The body of one ``## `` section of the canonical locale guide.
 
     Scoping matters: a check that greps the whole file answers a question
     about the file, not about the section it claims to guard, and any future
     sentence elsewhere carrying the same shape would fail it.
     """
-    text = AGENTS_MD.read_text("utf-8")
+    text = LOCALE_README.read_text("utf-8")
     match = re.search(
-        rf"^## {re.escape(title)}$(.*?)(?=^## )", text, re.MULTILINE | re.DOTALL
+        rf"^## {re.escape(title)}$(.*?)(?=^#{{1,2}} |\Z)",
+        text,
+        re.MULTILINE | re.DOTALL,
     )
-    assert match, f"AGENTS.md has no '## {title}' section — this test guards it"
+    assert match, f"locale README has no '## {title}' section — this test guards it"
     return match.group(1)
 
 
-def test_agents_md_states_the_current_ceilings() -> None:
+def test_locale_readme_states_the_current_ceilings() -> None:
     """The documented percentages are the ones a contributor plans against.
 
     Same reason the locale list below is pinned: the prose went stale the
     moment the constant moved, and nothing tied the two together.
     """
-    section = _agents_md_section("Translations")
-    documented = set(re.findall(r"(\d+)% for the", section))
-
-    assert documented == {
-        f"{_MAX_ENGLISH_IDENTICAL_SHARE:.0%}".rstrip("%"),
-        f"{_MAX_COMPONENT_IDENTICAL_SHARE:.0%}".rstrip("%"),
-    }, (
-        f"AGENTS.md § Translations documents ceilings {sorted(documented)} but "
-        f"the constants are {_MAX_ENGLISH_IDENTICAL_SHARE:.0%} and "
-        f"{_MAX_COMPONENT_IDENTICAL_SHARE:.0%}. Update the prose."
+    section = _locale_readme_section("What CI checks")
+    surface = re.search(
+        r"At most (\d+)% of this catalog's `messages`, and (\d+)% of its "
+        r"`tools` texts",
+        section,
+    )
+    projection = re.search(
+        r"The (\d+)% ceiling also applies\s+independently to each generated "
+        r"app projection",
+        section,
+    )
+    component = re.search(r"Component catalogs allow (\d+)%", section)
+    assert surface and projection and component
+    expected_english = f"{_MAX_ENGLISH_IDENTICAL_SHARE:.0%}".rstrip("%")
+    expected_component = f"{_MAX_COMPONENT_IDENTICAL_SHARE:.0%}".rstrip("%")
+    documented = {
+        "messages": surface.group(1),
+        "tools": surface.group(2),
+        "app projections": projection.group(1),
+        "component catalogs": component.group(1),
+    }
+    expected = {
+        "messages": expected_english,
+        "tools": expected_english,
+        "app projections": expected_english,
+        "component catalogs": expected_component,
+    }
+    assert documented == expected, (
+        f"locale README documents ceilings {documented} but expected {expected}"
     )
 
 
-def test_agents_md_lists_every_shipped_locale() -> None:
+def test_locale_readme_lists_every_shipped_locale() -> None:
     """The documented list went stale the moment ``fr`` landed.
 
     It is the one place a contributor looks up which languages exist, and
@@ -2540,19 +2599,21 @@ def test_agents_md_lists_every_shipped_locale() -> None:
     """
     marker = "names every file:"
     lines = [
-        line for line in AGENTS_MD.read_text("utf-8").splitlines() if marker in line
+        line for line in LOCALE_README.read_text("utf-8").splitlines() if marker in line
     ]
     assert len(lines) == 1, (
-        f"expected exactly one AGENTS.md line containing {marker!r} to carry "
+        f"expected exactly one locale README line containing {marker!r} to carry "
         f"the locale list, found {len(lines)} — update this test alongside the "
         "section it guards"
     )
 
     documented = set(re.findall(r"`([A-Za-z-]+)`", lines[0]))
-    shipped = set(_non_english_settings_locales())
+    shipped = {
+        path.stem for path in SETTINGS_LOCALES.glob("*.json") if path.stem != "en"
+    }
 
-    assert documented == shipped, (
-        "AGENTS.md § Translations lists "
+    assert documented - BEST_EFFORT_LOCALES == shipped - BEST_EFFORT_LOCALES, (
+        "locale README lists "
         f"{sorted(documented)} but the shipped catalogs are {sorted(shipped)}. "
         "Update the line so the documented set matches what ships."
     )

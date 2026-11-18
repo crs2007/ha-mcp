@@ -1,9 +1,11 @@
 // JSDOM harness for behavioural tests of in-page <script> bodies.
 //
-// Reads a JSON request from stdin, evaluates the script inside a JSDOM
-// window with stubbed fetch / BroadcastChannel / timers / dialogs, then
-// writes a JSON record of observed side effects to stdout. The Python
-// wrapper in tests/src/unit/_js_harness.py owns the contract.
+// One long-lived process serves many runs. Each stdin line is a JSON
+// request; the harness evaluates its script inside a fresh JSDOM window with
+// stubbed fetch / BroadcastChannel / timers / dialogs, then writes one stdout
+// line: {"result": <response>} or {"error": <message>}. It exits when stdin
+// closes. The Python wrapper in tests/src/unit/_js_harness.py owns the
+// contract.
 //
 // Request shape:
 //   {
@@ -37,6 +39,7 @@
 // real wall-clock values.
 
 import { JSDOM, VirtualConsole } from "jsdom";
+import { createInterface } from "node:readline";
 import { runInContext } from "node:vm";
 import { transformSync } from "esbuild";
 
@@ -49,18 +52,6 @@ function maybeTranspile(source, language) {
     target: "es2020",
     format: "esm",
   }).code;
-}
-
-function readStdin() {
-  return new Promise((resolve, reject) => {
-    let buf = "";
-    process.stdin.setEncoding("utf-8");
-    process.stdin.on("data", (chunk) => {
-      buf += chunk;
-    });
-    process.stdin.on("end", () => resolve(buf));
-    process.stdin.on("error", reject);
-  });
 }
 
 function buildFetchStub(fetchMap, fetches) {
@@ -83,6 +74,18 @@ function buildFetchStub(fetchMap, fetches) {
       // Unmatched URL: 404 by default so tests that forget to register a
       // route get a loud, predictable failure mode.
       entry = { status: 404, body: "" };
+    }
+    // Method-keyed routes: { byMethod: { GET: ..., POST: ... } }. Opt-in,
+    // and the reason it exists is that GET and POST share a URL on
+    // /api/settings/features — so a test that wants "the POST fails" had to
+    // hand-count how many times init GETs that endpoint and put its entry
+    // in that slot. Any change to init's read count then slid the failure
+    // onto a different call and the test kept passing while exercising a
+    // different path. Keyed by method, the counters are independent and the
+    // test says what it means.
+    if (entry.byMethod) {
+      entry = entry.byMethod[method] ?? entry.byMethod.default ?? entry;
+      matchedPattern = matchedPattern + "|" + method;
     }
     // Sequenced responses: each call advances the index, the last entry
     // sticks after exhaustion (matches "addon comes back online and
@@ -247,16 +250,8 @@ class FakeBroadcastChannel {
   }
 }
 
-async function main() {
-  const raw = await readStdin();
-  let req;
-  try {
-    req = JSON.parse(raw);
-  } catch (e) {
-    process.stderr.write(`harness: invalid JSON request: ${e.message}\n`);
-    process.exit(2);
-  }
-
+// `opened` receives the run's window so the caller can close it afterwards.
+async function runRequest(req, opened) {
   const fetches = [];
   const broadcasts = [];
   const alerts = [];
@@ -305,6 +300,7 @@ async function main() {
     url: "https://test.local/",
   });
   const { window } = dom;
+  opened(window);
 
   const clock = new FakeClock(errors);
   const channelRegistry = { byName: new Map(), posts: broadcasts };
@@ -480,7 +476,7 @@ async function main() {
   // synchronously, so unprefixed made every rejected invoke invisible to it.
   if (window.__harnessError) errors.push(`invoke: ${window.__harnessError}`);
 
-  const response = {
+  return {
     fetches,
     broadcasts,
     reloads,
@@ -494,11 +490,26 @@ async function main() {
     dom: window.document.documentElement.outerHTML,
     errors,
   };
-
-  process.stdout.write(JSON.stringify(response));
 }
 
-main().catch((e) => {
-  process.stderr.write(`harness: fatal: ${(e && e.stack) || e}\n`);
-  process.exit(1);
-});
+// Requests run one at a time, in order. A bad request or a harness fault is
+// reported for that request alone, so the process stays usable for the next.
+const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of lines) {
+  if (!line.trim()) continue;
+  let window = null;
+  let reply;
+  try {
+    const result = await runRequest(JSON.parse(line), (w) => {
+      window = w;
+    });
+    // Encoded here so a value JSON cannot hold fails this run, not the process.
+    reply = JSON.stringify({ result });
+  } catch (e) {
+    reply = JSON.stringify({ error: (e && e.stack) || String(e) });
+  } finally {
+    // pretendToBeVisual runs a real requestAnimationFrame timer per window.
+    window?.close();
+  }
+  process.stdout.write(`${reply}\n`);
+}

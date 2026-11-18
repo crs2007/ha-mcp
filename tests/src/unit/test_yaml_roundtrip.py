@@ -2,40 +2,16 @@
 
 from __future__ import annotations
 
-import sys
 from io import StringIO
-from unittest.mock import MagicMock
 
 import pytest
+from annotatedyaml.loader import FastSafeLoader
 
-# Mock Home Assistant imports so the package __init__ can be loaded.
-sys.modules["voluptuous"] = MagicMock()
-homeassistant = MagicMock()
-sys.modules["homeassistant"] = homeassistant
-sys.modules["homeassistant.components"] = homeassistant.components
-sys.modules["homeassistant.config"] = homeassistant.config
-sys.modules["homeassistant.config_entries"] = homeassistant.config_entries
-# setdefault (not =): other test modules stub homeassistant.core with a real
-# `callback` identity function (production code decorates real closures with
-# it - a clobbered auto-mock attribute would silently replace them). This
-# file doesn't care what's already there, only that something importable is.
-sys.modules.setdefault("homeassistant.core", homeassistant.core)
-sys.modules["homeassistant.helpers"] = homeassistant.helpers
-sys.modules["homeassistant.helpers.config_validation"] = (
-    homeassistant.helpers.config_validation
-)
-# The package __init__ also imports these; without them this file only
-# collects cleanly when an earlier test file has already mocked them.
-sys.modules["homeassistant.components.persistent_notification"] = (
-    homeassistant.components.persistent_notification
-)
-sys.modules["homeassistant.helpers.storage"] = homeassistant.helpers.storage
-sys.modules["homeassistant.loader"] = homeassistant.loader
-
-from custom_components.ha_mcp_tools.yaml_rt import (  # noqa: E402
-    _TaggedScalar,
+from custom_components.ha_mcp_tools.yaml_rt import (
+    find_yaml_key_files,
     make_yaml,
     yaml_dumps,
+    yaml_jsonify,
 )
 
 # ---------------------------------------------------------------------------
@@ -95,21 +71,15 @@ class TestSecretTag:
 
     def test_secret_value(self):
         ry, data = _load("api_key: !secret my_api_key\n")
-        assert isinstance(data["api_key"], _TaggedScalar)
         assert data["api_key"].tag == "!secret"
         assert data["api_key"].value == "my_api_key"
-
-    def test_tagged_scalar_str(self):
-        ts = _TaggedScalar("!secret", "my_api_key")
-        assert str(ts) == "my_api_key"
+        assert str(data["api_key"]) == "my_api_key"
 
     def test_tagged_scalar_equality(self):
-        a = _TaggedScalar("!secret", "key1")
-        b = _TaggedScalar("!secret", "key1")
-        c = _TaggedScalar("!secret", "key2")
-        assert a == b
-        assert a != c
-        assert a != "key1"
+        _ry, data = _load("a: !secret key1\nb: !secret key1\nc: !secret key2\n")
+        assert data["a"] == data["b"]
+        assert data["a"] != data["c"]
+        assert data["a"] != "key1"
 
 
 class TestIncludeTag:
@@ -141,6 +111,45 @@ class TestEnvVarTag:
         ry, data = _load("token: !env_var MY_TOKEN\n")
         out = yaml_dumps(ry, data)
         assert "!env_var MY_TOKEN" in out
+
+
+class TestCoreTagDiscovery:
+    def test_every_tag_core_loads_survives_a_round_trip(self):
+        """A tag Core's YAML loader knows is written back as it was read, so an
+        edit never drops or resolves one Core would have honoured."""
+        tags = [
+            tag
+            for tag in FastSafeLoader.yaml_constructors
+            if isinstance(tag, str) and tag.startswith("!")
+        ]
+        assert "!input" in tags
+        for tag in tags:
+            ry, data = _load(f"value: {tag} source\n")
+            assert f"{tag} source" in yaml_dumps(ry, data), tag
+
+
+class TestInputTag:
+    """Blueprint ``!input`` markers survive parsing and JSON projection."""
+
+    def test_input_tag_preserved(self):
+        ry, data = _load("target: !input target_entity\n")
+        assert data["target"].tag == "!input"
+        out = yaml_dumps(ry, data)
+        assert "!input target_entity" in out
+        ry2 = make_yaml()
+        data2 = ry2.load(StringIO(out))
+        assert data2["target"].tag == "!input"
+
+    def test_unknown_scalar_falls_back_to_str(self):
+        class Unknown:
+            def __str__(self):
+                return "unknown"
+
+        assert yaml_jsonify(Unknown()) == "unknown"
+
+    def test_input_tag_jsonifies_in_source_form(self):
+        _ry, data = _load("target: !input target_entity\n")
+        assert yaml_jsonify(data) == {"target": "!input target_entity"}
 
 
 # ---------------------------------------------------------------------------
@@ -396,3 +405,128 @@ class TestSeqIndentDetectionEdges:
 
         text = "name: My Home\ntemplate:\n  - sensor: []\n"
         assert detect_seq_indent(text) == (4, 2)
+
+
+class _AnnotatedDict(dict):
+    def __init__(self, path):
+        super().__init__()
+        self.__config_file__ = path
+        self.__line__ = 1
+
+    def __eq__(self, other: object) -> bool:
+        return dict.__eq__(self, other)
+
+
+class TestFindYamlKeyFiles:
+    def test_finds_top_level_key_in_config(self):
+        root = _AnnotatedDict("/config/configuration.yaml")
+        root["template"] = {}
+
+        assert find_yaml_key_files(root, "template") == ["/config/configuration.yaml"]
+
+    def test_finds_nested_package_mapping(self):
+        root = _AnnotatedDict("/config/configuration.yaml")
+        packages = _AnnotatedDict("/config/configuration.yaml")
+        nested = _AnnotatedDict("/config/custom_packages/nested/mcp.yaml")
+        nested["template"] = {}
+        packages["nested"] = nested
+        root["custom_packages"] = packages
+
+        assert find_yaml_key_files(root, "template") == [
+            "/config/custom_packages/nested/mcp.yaml"
+        ]
+
+    def test_dotted_path_uses_the_containing_mapping(self):
+        root = _AnnotatedDict("/config/configuration.yaml")
+        home = _AnnotatedDict("/config/configuration.yaml")
+        home["name"] = "Home"
+        root["homeassistant"] = home
+
+        assert find_yaml_key_files(root, "homeassistant.name") == [
+            "/config/configuration.yaml"
+        ]
+
+
+class _TaggedValue:
+    """A resolved value annotated with the file that supplied it."""
+
+    def __init__(self, path):
+        self.__config_file__ = path
+        self.__line__ = 1
+
+
+class TestFindYamlKeyEdges:
+    def test_empty_path_returns_nothing(self):
+        assert find_yaml_key_files({"template": {}}, "") == []
+
+    def test_scalar_root_returns_nothing(self):
+        assert find_yaml_key_files("not a mapping", "template") == []
+
+    def test_list_root_walks_mappings(self):
+        node = _AnnotatedDict("/config/configuration.yaml")
+        node["template"] = {}
+        assert find_yaml_key_files([node], "template") == ["/config/configuration.yaml"]
+
+    def test_empty_path_segment_is_not_collapsed(self):
+        """``sensor..name`` must not be read as ``sensor.name``."""
+        root = _AnnotatedDict("/config/configuration.yaml")
+        root["sensor"] = {"name": "x"}
+
+        assert find_yaml_key_files(root, "sensor..name") == []
+
+    def test_keys_nested_in_a_secret_mapping_are_not_discovered(self):
+        """A mapping-valued !secret is not a config file root."""
+        root = _AnnotatedDict("/config/configuration.yaml")
+        secret = _AnnotatedDict("/config/secrets.yaml")
+        secret["template"] = {}
+        root["shell_command"] = secret
+
+        assert find_yaml_key_files(root, "template") == []
+
+    def test_key_nested_below_a_top_level_mapping_is_not_a_root(self):
+        """A nested ``sensor`` under ``template`` is not a top-level sensor."""
+        root = _AnnotatedDict("/config/configuration.yaml")
+        template = _AnnotatedDict("/config/configuration.yaml")
+        template["sensor"] = []
+        root["template"] = template
+
+        assert find_yaml_key_files(root, "sensor") == []
+
+    def test_mapping_without_source_annotation_is_ignored(self):
+        assert find_yaml_key_files({"template": {}}, "template") == []
+
+    def test_path_across_an_include_is_not_attributed_to_the_parent(self):
+        """The parent file cannot supply a path that continues in an include."""
+        root = _AnnotatedDict("/config/configuration.yaml")
+        included = _AnnotatedDict("/config/commands.yaml")
+        included["mcp_secret"] = "value"
+        root["shell_command"] = included
+
+        assert find_yaml_key_files(root, "shell_command.mcp_secret") == []
+
+    def test_included_mapping_is_found_at_its_own_path(self):
+        """The included file is still discoverable by its own top-level path."""
+        root = _AnnotatedDict("/config/configuration.yaml")
+        included = _AnnotatedDict("/config/commands.yaml")
+        included["shell_command"] = {"mcp_secret": "value"}
+        root["included"] = included
+
+        assert find_yaml_key_files(root, "shell_command.mcp_secret") == [
+            "/config/commands.yaml"
+        ]
+
+    def test_key_uses_the_mapping_not_its_secret_value(self):
+        root = _AnnotatedDict("/config/configuration.yaml")
+        package = _AnnotatedDict("/config/custom_packages/nested/mcp.yaml")
+        package["shell_command"] = {"mcp_secret": _TaggedValue("/config/secrets.yaml")}
+        root["custom_packages"] = {"nested": package}
+
+        assert find_yaml_key_files(root, "shell_command.mcp_secret") == [
+            "/config/custom_packages/nested/mcp.yaml"
+        ]
+
+    def test_cycles_are_walked_once(self):
+        node = _AnnotatedDict("/config/configuration.yaml")
+        node["self"] = node
+        node["template"] = {}
+        assert find_yaml_key_files(node, "template") == ["/config/configuration.yaml"]

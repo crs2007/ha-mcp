@@ -38,6 +38,13 @@ PATHS_IGNORE: tuple[str, ...] = (
     # ours. Scoped to the library subtree, NOT all of _vendor/, so our own
     # _vendor/__init__.py stays gated exactly as ruff lints it.
     "src/ha_mcp/_vendor/websockets/",
+    # Vendored FastMCP / MCP SDK trees, excluded for the same reason.
+    "src/ha_mcp/_vendor/fastmcp/",
+    "src/ha_mcp/_vendor/mcp/",
+    "src/ha_mcp/_vendor/mcp_types/",
+    # Vendored skills submodule — upstream's code, shipped as package data and
+    # excluded from ruff for the same reason.
+    "src/ha_mcp/resources/skills-vendor/",
 )
 
 # Per-finding allowlist for verified false positives and intentional patterns
@@ -52,13 +59,30 @@ PATHS_IGNORE: tuple[str, ...] = (
 ALLOWLIST: tuple[tuple[str, str, str, str, str], ...] = (
     (
         "py/unused-global-variable",
-        "tests/src/unit/_embedded_stubs.py",
-        "_INSTALLED",
+        "custom_components/ha_mcp_tools/card_definitions.py",
+        "_build_task",
         "",
-        "Cross-invocation use: install() sets the module-level flag under a "
-        "'global' declaration so a second call returns early. CodeQL's "
-        "single-pass dead-store analysis misses the next-call read at the top "
-        "of install(), so the assignment looks dead.",
+        "Cross-invocation use: async_get_definitions stores the background build "
+        "task so later calls await the same build, including after a timeout.",
+    ),
+    (
+        "py/unused-global-variable",
+        "custom_components/ha_mcp_tools/custom_cards.py",
+        "_dom_failed_at",
+        "",
+        "Cross-invocation use: a failed download records its time; the next "
+        "_async_dom call reads it to enforce the retry cooldown.",
+    ),
+    *(
+        (
+            "py/unused-global-variable",
+            "tests/src/unit/_config_flow_core.py",
+            name,
+            "",
+            "Cross-module use: helper module of the config flow tests; the "
+            "test_config_flow_*.py modules import and read it.",
+        )
+        for name in ("MANIFEST_VERSION", "STRINGS_COMMON", "GERMAN_COMMON")
     ),
     # NOTE: CodeQL emits the same generic message for every instance of
     # py/ineffectual-statement, so the entries below carry a code substring:
@@ -106,11 +130,33 @@ ALLOWLIST: tuple[tuple[str, str, str, str, str], ...] = (
     ),
     (
         "py/ineffectual-statement",
-        "tests/src/e2e/workflows/hacs/test_auto_refresh_startup.py",
+        "src/ha_mcp/server_lifespan.py",
         "This statement has no effect",
         "await task",
         "False positive on the bare 'await task' inside contextlib.suppress "
-        "in _HttpLauncher.wait_for_lifespan_started: awaiting the cancelled "
+        "in server_lifespan: awaiting the cancelled admin-token check IS the "
+        "effect (it waits for the task to finish unwinding before the server "
+        "lifespan exits).",
+    ),
+    (
+        "py/ineffectual-statement",
+        "tests/src/unit/test_ha_search_dashboard_leg_failure.py",
+        "This statement has no effect",
+        "await call",
+        "False positive on the bare 'await call' inside pytest.raises in "
+        "test_parent_cancellation_settles_the_dashboard_leg and "
+        "test_parent_cancellation_during_fallback_settle_propagates: awaiting the "
+        "cancelled ha_search task IS the effect (it drives the call to "
+        "completion and raises the CancelledError the context manager "
+        "asserts).",
+    ),
+    (
+        "py/ineffectual-statement",
+        "tests/src/e2e/utilities/http_launcher.py",
+        "This statement has no effect",
+        "await task",
+        "False positive on the bare 'await task' inside contextlib.suppress "
+        "in HttpLauncher.wait_for_lifespan_started: awaiting the cancelled "
         "racer IS the effect (it drives the loser of the started-vs-exited "
         "race to completion before returning).",
     ),
@@ -188,34 +234,43 @@ ALLOWLIST: tuple[tuple[str, str, str, str, str], ...] = (
         "import, so the declaration looks dead.",
     ),
     (
-        "py/unused-import",
-        "packaging/binary/pyinstaller_hooks/runtime_hook.py",
-        "idna",
+        "py/unused-global-variable",
+        "src/ha_mcp/tools/log_common.py",
+        "_LOG_LEVEL_RE",
         "",
-        "Intentional side-effect import: registers the idna codec at startup and "
-        "forces PyInstaller to bundle it. Rewriting it risks the binary build.",
+        "Cross-module use: log_common.py is the leaf module of the tools_utility "
+        "split, so this regex is imported and read by log_sources.py's "
+        "_build_raw_error_log level filter. CodeQL's single-file analysis misses "
+        "the cross-module import, so the declaration looks dead.",
     ),
     (
         "py/unused-import",
-        "packaging/binary/pyinstaller_hooks/runtime_hook.py",
-        "encodings",
+        "tests/src/e2e/conftest.py",
+        "_collection_data_dir",
         "",
-        "Intentional side-effect import: registers the stdlib encodings.idna "
-        "codec at startup. Rewriting it risks the binary build.",
+        "Intentional side-effect import: sets HA_MCP_CONFIG_DIR to a temp dir "
+        "before the conftest imports ha_mcp, which reads settings at import. "
+        "Code in the conftest itself would break the import-order lint.",
     ),
     (
-        "py/import-and-import-from",
-        "tests/src/unit/test_translate_locales.py",
-        "Module 'translate_locales' is imported with both",
-        "import translate_locales",
-        "Both forms are load-bearing in this one file. The module object is "
-        "what the monkeypatch sites need — translate_locales.time, .httpx and "
-        "._call_gemini are replaced per test, twenty-three attributes in all — "
-        "while the from-imports name the API under test at seventy call sites. "
-        "Collapsing either direction requalifies those without making anything "
-        "clearer. The pair predates this entry and is unchanged from master; "
-        "it began reporting once scripts/ gained a second module importing "
-        "translate_locales, which is what lets the extractor resolve the name.",
+        "py/unused-import",
+        "tests/src/e2e/conftest.py",
+        "Import of 'pytest_",
+        "",
+        "Hook registration: pytest finds hooks by name in the conftest "
+        "namespace, so importing a pytest_* hook from a _conftest_* module "
+        "registers it. pytest_plugins is not allowed in a conftest below the "
+        "root directory.",
+    ),
+    (
+        "py/unused-import",
+        "tests/src/conftest.py",
+        "Import of 'pytest_runtest_call'",
+        "",
+        "Hook registration: pytest finds hooks by name in the conftest "
+        "namespace, so importing pytest_runtest_call from "
+        "tests/src/timed_out_task.py registers it. pytest_plugins is not "
+        "allowed in a conftest below the root directory.",
     ),
     (
         "py/catch-base-exception",
@@ -254,19 +309,30 @@ ALLOWLIST: tuple[tuple[str, str, str, str, str], ...] = (
         "clean under that typing.",
     ),
     # NOTE: same PATH-WIDE caveat as the server.py entry above — re-audit if
-    # backup.py grows genuinely mixed-returns functions.
+    # backup_snapshot.py grows genuinely mixed-returns functions.
     (
         "py/mixed-returns",
-        "src/ha_mcp/tools/backup.py",
+        "src/ha_mcp/tools/backup_snapshot.py",
         "Mixing implicit and explicit returns",
         "",
-        "False positive on _finalize_backup_timeout and _perform_restore's "
-        "success-branch-vs-raise shape (helpers extracted from the C901 "
-        "refactor, issue #925): the non-return branch in each always goes "
-        "through raise_tool_error, typed '-> NoReturn' (see helpers.py), so "
-        "there is no implicit None return for CodeQL's heuristic to have "
-        "correctly caught. mypy already confirms this file is clean under "
-        "that typing.",
+        "False positive on _wait_for_backup's return-in-the-loop vs raise "
+        "shape: after the loop it always goes through raise_tool_error, typed "
+        "'-> NoReturn' (see helpers.py), so there is no implicit None return "
+        "for CodeQL's heuristic to have correctly caught. mypy already "
+        "confirms this file is clean under that typing.",
+    ),
+    # NOTE: same PATH-WIDE caveat as the server.py entry above — re-audit if
+    # provision.py grows genuinely mixed-returns functions.
+    (
+        "py/mixed-returns",
+        "src/ha_mcp/dashboard_screenshot/provision.py",
+        "Mixing implicit and explicit returns",
+        "",
+        "False positive on _discover_engine_via_supervisor's return-in-the-try "
+        "vs raise shape: every other path ends in raise_tool_error, typed "
+        "'-> NoReturn' (see helpers.py), so there is no implicit None return "
+        "for CodeQL's heuristic to have correctly caught. mypy already "
+        "confirms this file is clean under that typing.",
     ),
     # ---- Security-suite entries (the workflow also gates the default
     # <language>-code-scanning suites; see codeql-quality.yml header). Entries
@@ -275,6 +341,18 @@ ALLOWLIST: tuple[tuple[str, str, str, str, str], ...] = (
     # the same file would be suppressed too. Accepted for the same reason as
     # the quality entries above: the files are small and each reason names the
     # exact intended pattern. Re-audit when one of these files grows.
+    (
+        "py/clear-text-logging-sensitive-data",
+        "custom_components/ha_mcp_tools/mcp_webhook.py",
+        "as clear text",
+        "OAUTH_BASE,",
+        "False positive: the legacy route-conflict warning logs the route-owner "
+        "domain string from hass.data plus the OAUTH_BASE public URL-path "
+        "constant. CodeQL's name-based classification treats the oauth-named "
+        "symbols as password-class; no credential flows into the call (the "
+        "secret-bearing exception object was deliberately dropped from the log "
+        "in the same PR).",
+    ),
     (
         "py/clear-text-logging-sensitive-data",
         "custom_components/ha_mcp_tools/embedded_setup.py",
@@ -364,6 +442,24 @@ ALLOWLIST: tuple[tuple[str, str, str, str, str], ...] = (
     ),
     (
         "py/clear-text-storage-sensitive-data",
+        "tests/src/unit/_core_setup.py",
+        "as clear text",
+        "",
+        "Test helper writing Core's secrets.yaml under the test's temporary "
+        "config directory; the values are throwaway strings the tests check "
+        "the component redacts.",
+    ),
+    (
+        "py/clear-text-storage-sensitive-data",
+        "tests/addon/webhook_proxy/_start.py",
+        "as clear text",
+        "",
+        "Test harness writing the app options the Supervisor would write to "
+        "/data/options.json, under the test's temporary directory; the OAuth "
+        "client secrets in them are throwaway test values that start.py reads.",
+    ),
+    (
+        "py/clear-text-storage-sensitive-data",
         "homeassistant-addon-webhook-proxy/mcp_proxy/oauth.py",
         "as clear text",
         "",
@@ -380,6 +476,28 @@ ALLOWLIST: tuple[tuple[str, str, str, str, str], ...] = (
         "Warned fallback (dev flavor, identical code to stable): plain write of "
         "the signing key only when the filesystem cannot honor 0600, with a "
         "warning. Persistence is the feature.",
+    ),
+    (
+        "py/clear-text-storage-sensitive-data",
+        "homeassistant-addon-webhook-proxy-dev/mcp_proxy_dev/__init__.py",
+        "as clear text",
+        "DCR_SECRET_FILE.write_bytes(new_secret)",
+        "Warned fallback (DCR signing key, same pattern as the OAuth signing "
+        "key in oauth.py): load_or_create_dcr_secret writes via "
+        "_atomic_write_0600 first; the flagged plain write only runs when the "
+        "filesystem cannot honor 0600 and it logs a warning. Persisting the "
+        "key is the feature (registered client_ids must survive restarts).",
+    ),
+    (
+        "py/clear-text-storage-sensitive-data",
+        "homeassistant-addon-webhook-proxy/mcp_proxy/__init__.py",
+        "as clear text",
+        "DCR_SECRET_FILE.write_bytes(new_secret)",
+        "Warned fallback (DCR signing key, stable twin of the dev entry above "
+        "— promoted in 3.0.0): load_or_create_dcr_secret writes via "
+        "_atomic_write_0600 first; the flagged plain write only runs when the "
+        "filesystem cannot honor 0600 and it logs a warning. Persisting the "
+        "key is the feature (registered client_ids must survive restarts).",
     ),
     (
         "py/clear-text-storage-sensitive-data",
@@ -457,15 +575,7 @@ ALLOWLIST: tuple[tuple[str, str, str, str, str], ...] = (
     ),
     (
         "py/incomplete-url-substring-sanitization",
-        "tests/src/unit/test_oauth.py",
-        "may be at an arbitrary position",
-        "",
-        "Test assertion, not URL validation: checks that the consent HTML "
-        "displays the redirect host to the user.",
-    ),
-    (
-        "py/incomplete-url-substring-sanitization",
-        "tests/src/unit/test_oauth_legacy_component.py",
+        "tests/src/unit/test_oauth_legacy_views.py",
         "may be at an arbitrary position",
         "",
         "Test assertion, not URL validation: the XSS-escape test checks the "
@@ -572,11 +682,6 @@ def classify(
     findings.sort(key=lambda f: (f[2], f[0], f[1]))
     suppressed.sort(key=lambda f: (f[2], f[0], f[1]))
     return findings, suppressed
-
-
-def load_findings(sarif_path: Path) -> list[tuple[str, int, str, str]]:
-    """Return the sorted list of gating (file, line, rule_id, message) findings."""
-    return classify(sarif_path)[0]
 
 
 def render(findings: list[tuple[str, int, str, str]]) -> str:

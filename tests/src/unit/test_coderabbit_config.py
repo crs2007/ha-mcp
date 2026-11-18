@@ -9,8 +9,8 @@ failure: rename ``.gemini/styleguide.md`` and both CodeRabbit and the Codex
 review request point at nothing, quietly.
 
 Same pattern as ``test_ruff_scope_covers_the_tree.py`` (pins a tool's config to
-the tree) and ``test_locale_parity.py::test_agents_md_states_the_current_ceilings``
-(pins AGENTS.md prose to the real values).
+the tree) and ``test_locale_parity.py::test_locale_readme_states_the_current_ceilings``
+(pins the canonical locale guide to the real values).
 """
 
 from __future__ import annotations
@@ -28,6 +28,11 @@ AGENTS_MD = REPO_ROOT / "AGENTS.md"
 CODEX_DELIVERY = REPO_ROOT / ".github" / "workflows" / "pr-codex-review-delivery.yml"
 CODEX_REQUEST = REPO_ROOT / ".github" / "workflows" / "pr-codex-review-request.yml"
 STYLEGUIDE = ".gemini/styleguide.md"
+REPO_WIDE_GUIDELINES = {
+    STYLEGUIDE,
+    "docs/agents/*.md",
+    "src/ha_mcp/settings_ui/locales/README.md",
+}
 
 # The exact auto-review skip list, mirrored by the Codex auto-admission list
 # in pr-codex-review-request.yml. dependabot/renovate PRs have never been
@@ -75,7 +80,7 @@ def _subsection(text: str, title: str) -> str | None:
     """The body of one ``### `` subsection, or ``None`` when absent.
 
     Scoped rather than grepping the whole document, for the reason given in
-    ``test_locale_parity.py::_agents_md_section``: a whole-file grep answers a
+    ``test_locale_parity.py::_locale_readme_section``: a whole-file grep answers a
     question about the file, not about the section it claims to guard.
 
     Terminates on any heading of level 1-3 or end of input. Both bounds matter:
@@ -133,6 +138,20 @@ def test_draft_reviews_are_enabled() -> None:
         "auto_pause_after_reviewed_commits must be integer 0 — drafts here "
         "iterate push -> CI -> fix and blow past CodeRabbit's default 5-commit "
         f"pause, which stops review with no signal. Found {pause!r}."
+    )
+
+
+def test_docstring_coverage_pre_merge_check_is_disabled() -> None:
+    """Docstrings stay reviewable without enforcing a repository-wide quota."""
+    pre_merge_checks = _config()["reviews"].get("pre_merge_checks")
+
+    assert pre_merge_checks is not None, (
+        "reviews.pre_merge_checks is missing — CodeRabbit would restore its "
+        "default docstring coverage warning"
+    )
+    assert pre_merge_checks.get("docstrings", {}).get("mode") == "off", (
+        "reviews.pre_merge_checks.docstrings.mode must be 'off' — this disables "
+        "only the percentage-based coverage check, not ordinary docstring review"
     )
 
 
@@ -273,40 +292,13 @@ def test_agents_md_documents_the_real_auto_review_settings() -> None:
     )
 
 
-def test_issue_enrichment_is_enabled() -> None:
-    """Issue triage now rests on this block; the schema default is ``false``.
-
-    CodeRabbit's docs say enrichment is "enabled by default", but the schema
-    the file points at says ``auto_enrich.enabled`` defaults to ``false`` —
-    and the schema is what applied in practice: no issue opened after the app
-    install got an enrichment comment until this was set. With the GitHub
-    Models triage bot deleted, a typo'd key here means new issues silently
-    get no triage at all, from either system.
-    """
+def test_issue_intake_has_exclusive_ownership() -> None:
+    """CodeRabbit must not compete with the factual issue-intake workflow."""
     enrich = _config()["issue_enrichment"]
-
-    assert enrich["auto_enrich"]["enabled"] is True, (
-        "issue_enrichment.auto_enrich.enabled must be true — the schema "
-        "default is false, and this block is the repo's only issue triage."
-    )
-    labeling = enrich["labeling"]
-    assert labeling["auto_apply_labels"] is True, (
-        "auto_apply_labels must be true — false (the default) demotes every "
-        "labeling_instruction to a suggestion inside the enrichment comment."
-    )
-    instructions = labeling["labeling_instructions"]
-    assert instructions, (
-        "labeling_instructions is empty — auto-labeling has nothing to apply"
-    )
-    for entry in instructions:
-        assert entry.get("label") and entry.get("instructions"), (
-            f"labeling_instructions entry {entry!r} needs both `label` and "
-            "`instructions`"
-        )
-        assert len(entry["instructions"]) <= 3000, (
-            f"instructions for {entry['label']!r} exceed the schema's 3000-char "
-            "maxLength — CodeRabbit rejects the config"
-        )
+    assert enrich["auto_enrich"]["enabled"] is False
+    assert enrich["labeling"]["auto_apply_labels"] is False
+    assert enrich["planning"]["enabled"] is False
+    assert (REPO_ROOT / ".github/workflows/issue-intake.yml").is_file()
 
 
 def test_auto_planning_stays_off() -> None:
@@ -342,31 +334,32 @@ def test_every_guideline_path_resolves() -> None:
             )
 
 
-def test_styleguide_applies_to_the_whole_tree() -> None:
-    """A narrowed ``applyTo`` scopes the styleguide to nothing, silently.
+def test_relocated_guidelines_apply_to_the_whole_tree() -> None:
+    """Every delegated owner must retain repository-wide review coverage.
 
     Path resolution alone does not catch it: the entry keeps pointing at a real
-    file while governing no reviewed code, because a guideline is otherwise
-    scoped to its own directory tree and ``.gemini/`` holds no source.
+    file while governing only its own subtree.
     """
-    entries = [
-        entry
+    entries = {
+        entry.get("files"): entry
         for entry in _config()["knowledge_base"]["code_guidelines"]["filePatterns"]
-        if isinstance(entry, dict) and entry.get("files") == STYLEGUIDE
-    ]
-    assert len(entries) == 1, (
-        f"expected exactly one code_guidelines entry for {STYLEGUIDE}, found "
-        f"{len(entries)} — a string entry would scope it to `.gemini/` only."
+        if isinstance(entry, dict)
+    }
+    missing_guidelines = REPO_WIDE_GUIDELINES - entries.keys()
+    assert not missing_guidelines, (
+        "CodeRabbit is missing repo-wide guideline entries for "
+        f"{sorted(missing_guidelines)}"
     )
 
-    scope = {part.strip() for part in entries[0]["applyTo"].split(",")}
-    missing = {p: why for p, why in REQUIRED_SCOPE.items() if p not in scope}
+    for guideline in sorted(REPO_WIDE_GUIDELINES):
+        scope = {part.strip() for part in entries[guideline]["applyTo"].split(",")}
+        missing = {p: why for p, why in REQUIRED_SCOPE.items() if p not in scope}
 
-    assert not missing, (
-        f"{STYLEGUIDE} no longer applies to: "
-        + "; ".join(f"{why} (pattern {p!r})" for p, why in missing.items())
-        + ". CodeRabbit drops those files from the styleguide's scope with no error."
-    )
+        assert not missing, (
+            f"{guideline} no longer applies to: "
+            + "; ".join(f"{why} (pattern {p!r})" for p, why in missing.items())
+            + ". CodeRabbit drops those files from the guideline scope."
+        )
 
 
 def test_codex_review_request_points_at_a_real_styleguide() -> None:

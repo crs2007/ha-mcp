@@ -14,8 +14,9 @@ from collections.abc import Callable, Iterable
 from typing import Any
 
 import websockets
-from fastmcp.exceptions import ClientError, FastMCPError
-from mcp import McpError
+import websockets.exceptions
+
+from ha_mcp._vendor.fastmcp.exceptions import ClientError, FastMCPError, McpError
 
 from .assertions import parse_mcp_result, safe_call_tool
 
@@ -292,7 +293,7 @@ async def wait_for_state_change(
             logger.warning(f"⚠️ Could not get initial state for {entity_id}")
             return None
         initial_state = initial_data.get("data", {}).get("state")
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"⚠️ Error getting initial state for {entity_id}: {e}")
         return None
 
@@ -666,7 +667,7 @@ async def _ws_wait_for_predicate(
 ) -> Any:
     """Subscribe → sample-after-subscribe → wait-for-event pattern, test-side.
 
-    Mirrors :func:`ha_mcp.tools.util_helpers._ws_wait_for_condition` (the
+    Mirrors :func:`ha_mcp.tools.ws_waiters._ws_wait_for_condition` (the
     server-side waiter PR #1382 introduced) so the test-side wait helpers
     stop racing against entity hydration on busy CI runners.
 
@@ -769,7 +770,7 @@ async def _ws_wait_for_predicate(
     finally:
         try:
             await ws.close()
-        except (websockets.exceptions.WebSocketException, OSError):
+        except websockets.exceptions.WebSocketException, OSError:
             pass
 
 
@@ -846,7 +847,7 @@ async def wait_for_ha_event(
         # KeyError, etc.) is a bug, not a transient, and should surface
         # immediately with a clear traceback rather than being indistinguishable
         # from "no matching event arrived". Matches the
-        # _POLLING_TRANSIENT_ERRORS discipline AGENTS.md mandates.
+        # _POLLING_TRANSIENT_ERRORS discipline tests/AGENTS.md mandates.
         trigger_result = trigger()
         if asyncio.iscoroutine(trigger_result):
             await trigger_result
@@ -867,7 +868,7 @@ async def wait_for_ha_event(
     finally:
         try:
             await ws.close()
-        except (websockets.exceptions.WebSocketException, OSError):
+        except websockets.exceptions.WebSocketException, OSError:
             # Close errors on an already-broken socket — don't mask the
             # caller's outcome with them.
             pass

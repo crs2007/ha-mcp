@@ -15,6 +15,24 @@ def test_tool_security_policies_disabled_by_default():
     assert Settings().enable_tool_security_policies is False
 
 
+def test_history_query_guardrails_disabled_by_default():
+    """Recorder workload budgets preserve existing behavior unless opted in."""
+    from ha_mcp.config import Settings
+
+    assert Settings().enable_history_query_guardrails is False
+
+
+@pytest.mark.parametrize(("env_value", "expected"), [("true", True), ("false", False)])
+def test_history_query_guardrails_env_var(env_value, expected):
+    from ha_mcp.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        HAMCP_ENABLE_HISTORY_QUERY_GUARDRAILS=env_value,
+    )
+    assert settings.enable_history_query_guardrails is expected
+
+
 def test_enable_mandatory_bps_default_on():
     """ENABLE_MANDATORY_BPS defaults to True — feature is on unless the
     operator explicitly disables (issue #1182 master switch)."""
@@ -44,7 +62,7 @@ def test_enable_mandatory_bps_env_var_coercion_accepted(env_value, expected):
     from ha_mcp.config import Settings
 
     settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
+        _env_file=None,
         ENABLE_MANDATORY_BPS=env_value,
     )
     assert settings.enable_mandatory_bps is expected
@@ -60,7 +78,7 @@ def test_enable_mandatory_bps_env_var_coercion_rejected(env_value):
 
     with pytest.raises(pydantic.ValidationError):
         Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             ENABLE_MANDATORY_BPS=env_value,
         )
 
@@ -94,7 +112,7 @@ def test_enable_strict_mandatory_bps_env_var_coercion_accepted(env_value, expect
     from ha_mcp.config import Settings
 
     settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
+        _env_file=None,
         ENABLE_STRICT_MANDATORY_BPS=env_value,
     )
     assert settings.enable_strict_mandatory_bps is expected
@@ -110,7 +128,7 @@ def test_enable_strict_mandatory_bps_env_var_coercion_rejected(env_value):
 
     with pytest.raises(pydantic.ValidationError):
         Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             ENABLE_STRICT_MANDATORY_BPS=env_value,
         )
 
@@ -156,7 +174,7 @@ def test_read_only_mode_env_var_coercion_accepted(env_value, expected):
     from ha_mcp.config import Settings
 
     settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
+        _env_file=None,
         READ_ONLY_MODE=env_value,
     )
     assert settings.read_only_mode is expected
@@ -171,7 +189,7 @@ def test_read_only_mode_env_var_coercion_rejected(env_value):
 
     with pytest.raises(pydantic.ValidationError):
         Settings(
-            _env_file=None,  # type: ignore[call-arg]
+            _env_file=None,
             READ_ONLY_MODE=env_value,
         )
 
@@ -219,7 +237,6 @@ class TestConfigErrorHandling:
             cwd=tmp_path,
             capture_output=True,
             text=True,
-            timeout=30,
             check=False,
         )
 
@@ -253,7 +270,6 @@ class TestConfigErrorHandling:
             cwd=tmp_path,
             capture_output=True,
             text=True,
-            timeout=30,
             check=False,
         )
 
@@ -275,7 +291,6 @@ class TestConfigErrorHandling:
             cwd=tmp_path,
             capture_output=True,
             text=True,
-            timeout=30,
             check=False,
         )
 
@@ -297,7 +312,6 @@ class TestConfigErrorHandling:
             cwd=tmp_path,
             capture_output=True,
             text=True,
-            timeout=30,
             check=False,
         )
 
@@ -326,7 +340,6 @@ class TestConfigErrorHandling:
             cwd=tmp_path,
             capture_output=True,
             text=True,
-            timeout=60,
             check=False,
         )
 
@@ -353,8 +366,7 @@ def isolated_data_dir(tmp_path, monkeypatch):
     ``get_data_dir`` is ``@lru_cache(maxsize=1)`` — without clearing
     the cache, the first test bakes in whichever tmp_path the runner
     saw and every subsequent test reads from a stale path. Clear the
-    cache both before AND after the test so the fixture is symmetric
-    with `_reset_data_dir_cache` in ``test_settings_ui.py``.
+    cache both before AND after the test.
     """
     from ha_mcp.utils.data_paths import get_data_dir
 
@@ -394,9 +406,9 @@ def test_master_off_forces_beta_subflags_false_even_with_file_overrides(
         )
     )
 
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
 
     assert s.enable_beta_features is False
@@ -418,9 +430,9 @@ def test_master_on_allows_beta_subflag_file_overrides(
         )
     )
 
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
 
     assert s.enable_beta_features is True
@@ -438,9 +450,9 @@ def test_master_env_var_off_overrides_subflag_env_var(
     monkeypatch.delenv("ENABLE_BETA_FEATURES", raising=False)
     monkeypatch.setenv("ENABLE_YAML_CONFIG_EDITING", "true")
 
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
 
     assert s.enable_beta_features is False
@@ -467,9 +479,9 @@ def test_master_in_addon_mode_reads_override_file(
         )
     )
 
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
 
     assert s.enable_beta_features is True
@@ -504,9 +516,9 @@ def test_yaml_packages_subflags_read_from_override_file_in_addon_mode(
         )
     )
 
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
 
     assert s.enable_yaml_config_editing is True
@@ -534,9 +546,9 @@ def test_yaml_packages_subflags_forced_off_when_master_off(
         )
     )
 
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
 
     assert s.enable_beta_features is False
@@ -622,9 +634,9 @@ def test_get_feature_flag_origin_beta_master_file_override_in_addon(
 def test_advanced_override_applies_int_field(isolated_data_dir, monkeypatch) -> None:
     _clear_all_feature_envs(monkeypatch)
     (isolated_data_dir / "feature_flags.json").write_text(json.dumps({"timeout": 90}))
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     assert get_global_settings().timeout == 90
 
 
@@ -635,9 +647,9 @@ def test_advanced_override_applies_str_field_with_choices(
     (isolated_data_dir / "feature_flags.json").write_text(
         json.dumps({"log_level": "DEBUG"})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     assert get_global_settings().log_level == "DEBUG"
 
 
@@ -646,9 +658,9 @@ def test_advanced_override_applies_float_field(isolated_data_dir, monkeypatch) -
     (isolated_data_dir / "feature_flags.json").write_text(
         json.dumps({"code_mode_max_duration": 60.0})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     # enable_beta_features is False default, but code_mode_max_duration
     # isn't a beta sub-flag (it's a numeric tuning param), so it
     # applies regardless.
@@ -665,9 +677,9 @@ def test_advanced_override_skips_display_only_fields(
     (isolated_data_dir / "feature_flags.json").write_text(
         json.dumps({"homeassistant_url": "http://attacker"})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     assert get_global_settings().homeassistant_url != "http://attacker"
 
 
@@ -676,9 +688,9 @@ def test_advanced_override_rejects_out_of_bounds_int(
 ) -> None:
     _clear_all_feature_envs(monkeypatch)
     (isolated_data_dir / "feature_flags.json").write_text(json.dumps({"timeout": -5}))
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     # Out-of-bounds value silently ignored, field stays at default (30).
     assert get_global_settings().timeout == 30
 
@@ -690,9 +702,9 @@ def test_advanced_override_rejects_invalid_choice(
     (isolated_data_dir / "feature_flags.json").write_text(
         json.dumps({"log_level": "BANANAS"})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     # Invalid choice silently ignored, log_level stays at default (INFO).
     assert get_global_settings().log_level == "INFO"
 
@@ -706,9 +718,9 @@ def test_advanced_override_str_field_with_null_byte_rejected(
     (isolated_data_dir / "feature_flags.json").write_text(
         json.dumps({"mcp_server_name": "foo\x00bar"})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
     # Null-byte value silently ignored, field stays at default ("ha-mcp").
     assert s.mcp_server_name == "ha-mcp"
@@ -727,9 +739,9 @@ def test_old_override_file_with_subflag_no_master_force_false(
     (isolated_data_dir / "feature_flags.json").write_text(
         json.dumps({"enable_lite_docstrings": True})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
     assert s.enable_beta_features is False
     assert s.enable_lite_docstrings is False  # forced off by master
@@ -742,9 +754,9 @@ def test_old_override_file_unknown_keys_ignored(isolated_data_dir, monkeypatch) 
     (isolated_data_dir / "feature_flags.json").write_text(
         json.dumps({"future_flag_v99": True, "enable_beta_features": True})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
     assert s.enable_beta_features is True
 
@@ -761,9 +773,9 @@ def test_backup_override_dir_rejects_null_byte(isolated_data_dir, monkeypatch) -
     (isolated_data_dir / "backup_settings.json").write_text(
         json.dumps({"auto_backup_dir": "/tmp/evil\x00bar"})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
     assert s.auto_backup_dir == ""  # default — null-byte value silently dropped
 
@@ -776,9 +788,9 @@ def test_backup_override_lookahead_rejects_out_of_range(
     (isolated_data_dir / "backup_settings.json").write_text(
         json.dumps({"auto_backup_calendar_lookahead_days": 9999})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     s = get_global_settings()
     assert s.auto_backup_calendar_lookahead_days == 7  # field default
 
@@ -791,9 +803,9 @@ def test_backup_override_lookahead_accepts_in_range(
     (isolated_data_dir / "backup_settings.json").write_text(
         json.dumps({"auto_backup_calendar_lookahead_days": 30})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     assert get_global_settings().auto_backup_calendar_lookahead_days == 30
 
 
@@ -812,48 +824,40 @@ def test_snapshot_delete_min_age_days_default_seven() -> None:
     assert Settings().snapshot_delete_min_age_days == 7
 
 
-def test_enable_snapshot_delete_env_var_true() -> None:
+def test_enable_snapshot_delete_env_var_true(monkeypatch) -> None:
     from ha_mcp.config import Settings
 
-    settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
-        ENABLE_SNAPSHOT_DELETE="true",
-    )
+    monkeypatch.setenv("ENABLE_SNAPSHOT_DELETE", "true")
+    settings = Settings(_env_file=None)
     assert settings.enable_snapshot_delete is True
 
 
-def test_snapshot_delete_min_age_days_env_var() -> None:
+def test_snapshot_delete_min_age_days_env_var(monkeypatch) -> None:
     from ha_mcp.config import Settings
 
-    settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
-        SNAPSHOT_DELETE_MIN_AGE_DAYS="14",
-    )
+    monkeypatch.setenv("SNAPSHOT_DELETE_MIN_AGE_DAYS", "14")
+    settings = Settings(_env_file=None)
     assert settings.snapshot_delete_min_age_days == 14
 
 
-def test_snapshot_delete_min_age_days_zero_disables_floor() -> None:
+def test_snapshot_delete_min_age_days_zero_disables_floor(monkeypatch) -> None:
     """0 is a valid, in-range value (the age floor is opt-out per #1861
     design: min_age_days=0 disables the age guard)."""
     from ha_mcp.config import Settings
 
-    settings = Settings(
-        _env_file=None,  # type: ignore[call-arg]
-        SNAPSHOT_DELETE_MIN_AGE_DAYS="0",
-    )
+    monkeypatch.setenv("SNAPSHOT_DELETE_MIN_AGE_DAYS", "0")
+    settings = Settings(_env_file=None)
     assert settings.snapshot_delete_min_age_days == 0
 
 
-def test_snapshot_delete_min_age_days_rejects_out_of_range() -> None:
+def test_snapshot_delete_min_age_days_rejects_out_of_range(monkeypatch) -> None:
     import pydantic
 
     from ha_mcp.config import Settings
 
+    monkeypatch.setenv("SNAPSHOT_DELETE_MIN_AGE_DAYS", "9999")
     with pytest.raises(pydantic.ValidationError):
-        Settings(
-            _env_file=None,  # type: ignore[call-arg]
-            SNAPSHOT_DELETE_MIN_AGE_DAYS="9999",
-        )
+        Settings(_env_file=None)
 
 
 def test_backup_override_enable_snapshot_delete_accepts_bool(
@@ -864,9 +868,9 @@ def test_backup_override_enable_snapshot_delete_accepts_bool(
     (isolated_data_dir / "backup_settings.json").write_text(
         json.dumps({"enable_snapshot_delete": True})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     assert get_global_settings().enable_snapshot_delete is True
 
 
@@ -878,9 +882,9 @@ def test_backup_override_min_age_days_rejects_out_of_range(
     (isolated_data_dir / "backup_settings.json").write_text(
         json.dumps({"snapshot_delete_min_age_days": 9999})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     assert get_global_settings().snapshot_delete_min_age_days == 7  # field default
 
 
@@ -892,7 +896,40 @@ def test_backup_override_min_age_days_accepts_in_range(
     (isolated_data_dir / "backup_settings.json").write_text(
         json.dumps({"snapshot_delete_min_age_days": 30})
     )
-    from ha_mcp.config import _reset_global_settings, get_global_settings
+    from ha_mcp.config import get_global_settings, reset_global_settings
 
-    _reset_global_settings()
+    reset_global_settings()
     assert get_global_settings().snapshot_delete_min_age_days == 30
+
+
+@pytest.mark.parametrize(
+    ("env", "value", "field", "default"),
+    [
+        ("HA_TIMEOUT", "900", "timeout", 30),
+        ("ENVIRONMENT", "staging", "environment", "development"),
+    ],
+    ids=["outside the range", "not one of the choices"],
+)
+def test_bad_lenient_env_value_warns_and_keeps_the_default(
+    env: str, value: str, field: str, default: object, caplog
+) -> None:
+    """An env value the web UI would refuse must not stop the server either:
+    the setting keeps its default and the log says which value was ignored."""
+    from ha_mcp.config import Settings
+
+    with caplog.at_level("WARNING", logger="ha_mcp.config"):
+        settings = Settings(_env_file=None, **{env: value})  # type: ignore[arg-type]
+
+    assert getattr(settings, field) == default
+    assert f"{field}={value!r}" in caplog.text
+
+
+def test_unknown_log_level_fails_at_startup() -> None:
+    """A log level the logging module does not know would silently fall back
+    to INFO when applied; startup must name the bad value instead."""
+    import pydantic
+
+    from ha_mcp.config import Settings
+
+    with pytest.raises(pydantic.ValidationError, match="must be one of"):
+        Settings(_env_file=None, LOG_LEVEL="verbose")

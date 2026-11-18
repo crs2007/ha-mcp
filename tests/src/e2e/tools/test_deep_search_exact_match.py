@@ -11,7 +11,7 @@ import logging
 
 import pytest
 
-from ..utilities.assertions import assert_mcp_success
+from ..utilities.assertions import assert_mcp_success, safe_call_tool
 from ..utilities.wait_helpers import wait_for_tool_result
 
 logger = logging.getLogger(__name__)
@@ -78,9 +78,10 @@ async def test_deep_search_exact_match_default(mcp_client):
         logger.info("Exact match correctly excludes non-matching results")
 
     finally:
-        await mcp_client.call_tool(
+        await safe_call_tool(
+            mcp_client,
             "ha_config_remove_automation",
-            {"identifier": "automation.exact_match_test_automation"},
+            {"entity_id": "automation.exact_match_test_automation"},
         )
         logger.info("Cleaned up test automation")
 
@@ -126,9 +127,10 @@ async def test_deep_search_fuzzy_match_opt_in(mcp_client):
         logger.info(f"Fuzzy match found {len(data['automations'])} result(s)")
 
     finally:
-        await mcp_client.call_tool(
+        await safe_call_tool(
+            mcp_client,
             "ha_config_remove_automation",
-            {"identifier": "automation.fuzzy_search_test_automation"},
+            {"entity_id": "automation.fuzzy_search_test_automation"},
         )
         logger.info("Cleaned up test automation")
 
@@ -181,8 +183,8 @@ async def test_deep_search_dashboard_type(mcp_client):
 
         # Verify the match is from our test dashboard
         found = any(
-            d.get("dashboard_url") == "deep-search-test-dash"
-            or d.get("dashboard_title") == "Deep Search Test"
+            d.get("url_path") == "deep-search-test-dash"
+            and d.get("title") == "Deep Search Test"
             for d in dashboards
         )
         assert found, "Should find our specific test dashboard"
@@ -198,7 +200,8 @@ async def test_deep_search_dashboard_type(mcp_client):
         )
 
     finally:
-        await mcp_client.call_tool(
+        await safe_call_tool(
+            mcp_client,
             "ha_config_delete_dashboard",
             {"url_path": "deep-search-test-dash"},
         )
@@ -236,7 +239,8 @@ async def test_dashboard_search_config_less_dashboard_not_partial(mcp_client):
         logger.info("Confirmed: config-less dashboard does not flag partial")
 
     finally:
-        await mcp_client.call_tool(
+        await safe_call_tool(
+            mcp_client,
             "ha_config_delete_dashboard",
             {"url_path": "no-config-dash-2008"},
         )

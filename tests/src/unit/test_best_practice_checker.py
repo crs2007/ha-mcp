@@ -1636,7 +1636,7 @@ class TestBestPracticeCheckResultShape:
             }
         )
         assert (
-            "references/automation-patterns.md#native-conditions"
+            "references/triggers-and-conditions.md#native-conditions"
             in result.referenced_files
         )
 
@@ -1658,7 +1658,7 @@ class TestBestPracticeCheckResultShape:
             }
         )
         assert result.referenced_files == {
-            "references/automation-patterns.md#native-conditions"
+            "references/triggers-and-conditions.md#native-conditions"
         }
 
     def test_referenced_files_tracked_even_when_skill_prefix_none(self):
@@ -1680,7 +1680,7 @@ class TestBestPracticeCheckResultShape:
             skill_prefix=None,
         )
         assert result.referenced_files == {
-            "references/automation-patterns.md#native-conditions"
+            "references/triggers-and-conditions.md#native-conditions"
         }
 
 
@@ -1696,12 +1696,10 @@ class TestTwoRouteWarningSuffix:
 
     @staticmethod
     def _first_warning(prefix=None):
-        from ha_mcp.tools.best_practice_checker import (
-            _DEFAULT_SKILL_PREFIX,
-            check_automation_config,
-        )
+        from ha_mcp.tools.best_practice_checker import check_automation_config
 
-        skill_prefix = prefix if prefix is not None else _DEFAULT_SKILL_PREFIX
+        # No prefix given: the checker's own default, as every tool call gets.
+        overrides = {} if prefix is None else {"skill_prefix": prefix}
         result = check_automation_config(
             {
                 "condition": [
@@ -1712,7 +1710,7 @@ class TestTwoRouteWarningSuffix:
                 ],
                 "action": [],
             },
-            skill_prefix=skill_prefix,
+            **overrides,
         )
         assert result, "expected at least one warning"
         return result[0]
@@ -1720,14 +1718,13 @@ class TestTwoRouteWarningSuffix:
     def test_default_warning_names_skill_uri_route(self):
         msg = self._first_warning()
         assert (
-            "skill://home-assistant-best-practices/references/automation-patterns.md"
+            "skill://home-assistant-best-practices/references/triggers-and-conditions.md"
             in msg
         )
 
     def test_default_warning_names_ha_get_skill_guide_route(self):
         msg = self._first_warning()
-        assert "ha_get_skill_guide(skill='home-assistant-best-practices'" in msg
-        assert "file='references/automation-patterns.md'" in msg
+        assert "ha_get_skill_guide(file='references/triggers-and-conditions.md')" in msg
 
     def test_warning_does_not_mention_MandatoryBPS_param(self):
         """MandatoryBPS must not appear in warnings. The param is visible
@@ -1739,7 +1736,7 @@ class TestTwoRouteWarningSuffix:
 
     def test_custom_prefix_replaces_skill_uri_keeps_tool_route(self):
         msg = self._first_warning(prefix="https://example.com/refs")
-        assert "https://example.com/refs/automation-patterns.md" in msg
+        assert "https://example.com/refs/triggers-and-conditions.md" in msg
         assert "skill://" not in msg
         # Tool route always present when skills are on
         assert "ha_get_skill_guide" in msg
@@ -1752,9 +1749,9 @@ class TestTwoRouteWarningSuffix:
         the ha_get_skill_guide call uses bare file path (tool reads the whole file)."""
         msg = self._first_warning()
         # URI: anchor preserved
-        assert "automation-patterns.md#native-conditions" in msg
+        assert "triggers-and-conditions.md#native-conditions" in msg
         # Tool route: bare file path, no anchor
-        assert "file='references/automation-patterns.md'" in msg
+        assert "file='references/triggers-and-conditions.md'" in msg
 
 
 # ---------------------------------------------------------------------------
@@ -1830,7 +1827,7 @@ class TestDurationMathDetector:
         assert not _has_warning_containing(warnings, "last_changed", "for:")
 
     def test_warning_contains_skill_ref(self):
-        """Condition-path warning links to ``#native-conditions`` (cf. ``#trigger-types`` for triggers)."""
+        """Condition-path warning links to ``#native-conditions`` (trigger warnings cite a trigger subsection)."""
         config = {
             "condition": [
                 {
@@ -1842,7 +1839,7 @@ class TestDurationMathDetector:
         }
         warnings = check_automation_config(config, skill_prefix=SKILL_PREFIX)
         assert _has_warning_containing(
-            warnings, "automation-patterns.md#native-conditions"
+            warnings, "triggers-and-conditions.md#native-conditions"
         )
 
     def test_no_generic_fallback_when_duration_fires(self):
@@ -1862,22 +1859,6 @@ class TestDurationMathDetector:
         assert not generic_warnings, (
             "Generic fallback should not fire alongside specific detector"
         )
-
-    def test_trigger_warning_uses_trigger_types_anchor(self):
-        """Trigger-specific warning links to trigger-types, not native-conditions."""
-        config = {
-            "trigger": [
-                {
-                    "platform": "template",
-                    "value_template": "{{ (now() - states.sensor.x.last_updated).total_seconds() > 60 }}",
-                }
-            ],
-            "action": [],
-        }
-        warnings = check_automation_config(config, skill_prefix=SKILL_PREFIX)
-        assert _has_warning_containing(
-            warnings, "automation-patterns.md#trigger-types"
-        ), "Trigger warning should reference #trigger-types anchor"
 
     def test_no_false_positive_bare_last_changed_variable(self):
         """A Jinja variable literally named ``last_changed`` must not trigger the detector."""
@@ -2307,81 +2288,14 @@ class TestPluralKeyTolerance:
 
 
 # ---------------------------------------------------------------------------
-# HA 2026.7 renamed purpose-specific keys + trigger behavior values
+# HA 2026.7 trigger behavior values (renamed trigger/condition keys are
+# Core's to reject: it names the unknown key, and the tool adds the closest
+# registered keys)
 # ---------------------------------------------------------------------------
 
 
-class TestRenamedPurposeSpecificKeys:
-    """2026.7 renamed trigger/condition keys and options.behavior values."""
-
-    def test_renamed_trigger_key_warns(self):
-        config = {
-            "triggers": [
-                {"trigger": "vacuum.docked", "target": {"entity_id": "vacuum.robo"}}
-            ],
-            "actions": [],
-        }
-        warnings = check_automation_config(config)
-        assert _has_warning_containing(
-            warnings, "vacuum.docked", "vacuum.returned_to_dock", "2026.7"
-        )
-
-    def test_all_renamed_trigger_keys_warn(self):
-        from ha_mcp.tools.best_practice_checker import _RENAMED_TRIGGER_KEYS
-
-        for old, new in _RENAMED_TRIGGER_KEYS.items():
-            config = {"triggers": [{"trigger": old}], "actions": []}
-            warnings = check_automation_config(config)
-            assert _has_warning_containing(warnings, f"`{old}`", f"`{new}`"), old
-
-    def test_new_trigger_key_clean(self):
-        config = {
-            "triggers": [
-                {
-                    "trigger": "vacuum.returned_to_dock",
-                    "target": {"entity_id": "vacuum.robo"},
-                }
-            ],
-            "actions": [],
-        }
-        assert check_automation_config(config) == []
-
-    def test_renamed_condition_key_warns(self):
-        config = {
-            "triggers": [{"trigger": "state", "entity_id": "climate.x"}],
-            "conditions": [
-                {
-                    "condition": "climate.target_temperature",
-                    "target": {"entity_id": "climate.x"},
-                }
-            ],
-            "actions": [],
-        }
-        warnings = check_automation_config(config)
-        assert _has_warning_containing(
-            warnings, "climate.target_temperature", "climate.is_target_temperature"
-        )
-
-    def test_new_condition_key_clean(self):
-        config = {
-            "triggers": [{"trigger": "state", "entity_id": "climate.x"}],
-            "conditions": [
-                {
-                    "condition": "climate.is_target_temperature",
-                    "target": {"entity_id": "climate.x"},
-                }
-            ],
-            "actions": [],
-        }
-        assert check_automation_config(config) == []
-
-    def test_renamed_condition_key_in_action_tree_warns(self):
-        config = {
-            "triggers": [{"trigger": "state", "entity_id": "light.x"}],
-            "actions": [{"if": [{"condition": "climate.target_humidity"}], "then": []}],
-        }
-        warnings = check_automation_config(config)
-        assert _has_warning_containing(warnings, "climate.is_target_humidity")
+class TestDeprecatedTriggerBehavior:
+    """2026.7 renamed trigger options.behavior values; old ones still load."""
 
     def test_deprecated_trigger_behavior_warns(self):
         for old, new in (("any", "each"), ("last", "all")):
@@ -2800,11 +2714,9 @@ class TestVariablesForwardReferenceMessage:
     def test_skill_route_and_referenced_file(self):
         warnings = check_automation_config(_FORWARD_REF_CONFIG)
         assert _has_warning_containing(
-            warnings, f"{SKILL_PREFIX}/automation-patterns.md#variables"
+            warnings, f"{SKILL_PREFIX}/automation-actions.md#variables"
         )
-        assert (
-            "references/automation-patterns.md#variables" in warnings.referenced_files
-        )
+        assert "references/automation-actions.md#variables" in warnings.referenced_files
 
     def test_skill_prefix_none_suppresses_suffix(self):
         warnings = check_automation_config(_FORWARD_REF_CONFIG, skill_prefix=None)
@@ -3046,38 +2958,4 @@ class TestVariablesForwardReferenceNesting:
         config = {"first": ["{% set later = 1 %}", "{{ later }}"], "later": "1"}
         assert _has_warning_containing(
             _variables_warnings(config), "`first`", "`later`"
-        )
-
-
-class TestVariablesForwardReferenceNormalizationSeam:
-    """The premise the check rests on: normalization leaves the block alone.
-
-    The reported bug arrived as an already-reordered block, so the check has
-    to fire on the order it is handed. That only holds if the write path does
-    not reorder or rename anything inside a variables block on the way in.
-    """
-
-    def test_normalization_preserves_key_order_and_names(self):
-        from ha_mcp.tools.tools_config_automations import _normalize_automation_config
-
-        config = {
-            "triggers": [{"trigger": "state", "entity_id": "binary_sensor.door"}],
-            "actions": [
-                {
-                    "variables": {
-                        "meldung": "{% if offene_tueren %}open{% endif %}",
-                        "offene_tueren": "{{ 1 }}",
-                    }
-                }
-            ],
-        }
-
-        normalized = _normalize_automation_config(config)
-
-        assert list(normalized["actions"][0]["variables"]) == [
-            "meldung",
-            "offene_tueren",
-        ]
-        assert _has_warning_containing(
-            check_automation_config(normalized), "`meldung`", "`offene_tueren`"
         )

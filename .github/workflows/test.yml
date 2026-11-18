@@ -1,80 +1,105 @@
-name: Codex Hello World Tests
+name: Codex example - hello world
 
 on:
   workflow_dispatch:
+    inputs:
+      model:
+        description: Codex model to verify with the repository's authenticated account.
+        required: true
+        default: gpt-6.1-sol
+        type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: codex-auth-${{ github.repository }}
+  cancel-in-progress: false
+  queue: max
+
 jobs:
-  codex-hello:
+  hello-world:
     runs-on: ubuntu-latest
-
-    env:
-      PYTHON_VERSION: "3.13"
-      CODEX_CLI_MODEL: "gpt-4.1-mini"
-      CODEX_CLI_MODEL_FALLBACKS: "gpt-4o-mini gpt-4o-mini-2024-08-06 gpt-4.1 gpt-4o-mini-2024-05-13"
-
+    timeout-minutes: 27
     steps:
       - name: Checkout
+        timeout-minutes: 2
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
 
-      - name: Ensure Codex secrets available
-        id: ensure_codex_secrets
-        env:
-          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
-          CODEX_AUTH_PAT: ${{ secrets.CODEX_AUTH_PAT }}
-        run: |
-          if [ -n "${CODEX_AUTH}" ] && [ -n "${CODEX_AUTH_PAT}" ]; then
-            echo "available=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-          echo "available=false" >> "${GITHUB_OUTPUT}"
-          echo "::notice::Codex secrets missing; skipping tests."
+      - name: Run arbitrary instructions
+        timeout-minutes: 18
+        id: codex
+        uses: ./.github/actions/codex-run
+        with:
+          codex-auth: ${{ secrets.CODEX_AUTH }}
+          model: ${{ inputs.model }}
+          reasoning-effort: low
+          sandbox: read-only
+          timeout-minutes: "5"
+          instructions: |
+            Run this shell command exactly once:
 
-      - name: Prepare Codex authentication
-        if: ${{ steps.ensure_codex_secrets.outputs.available == 'true' }}
+            printf 'Hello world'
+
+            Then respond with exactly its stdout and nothing else.
+
+      - name: Verify the caller's expectation
+        timeout-minutes: 1
         env:
-          CODEX_AUTH: ${{ secrets.CODEX_AUTH }}
-          RUNNER_TEMP: ${{ runner.temp }}
+          OUTPUT_PATH: ${{ steps.codex.outputs.output-path }}
         run: |
           set -euo pipefail
-          auth_path="$HOME/.codex/auth.json"
-          mkdir -p "$(dirname "$auth_path")"
-          printf '%s' "$CODEX_AUTH" > "$auth_path"
-          chmod 600 "$auth_path"
-          echo "Wrote Codex auth to $auth_path"
+          normalized="$(mktemp "$RUNNER_TEMP/codex-output-normalized.XXXXXX")"
+          expected="$(mktemp "$RUNNER_TEMP/codex-output-expected.XXXXXX")"
+          tr -d '\r' < "$OUTPUT_PATH" > "$normalized"
+          printf 'Hello world' > "$expected"
+          if ! cmp -s "$expected" "$normalized"; then
+            echo "::error::Codex output did not exactly match 'Hello world'."
+            exit 1
+          fi
+          sed 's/^/Codex | /' "$OUTPUT_PATH"
+          cat "$OUTPUT_PATH" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Install Node and Codex CLI
-        if: ${{ steps.ensure_codex_secrets.outputs.available == 'true' }}
+      - name: Publish diagnostics on failure
+        # Deliberate caller policy for these public, fixed/unprivileged report prompts.
+        if: ${{ failure() && steps.codex.outputs.log-path != '' }}
+        timeout-minutes: 1
+        env:
+          LOG_PATH: ${{ steps.codex.outputs.log-path }}
         run: |
-          npm install -g @openai/codex@latest
+          set -euo pipefail
+          if [[ -s "$LOG_PATH" ]]; then
+            echo "::group::Codex failure diagnostics"
+            # The runner also recognizes legacy ##[...] commands mid-line.
+            # Generate the resume token after Codex exits; it is not in the log.
+            pause_token="$(node -e 'process.stdout.write(require("node:crypto").randomUUID())')"
+            trap 'printf "::%s::\n::endgroup::\n" "$pause_token"' EXIT
+            printf '::stop-commands::%s\n' "$pause_token"
+            if (( $(wc -c < "$LOG_PATH") > 262144 )); then
+              echo 'Codex log | [truncated to the last 256 KiB]'
+            fi
+            # Bound bytes before decoding; Node emits valid UTF-8 even if the
+            # tail starts within a multibyte character. Then bound line count.
+            tail -c 262144 "$LOG_PATH" | node -e '
+              const fs = require("node:fs");
+              const lines = fs.readFileSync(0, "utf8").split(/\r?\n/);
+              if (lines[lines.length - 1] === "") lines.pop();
+              if (lines.length > 1000) console.log("Codex log | [truncated to the last 1000 lines]");
+              for (const line of lines.slice(-1000)) console.log("Codex log | " + line);
+            '
+          else
+            echo "No Codex diagnostic log was produced before the failure."
+          fi
 
-      - name: Simple hello world
-        if: ${{ steps.ensure_codex_secrets.outputs.available == 'true' }}
-        run: |
-          codex --version
-          codex exec --skip-git-repo-check --full-auto "say hello"
-
-      - name: Structured hello world
-        if: ${{ steps.ensure_codex_secrets.outputs.available == 'true' }}
-        run: |
-          set -uo pipefail
-          : "${CODEX_CLI_MODEL_FALLBACKS:=}"
-          echo "=== Structured output ==="
-          cat <<'JSON' > schema.json
-          {
-            "type": "object",
-            "properties": {
-              "message": { "type": "string" }
-            },
-            "required": ["message"],
-            "additionalProperties": false
-          }
-          JSON
-          success=0
-          mkdir -p codex_artifacts
-          codex exec \
-              --output-schema schema.json \
-              -o "${output_path}" \
-              "Output a JSON object with key 'message' set to 'hello world'."
+      - name: Validate secret-writer PAT and persist auth
+        timeout-minutes: 3
+        if: ${{ always() && steps.codex.outputs.auth-path != '' }}
+        uses: ./.github/actions/codex-update-auth
+        with:
+          codex-auth-path: ${{ steps.codex.outputs.auth-path }}
+          original-codex-auth: ${{ steps.codex.outputs.original-auth-path }}
+          gh-token: ${{ secrets.CODEX_AUTH_PAT }}
+          repository: ${{ github.repository }}
+          force-update: "true"

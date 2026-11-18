@@ -10,6 +10,7 @@ Precedent for asserting on workflow contents: ``test_e2e_skip_gate_shape.py``.
 
 from __future__ import annotations
 
+import os
 import shlex
 from pathlib import Path
 
@@ -63,18 +64,18 @@ def _holds_python(directory: Path) -> bool:
     """True if the tree under ``directory`` contains a ``.py`` file.
 
     Walked directly rather than via ``git ls-files`` so the test does not
-    depend on git being installed, or on the checkout passing git's
-    ownership check — CI containers run as a different UID than the checkout
-    owner, which is why ``pr.yml`` re-adds ``safe.directory`` for its own git
-    calls.
+    depend on git being installed, or on the checkout passing git's ownership
+    check — this test's own job (``unit-tests``) runs in a container as a
+    different UID than the checkout owner, which is why the tests that do shell
+    out to git pass ``-c safe.directory=*`` per invocation.
+
+    Excluded directories are pruned before the walk enters them, so a
+    ``node_modules`` tree is never listed file by file.
     """
-    for path in directory.rglob("*.py"):
-        if any(
-            part in _NOT_SOURCE or part.startswith(".")
-            for part in path.relative_to(directory).parts
-        ):
-            continue
-        return True
+    for _root, dirs, files in os.walk(directory):
+        dirs[:] = [d for d in dirs if d not in _NOT_SOURCE and not d.startswith(".")]
+        if any(n.endswith(".py") and not n.startswith(".") for n in files):
+            return True
     return False
 
 

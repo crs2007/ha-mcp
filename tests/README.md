@@ -31,7 +31,14 @@ uv run pytest tests/src/e2e/ -n2 --dist loadscope -v -m "not slow"
 # Specific categories
 uv run pytest tests/src/e2e/basic/ -v               # Basic connectivity
 uv run pytest tests/src/e2e/workflows/automation/ -v # Automation tests
+
+# Combined topology: general coverage without tools, then relevant tests after
+# installing the component/tools entry in each worker's existing HA instance.
+E2E_COMBINE_TOPOLOGIES=1 uv run pytest tests/src/e2e/ -n2 --dist loadscope -v
 ```
+
+See [combined PR lanes](AGENTS.md#combined-pr-lanes-e2e_combine_topologies1)
+for phase selection and the manual-only no-tools and stdio runs.
 
 ### Manual Branch Testing
 
@@ -64,15 +71,21 @@ tests/
 │   ├── workflows/              # Complex scenarios
 │   └── error_handling/         # Error scenarios
 ├── initial_test_state/         # Clean HA config baseline
-├── test_env_manager.py         # Interactive test runner
-└── pytest.ini                 # Test configuration
+├── test-env/                   # Dev-only package for the hamcp-test-env command
+└── test_env_manager.py         # Interactive test runner
 ```
+
+Pytest configuration lives in the repository root `pyproject.toml` so every invocation uses the same markers and runtime settings.
 
 ## 🔧 Test Categories
 
 - **Basic**: Connection, tool listing, entity search
 - **Workflows**: Automation, device control, scripts, scenes
 - **Error Handling**: Invalid inputs, network failures
+
+## ✍️ Writing Tests
+
+Before writing or changing a test, read the [test design rules](AGENTS.md#test-design-rules).
 
 ## 🐛 Debugging
 

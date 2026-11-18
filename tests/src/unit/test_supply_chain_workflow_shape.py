@@ -2,21 +2,24 @@
 
 import json
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 import yaml
 
+from tests.haos_image_build import python_base
+
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _WORKFLOW_DIR = _REPO_ROOT / ".github" / "workflows"
 
 
-def _workflow(path: Path) -> dict[str, Any]:
+def _workflow(path: Path) -> dict[Any, Any]:
     return yaml.safe_load(path.read_text(encoding="utf-8"))
 
 
-def _triggers(data: dict[str, Any]) -> set[str]:
+def _triggers(data: dict[Any, Any]) -> set[str]:
     on_node = data.get(True) or data.get("on") or {}
     if isinstance(on_node, str):
         return {on_node}
@@ -201,6 +204,57 @@ def test_renovate_log_levels_make_failures_actionable_without_warning_noise() ->
     )
 
 
+def _tracked_dockerfiles() -> set[Path]:
+    """Every Dockerfile Renovate can see, which is exactly the tracked ones.
+
+    Enumerated through Git rather than walking the filesystem. This project's
+    workflow tells contributors to keep worktrees under `worktree/` (AGENTS.md)
+    and agents place theirs under `.claude/worktrees/`, so a walk finds whole
+    nested copies of the repository and the assertion below fails on any
+    machine following those instructions.
+
+    Excluding those by directory NAME is the wrong instrument: `.claude` also
+    holds the tracked `.claude/skills/` tree, so a Dockerfile added there later
+    would be invisible to this guard while Renovate still applied its rules to
+    it. Tracked-ness is the property that actually matters, so ask Git for it.
+
+    Raises rather than degrading if Git cannot answer: silently scanning
+    nothing would let this guard pass while asserting about an empty set.
+    """
+    listing = subprocess.run(
+        [
+            "git",
+            # The unit-test job runs inside a container with the workspace
+            # bind-mounted from the host, so the checkout is owned by a
+            # different uid than the process and Git's dubious-ownership
+            # check refuses to read the index at all. Scoped to this one
+            # invocation; no Git config is written anywhere.
+            "-c",
+            "safe.directory=*",
+            "-C",
+            str(_REPO_ROOT),
+            "ls-files",
+            "-z",
+            "Dockerfile",
+            "*/Dockerfile",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # Carry Git's own stderr into the failure. ``check=True`` would raise
+    # ``CalledProcessError`` naming only the exit status, which says nothing
+    # about why Git refused.
+    assert listing.returncode == 0, (
+        "cannot enumerate tracked Dockerfiles, so this guard cannot run: "
+        f"git exited {listing.returncode}: {listing.stderr.strip()}"
+    )
+    return {_REPO_ROOT / rel for rel in listing.stdout.split("\0") if rel}
+
+
+_PYTHON_IMAGE_MIRROR = "public.ecr.aws/docker/library/python"
+
+
 def test_python_runtime_automation_is_digest_only() -> None:
     config = json.loads((_REPO_ROOT / "renovate.json").read_text(encoding="utf-8"))
     package_rules = config["packageRules"]
@@ -210,14 +264,20 @@ def test_python_runtime_automation_is_digest_only() -> None:
         if "dockerfile" in rule.get("matchManagers", [])
         and "python" in rule.get("matchPackageNames", [])
     ]
+    # The runtime is pulled from the ECR Public mirror of the Docker Hub
+    # official image (same digests, no anonymous rate limit); Renovate tracks
+    # it under that name.
+    assert all(
+        _PYTHON_IMAGE_MIRROR in rule["matchPackageNames"] for rule in python_rules
+    )
 
     version_rule = next(
         rule
         for rule in python_rules
-        if rule.get("allowedVersions") == "/^3\\.13-slim$/"
+        if rule.get("allowedVersions") == "/^3\\.14-slim$/"
     )
     assert "matchFileNames" not in version_rule, (
-        "every Python Dockerfile must inherit the coordinated 3.13-slim baseline"
+        "every Python Dockerfile must inherit the coordinated 3.14-slim baseline"
     )
 
     proxy_rule = next(rule for rule in python_rules if rule.get("enabled") is False)
@@ -226,10 +286,18 @@ def test_python_runtime_automation_is_digest_only() -> None:
         "homeassistant-addon-webhook-proxy-dev/Dockerfile",
     }, "webhook-proxy images change only through the dev-first promotion workflow"
 
+    # The runtime stage takes the PYTHON_BASE build arg, whose default is the
+    # pin (CI may point it at Docker Hub); a bare FROM is the pre-arg form.
+    def _uses_python_runtime(text: str) -> bool:
+        return (
+            f"ARG PYTHON_BASE={_PYTHON_IMAGE_MIRROR}:" in text
+            and "FROM ${PYTHON_BASE}" in text
+        ) or (f"FROM {_PYTHON_IMAGE_MIRROR}:" in text or "FROM python:" in text)
+
     python_dockerfiles = {
         path.relative_to(_REPO_ROOT).as_posix()
-        for path in _REPO_ROOT.rglob("Dockerfile")
-        if "FROM python:" in path.read_text(encoding="utf-8")
+        for path in _tracked_dockerfiles()
+        if _uses_python_runtime(path.read_text(encoding="utf-8"))
     }
     assert python_dockerfiles - set(proxy_rule["matchFileNames"]) == {
         "Dockerfile",
@@ -241,13 +309,11 @@ def test_python_runtime_automation_is_digest_only() -> None:
         "a pre-lookup enabled=false rule cannot be overridden later for digest updates"
     )
     assert "asdf" not in config.get("enabledManagers", [])
-    assert not any(
-        "asdf" in rule.get("matchManagers", []) or "postUpgradeTasks" in rule
-        for rule in package_rules
-    ), (
+    assert not any("asdf" in rule.get("matchManagers", []) for rule in package_rules), (
         "Python minor-version changes span independent runtime contracts and must "
         "not be rewritten by the old dead asdf task"
     )
+    assert not any("postUpgradeTasks" in rule for rule in python_rules)
 
 
 def test_dev_release_tag_cleanup_uses_authenticated_github_api() -> None:
@@ -271,3 +337,147 @@ def test_dev_release_tag_cleanup_uses_authenticated_github_api() -> None:
         in cleanup_run
     )
     assert "git push origin --delete" not in create_run + cleanup_run
+
+
+def test_the_dev_release_tags_the_component_stamped_for_its_build() -> None:
+    # HACS installs a pre-release from the commit its tag names (#2763), so that
+    # commit must pin the ha-mcp-dev build the release installs, not master's
+    # stable pin.
+    job = _workflow(_WORKFLOW_DIR / "publish-dev.yml")["jobs"]["create-prerelease"]
+    steps = job["steps"]
+    names = [step.get("name") for step in steps]
+    # Only master's build, and only once PyPI serves the pinned version.
+    assert "publish-pypi-dev" in job["needs"]
+    assert job["if"] == "github.ref == 'refs/heads/master'"
+    assert names.index("Wait for the build on PyPI") < names.index(
+        "Stamp the component for this build"
+    )
+    stamp = steps[names.index("Stamp the component for this build")]["run"]
+    create = steps[names.index("Create pre-release")]["run"]
+
+    assert names.index("Stamp the component for this build") < names.index(
+        "Create pre-release"
+    )
+    assert "stamp_component_version.py" in stamp
+    assert "--dist ha-mcp-dev" in stamp
+    assert 'git tag -f "$TAG" HEAD' in create
+    assert "git push --quiet --force" in create
+    assert "--verify-tag" in create
+
+
+def test_renovate_can_write_the_status_check_it_publishes() -> None:
+    """Renovate must not abort its whole run right after writing a branch.
+
+    ``minimumReleaseAge`` makes Renovate publish a stability status check on
+    every branch it writes. GitHub answers a commit-status call from a token
+    without that permission with 404, not 403, and Renovate reads 404 there as
+    the repository having changed underneath it and aborts the ENTIRE run,
+    before opening the PR, before updating the dependency dashboard, and
+    before processing any other dependency. That is silent: the abort logs
+    below error level, so the workflow still reports success.
+
+    This pins the workflow half only. The app installation must grant
+    ``statuses`` as well, which no test here can see: an installation token
+    can only narrow the permissions the installation already holds.
+    """
+    steps = _workflow(_WORKFLOW_DIR / "renovate.yml")["jobs"]["renovate"]["steps"]
+    token_step = next(
+        step for step in steps if "create-github-app-token" in str(step.get("uses", ""))
+    )
+    assert token_step["with"].get("permission-statuses") == "write", (
+        "Renovate needs commit-status write, and a token listing any "
+        "permission-* input drops every permission it does not name"
+    )
+
+
+def test_a_renovate_abort_fails_the_workflow() -> None:
+    """A run that dies mid-way must not report success.
+
+    Renovate exits non-zero only when some record is logged at error level or
+    above, so a fatal abort logged at info leaves the workflow green. This one
+    hid two weeks of dead runs.
+    """
+    config = json.loads((_REPO_ROOT / "renovate.json").read_text(encoding="utf-8"))
+    promoted = {
+        remap["matchMessage"]
+        for remap in config["logLevelRemap"]
+        if remap["newLogLevel"] == "error"
+    }
+    assert "Repository has changed during renovation - aborting" in promoted, (
+        "this abort ends the whole repository run, so it cannot stay at info"
+    )
+
+
+_PYTHON_BASE_FALLBACK = ".github/actions/docker-build-python-base-fallback"
+
+
+def test_buildx_image_builds_fall_back_from_the_mirror_for_the_python_base() -> None:
+    """Every buildx image build goes through the fallback action, which builds
+    from the GHCR mirror of the pinned base and repeats from ECR Public, then
+    Docker Hub, when a build fails; the buildx docker-container builder pulls
+    on its own, so a host pull would not reach it."""
+    direct: list[str] = []
+    through_action: list[str] = []
+    for path in sorted(_WORKFLOW_DIR.glob("*.yml")):
+        for job in _workflow(path)["jobs"].values():
+            for step in job.get("steps", []):
+                uses = step.get("uses", "")
+                if uses.startswith("docker/build-push-action@"):
+                    direct.append(f"{path.name}: {step.get('name')}")
+                if uses == f"./{_PYTHON_BASE_FALLBACK}":
+                    through_action.append(f"{path.name}: {step.get('name')}")
+    assert direct == [], f"buildx builds must use {_PYTHON_BASE_FALLBACK}: {direct}"
+    assert through_action, "no workflow uses the fallback action"
+
+    action = yaml.safe_load(
+        (_REPO_ROOT / _PYTHON_BASE_FALLBACK / "action.yml").read_text(encoding="utf-8")
+    )
+    builds = [
+        step
+        for step in action["runs"]["steps"]
+        if step.get("uses", "").startswith("docker/build-push-action@")
+    ]
+    assert len(builds) == 3
+    mirror, ecr, dockerhub = builds
+    assert mirror["id"] == "mirror" and mirror["continue-on-error"] is True
+    assert "if" not in mirror
+    assert ecr["id"] == "ecr" and ecr["continue-on-error"] is True
+    assert ecr["if"] == "steps.mirror.outcome == 'failure'"
+    assert dockerhub["if"] == "steps.ecr.outcome == 'failure'"
+    assert mirror["uses"] == ecr["uses"] == dockerhub["uses"]
+
+    def passthrough(step: dict) -> dict:
+        return {k: v for k, v in step["with"].items() if k != "build-args"}
+
+    assert passthrough(mirror) == passthrough(ecr) == passthrough(dockerhub)
+    # The ECR attempt builds from the Dockerfile's own pin.
+    assert ecr["with"]["build-args"] == "${{ inputs.build-args }}"
+    for step, output in ((mirror, "mirror"), (dockerhub, "dockerhub")):
+        assert "${{ inputs.build-args }}" in step["with"]["build-args"]
+        assert (
+            step["with"]["build-args"]
+            .rstrip()
+            .endswith(f"PYTHON_BASE=${{{{ steps.base.outputs.{output} }}}}")
+        )
+
+
+def test_every_python_base_consumer_pulls_the_mirror_the_workflow_fills() -> None:
+    """A consumer naming another repository would never find a digest and
+    silently fall back to the rate-limited registries on every run."""
+    sources = {
+        "mirror workflow": ".github/workflows/mirror-python-base.yml",
+        "pr.yml pull step": ".github/workflows/pr.yml",
+        "buildx fallback action": f"{_PYTHON_BASE_FALLBACK}/action.yml",
+    }
+    named = {
+        label: set(
+            re.findall(
+                r"ghcr\.io/homeassistant-ai/ha-mcp-python[\w-]*(?:/[\w.-]+)*",
+                (_REPO_ROOT / rel).read_text(encoding="utf-8"),
+            )
+        )
+        for label, rel in sources.items()
+    }
+    named["HAOS bake"] = {python_base.MIRROR_PYTHON}
+    assert all(names == named["mirror workflow"] for names in named.values()), named
+    assert len(named["mirror workflow"]) == 1

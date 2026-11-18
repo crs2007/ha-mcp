@@ -66,12 +66,15 @@ _READY_TIMEOUT_S = 600
 _READY_POLL_S = 5
 
 # The module-scoped fixture's bring-up wait runs during the FIRST test item, so
-# that item's pytest-timeout must exceed the poll budget. pytest.ini's global
-# timeout=300 is fine on the fast container lane (which never actually waits that
+# that item's pytest-timeout must exceed the poll budget. pyproject.toml's
+# global timeout=300 is fine on the fast container lane (which never waits that
 # long) but would kill a legitimately slower HAOS install mid-poll; override it
 # to sit just above _READY_TIMEOUT_S. The fixture's own 600s AssertionError still
 # fires first with an actionable message; this is only the safety ceiling above it.
 pytestmark = [
+    # Enabling the server entry changes the shared surface for later tests.
+    # Keep it out of a combined worker's component-absent phase.
+    pytest.mark.installs_component_surface,
     pytest.mark.slow,
     pytest.mark.haos_only,
     # These tests enable the baked entry and drive the webhook per-test. On the
@@ -184,7 +187,7 @@ def embedded_server(
             f"webhook within {_READY_TIMEOUT_S}s of enabling {HA_MCP_SERVER_ENTRY_ID}. "
             f"Wheel-staging status for this worker: {staging}. "
             "If staging ok=True, the runtime pip install of the fastmcp tree or "
-            "the server thread start failed (see ha-core-runtime.log in the HAOS "
+            "the server thread start failed (see <worker>/ha-core-runtime.log in the HAOS "
             "diagnostics artifact); if ok=False or None, the checkout wheel never "
             "reached the VM (haos_runtime.stage_embedded_server_wheel_in_qcow2)."
         )

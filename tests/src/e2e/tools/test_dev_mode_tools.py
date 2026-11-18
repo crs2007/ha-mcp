@@ -27,6 +27,7 @@ from ..utilities.assertions import (
     extract_error_message,
     safe_call_tool,
 )
+from ..utilities.cleanup import CleanupSteps
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -97,7 +98,7 @@ async def _dev_mode_server(dev_mode_enabled, ha_container_with_fresh_config):
 @pytest.fixture
 async def mcp_client_with_dev_mode(_dev_mode_server):
     """Create MCP client connected to the dev-mode-enabled server."""
-    from fastmcp import Client
+    from ha_mcp._vendor.fastmcp import Client
 
     mcp_client = Client(_dev_mode_server.mcp)
     async with mcp_client:
@@ -113,8 +114,7 @@ class TestDevModeAvailability:
         try:
             _reset_settings_state()
 
-            from fastmcp import Client
-
+            from ha_mcp._vendor.fastmcp import Client
             from ha_mcp.server import HomeAssistantSmartMCPServer
 
             server = HomeAssistantSmartMCPServer(
@@ -260,15 +260,7 @@ class TestDevManageServer:
             {"action": "update_source"},
         )
         assert result.get("success") is not True
-        assert "channel" in extract_error_message(result).lower()
-
-    async def test_update_source_rejects_bad_channel(self, mcp_client_with_dev_mode):
-        result = await safe_call_tool(
-            mcp_client_with_dev_mode,
-            "ha_dev_manage_server",
-            {"action": "update_source", "channel": "nightly"},
-        )
-        assert result.get("success") is not True
+        assert "pip_spec" in extract_error_message(result).lower()
 
     async def test_restart_unavailable_standalone(self, mcp_client_with_dev_mode):
         result = await safe_call_tool(
@@ -276,3 +268,63 @@ class TestDevManageServer:
         )
         assert result.get("success") is not True
         assert "standalone" in extract_error_message(result).lower()
+
+
+class TestEngineThemeIdentityGuard:
+    """Deterministic engine-account coverage, only reachable with dev mode.
+
+    ha_dev_manage_settings can set dashboard_screenshot_engine_url at runtime
+    (it is resolved live per capture, so no restart is needed). Pointing it at
+    an explicit URL forces resolve_engine() to return no addon_credential,
+    which is exactly the case where ha-mcp's own credential must NOT be
+    treated as the engine account -- so the refusal is deterministic here in a
+    way it cannot be in the themes suite, where dev mode is off.
+    """
+
+    async def test_explicit_engine_url_refuses_engine_theme_actions(
+        self, mcp_client_with_dev_mode
+    ):
+        set_result = await safe_call_tool(
+            mcp_client_with_dev_mode,
+            "ha_dev_manage_settings",
+            {
+                "action": "set",
+                "setting": "dashboard_screenshot_engine_url",
+                "value": "http://sidecar.example:10000",
+            },
+        )
+        assert set_result.get("success") is True, f"Could not set URL: {set_result}"
+
+        try:
+            read = await safe_call_tool(
+                mcp_client_with_dev_mode,
+                "ha_manage_theme",
+                {"action": "get_engine_theme"},
+            )
+            assert read.get("success") is False, (
+                f"Reading an unidentifiable engine account must fail: {read}"
+            )
+            assert "identified" in extract_error_message(read).lower(), (
+                f"Error should name the identity problem: {read}"
+            )
+
+            # The write refuses for the same reason, so a restore can never
+            # land on ha-mcp's own profile.
+            write = await safe_call_tool(
+                mcp_client_with_dev_mode,
+                "ha_manage_theme",
+                {
+                    "action": "set_engine_theme",
+                    "value": {"theme": "", "dark": False},
+                    "expected_current": None,
+                },
+            )
+            assert write.get("success") is False, (
+                f"Writing an unidentifiable engine account must fail: {write}"
+            )
+        finally:
+            with CleanupSteps() as cleanup, cleanup.step():
+                await MCPAssertions(mcp_client_with_dev_mode).call_tool_success(
+                    "ha_dev_manage_settings",
+                    {"action": "reset", "setting": "dashboard_screenshot_engine_url"},
+                )

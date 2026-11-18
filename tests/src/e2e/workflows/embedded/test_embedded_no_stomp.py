@@ -24,9 +24,12 @@ The policy this test enforces is the linked/unlinked split:
   to keep current. Such upgrades are printed loudly so a new one never
   lands unnoticed.
 - **Removals** are never legitimate for either class.
+- **Additions** of a governed package the image does not ship (Core 2026.11
+  dropped ``aiofile``/``caio``) are legitimate only within HA's pin or
+  constraint, the version HA's own requirement processing would pick.
 
 The snapshots come from the session container every embedded-lane test
-already boots (see ``_build_ha_testcontainer`` in the e2e conftest), so the
+already boots (see ``_build_ha_testcontainer`` in ``_conftest_testcontainer``), so the
 guard also covers dependencies we don't declare directly — a transitive
 floor-bump into governed territory trips it the same way the old exact
 websockets pin would have.
@@ -41,13 +44,21 @@ from pathlib import Path
 
 import pytest
 import requests
+from packaging.requirements import InvalidRequirement, Requirement
+from packaging.specifiers import SpecifierSet
 from test_constants import HA_TEST_IMAGE
 
-from ...conftest import (
+from ..._conftest_embedded import (
     EMBEDDED_FREEZE_AFTER,
     EMBEDDED_FREEZE_BEFORE,
     EMBEDDED_HA_CONSTRAINTS_COPY,
 )
+
+# The freeze snapshots exist only where the entrypoint installs ha-mcp into
+# the HA image: the embedded testcontainer lane. Collection-time marker
+# rather than a runtime skip, so the mass-skip ceiling accounts for these
+# (the ``embedded_only`` gate lives in conftest's collection hook; #2245).
+pytestmark = pytest.mark.embedded_only
 
 _REQUIREMENTS_ALL_URL = (
     "https://raw.githubusercontent.com/home-assistant/core/"
@@ -98,20 +109,23 @@ def _parse_freeze(text: str) -> dict[str, str]:
     return packages
 
 
-def _parse_requirement_names(text: str) -> set[str]:
-    """Extract canonical package names from a requirements/constraints file."""
-    names: set[str] = set()
+def _parse_requirement_specs(text: str) -> dict[str, SpecifierSet]:
+    """{canonical name: version specifier} from a requirements/constraints file."""
+    specs: dict[str, SpecifierSet] = {}
     for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith(("#", "-")):
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or line.startswith("-"):
             continue
-        match = re.match(r"([A-Za-z0-9._-]+)", line)
-        if match:
-            names.add(_canonical(match.group(1)))
-    return names
+        try:
+            requirement = Requirement(line)
+        except InvalidRequirement:
+            continue
+        name = _canonical(requirement.name)
+        specs[name] = specs.get(name, SpecifierSet()) & requirement.specifier
+    return specs
 
 
-def _fetch_requirements_all(ha_version: str) -> set[str]:
+def _fetch_requirements_all(ha_version: str) -> dict[str, SpecifierSet]:
     """Fetch the HA release's direct integration requirements (fail-closed).
 
     Three attempts against raw.githubusercontent; a total failure FAILS the
@@ -124,7 +138,7 @@ def _fetch_requirements_all(ha_version: str) -> set[str]:
         try:
             response = requests.get(url, timeout=30)
             response.raise_for_status()
-            return _parse_requirement_names(response.text)
+            return _parse_requirement_specs(response.text)
         except requests.exceptions.RequestException as err:
             last_error = err
             if attempt < 2:  # no pointless backoff after the final attempt
@@ -136,45 +150,24 @@ def _fetch_requirements_all(ha_version: str) -> set[str]:
     )
 
 
-_KNOWN_BACKENDS = {"container", "embedded", "haos", "haos_inaddon", "haos_embedded"}
-
-
-def _skip_unless_embedded(info) -> None:
-    """Runtime skip with a drift tripwire.
-
-    Runtime skips are invisible to the mass-skip detector (it counts only
-    collection-time markers), so a silently changed backend label would
-    disable this guard forever with nothing noticing. An UNKNOWN label
-    therefore fails loudly instead of skipping.
-    """
-    backend = info.get("backend")
-    assert backend in _KNOWN_BACKENDS, (
-        f"unknown backend label {backend!r} — the conftest's backend names "
-        "changed; update this guard so it keeps running on the embedded lane"
-    )
-    if backend != "embedded":
-        pytest.skip(
-            "freeze snapshots are written only by the embedded testcontainer "
-            "backend's preinstall entrypoint (E2E_BACKEND=embedded)"
-        )
-
-
-def _governed_names(config_path: Path) -> set[str]:
+def _governed_specs(config_path: Path) -> dict[str, SpecifierSet]:
+    """What HA allows for each package it governs: constraints and pins combined."""
     constraints_file = config_path / EMBEDDED_HA_CONSTRAINTS_COPY
     assert constraints_file.is_file(), (
         f"missing constraints copy {constraints_file} — the entrypoint could "
         "not find the image's package_constraints.txt"
     )
     ha_version = HA_TEST_IMAGE.rsplit(":", 1)[-1]
-    return _parse_requirement_names(
-        constraints_file.read_text(encoding="utf-8")
-    ) | _fetch_requirements_all(ha_version)
+    specs = _parse_requirement_specs(constraints_file.read_text(encoding="utf-8"))
+    for name, pin in _fetch_requirements_all(ha_version).items():
+        specs[name] = specs.get(name, SpecifierSet()) & pin
+    return specs
 
 
 def _assert_no_governed_changes(
     before: dict[str, str],
     after: dict[str, str],
-    governed: set[str],
+    governed: dict[str, SpecifierSet],
     context: str,
 ) -> None:
     replaced = {
@@ -211,14 +204,18 @@ def _assert_no_governed_changes(
         "shipped version instead of pinning past it."
     )
     # ADDED packages matter too: `replaced` is built from before.items() and
-    # is blind to a governed package the install PULLS IN fresh.
-    added_governed = {
-        name: after[name] for name in set(after) - set(before) if name in governed
+    # is blind to a governed package the install PULLS IN fresh. HA's own
+    # requirement processing would add one too, within its pin or
+    # constraint; a version outside them means our resolution decided it.
+    added_outside = {
+        name: (after[name], str(governed[name]))
+        for name in set(after) - set(before)
+        if name in governed
+        and not governed[name].contains(after[name], prereleases=True)
     }
-    assert not added_governed, (
-        f"[{context}] the install ADDED packages HA governs: {added_governed}. "
-        "HA's own requirement processing owns those; installing one behind "
-        "its back means our resolution, not HA's, decided the version."
+    assert not added_outside, (
+        f"[{context}] the install ADDED packages HA governs at versions HA "
+        f"does not allow: {added_outside} (version, HA's specifier)."
     )
     # websockets is the package the whole fix is about, so its presence in
     # the baseline is asserted rather than assumed — an image that stops
@@ -240,7 +237,6 @@ def test_embedded_preinstall_replaces_nothing_ha_governs(
     ha_container_with_fresh_config,
 ):
     info = ha_container_with_fresh_config
-    _skip_unless_embedded(info)
 
     config_path = Path(info["config_path"])
     before_file = config_path / EMBEDDED_FREEZE_BEFORE
@@ -263,7 +259,7 @@ def test_embedded_preinstall_replaces_nothing_ha_governs(
     )
 
     _assert_no_governed_changes(
-        before, after, _governed_names(config_path), context="entrypoint preinstall"
+        before, after, _governed_specs(config_path), context="entrypoint preinstall"
     )
 
 
@@ -281,7 +277,6 @@ def test_embedded_runtime_install_replaces_nothing_ha_governs(
     snapshot covers everything every install path did.
     """
     info = ha_container_with_fresh_config
-    _skip_unless_embedded(info)
 
     config_path = Path(info["config_path"])
     before_file = config_path / EMBEDDED_FREEZE_BEFORE
@@ -336,5 +331,5 @@ def test_embedded_runtime_install_replaces_nothing_ha_governs(
     )
 
     _assert_no_governed_changes(
-        before, runtime, _governed_names(config_path), context="runtime install"
+        before, runtime, _governed_specs(config_path), context="runtime install"
     )

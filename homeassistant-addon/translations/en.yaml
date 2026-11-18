@@ -1,30 +1,27 @@
 ---
 # GENERATED FILE — do not edit. Translations live in
-# src/ha_mcp/settings_ui/locales/en.json (keys addon.*, features.*,
-# addon_stable.*); regenerate with: python scripts/generate_locales.py
+# src/ha_mcp/settings_ui/locales/en.json (keys addon.*, features.*, advanced.*,
+# backup.fields.*, addon_stable.*); regenerate with: python scripts/generate_locales.py
 configuration:
-  backup_hint:
-    name: Full-HA snapshot suggestion level (LLM-facing)
-    description: 'Tunes the wording of the hint the LLM sees in the
-
-      `ha_manage_backup(scope=''snapshot'')` tool description for when to
-
-      suggest a full Home Assistant tarball backup before risky operations
-
-      (e.g. mass device deletes). Affects ONLY this one LLM-facing prompt
-
-      sentence.
-
-
-      For per-edit automatic snapshots of automations / scripts / helpers /
-
-      etc., use the separate **Enable auto-backup of edits** toggle below.'
-  secret_path:
-    name: Secret path override
-    description: 'Optional custom HTTP path for the MCP server. Leave empty to use
-      the auto-generated secure path.
-
-      '
+  verify_ssl:
+    name: Verify TLS certificates
+    description: 'Verify the Home Assistant server''s TLS certificate. Turn this off
+      only on a trusted network, for a self-signed certificate or a hostname mismatch:
+      it weakens transport security.'
+  ha_tool_concurrency:
+    name: Home Assistant tool concurrency
+    description: Optional limit on outer Home Assistant tool calls across all sessions.
+      Internal REST, WebSocket, and per-tool fan-out concurrency is unchanged. 0 keeps
+      unlimited behavior. A call waiting for capacity fails after 60 seconds. Range
+      0–32.
+  custom_instructions:
+    name: Custom server instructions
+    description: Text sent to every AI assistant that connects, as part of the MCP
+      server instructions — for example where household notes are kept and when to
+      read or update them. Also part of the prompt of Home Assistant conversation
+      agents (Assist) that use this toolset. Use it for guidance that should reach
+      all your clients at once; keep it short and free of secrets. Leave empty to
+      add nothing. Requires restart; clients see the change when they reconnect.
   enable_tool_search:
     name: Enable tool search
     description: 'Replace the full tool catalog with search-based discovery. Reduces
@@ -39,15 +36,16 @@ configuration:
       Some Codex models and ChatGPT include deferred tools too — check your client/model
       directly to confirm its features so you don''t leave this enabled unnecessarily.
       Tools are found via ha_search_tools and executed via categorized proxies (read/write/delete).
-      Requires an add-on restart to take effect — then reconnect or refresh the MCP
-      server in your AI client so it reloads the tool list. Restarting the add-on
-      alone does NOT refresh a client''s cached tool list; this applies after changing
-      any setting here.'
+      Requires an app (add-on) restart to take effect — then reconnect or refresh
+      the MCP server in your AI client so it reloads the tool list. Restarting the
+      app (add-on) alone does NOT refresh a client''s cached tool list; this applies
+      after changing any setting here.'
   tool_search_max_results:
     name: Tool search max results
-    description: 'Maximum number of tools returned by ha_search_tools when tool search
-      is enabled. Lower values (2-3) save context tokens but may miss relevant tools.
-      Range: 2-10. Requires restart.'
+    description: Maximum number of hidden tools returned per ha_search_tools call
+      when tool search is enabled; a pinned tool that ranks inside that top count
+      is added as a short name-only entry on top of it. Lower values (2-3) save context
+      tokens but may miss relevant tools. Requires restart. Range 2–10.
   enable_tool_security_policies:
     name: Enable Tool Security Policies (advanced)
     description: Gate high-stakes tool calls (lock/alarm control, automation writes,
@@ -68,19 +66,34 @@ configuration:
   read_only_mode:
     name: Read Only Mode
     description: Toggles all write tools off, and removes ability for tools to make
-      any write or destructive calls. Mixed read/write tools (backups, add-ons, energy
-      preferences, voice pipelines, and code mode when enabled) stay available with
-      their write operations blocked. Same toggle as the web UI Tools tab. Off by
-      default. Requires restart to take effect.
+      any write or destructive calls. Mixed read/write tools — backups, Apps (add-ons),
+      energy preferences, voice pipelines, and code mode when enabled — stay available
+      with their write operations blocked. Same toggle as the web UI Tools tab. Off
+      by default. Requires restart to take effect.
   redact_secrets:
     name: Redact Secrets
     description: Redacts secrets from tool responses before they reach the AI assistant.
-      Add-on options and integration fields marked as passwords are replaced with
-      a set/empty marker (so "is this credential configured?" stays answerable), and
-      other tool responses are scrubbed of secret values the server has already seen
-      (values shorter than 6 characters are skipped, since replacing tiny fragments
-      would corrupt unrelated output). Fields not marked as passwords by their schema
-      cannot be detected. Off by default.
+      App (add-on) options and integration fields marked as passwords are replaced
+      with a set/empty marker (so "is this credential configured?" stays answerable),
+      and other tool responses are scrubbed of secret values the server has already
+      seen (values shorter than 6 characters are skipped, since replacing tiny fragments
+      would corrupt unrelated output). Other fields are not detected, except private
+      keys in app options and the app option names listed below. Off by default.
+  redact_app_option_keys:
+    name: Extra app option keys to redact
+    description: App (add-on) option names to redact like password fields, for apps
+      whose schema stores a secret as plain text (for example backup_password). Separate
+      names with commas or new lines. A name applies to every app; write app_slug:name
+      to limit it to one app. Naming an option group covers every option in it. Used
+      only while Redact Secrets is on. Empty by default.
+  ipv6_allowed_networks:
+    name: Extra IPv6 networks allowed
+    description: 'IPv6 clients reach this server''s own port only from the local network:
+      loopback, link-local, unique local (fc00::/7) and the networks the Home Assistant
+      host is directly connected to. IPv4 is unaffected. List other IPv6 networks
+      to allow, separated by commas or new lines (for example 2001:db8:5::/48). Adding
+      ::/0 allows every IPv6 client, including from the internet if your router lets
+      inbound IPv6 through.'
   enable_mandatory_bps:
     name: Attach best-practice skills on writes
     description: 'Master switch for the write-tool skill content delivery feature
@@ -104,6 +117,46 @@ configuration:
       on, the ha_get_skill_guide tool is locked enabled — it is the only publisher
       of the acknowledgment key. Child of the "Attach best-practice skills on writes"
       option above and inert while that parent is off. Requires restart to take effect.'
+  enable_auto_backup:
+    name: Auto-backup edits
+    description: Save a snapshot of an entity before each write or delete tool call
+      changes it. While this is off, the file and raw-YAML tools (ha_write_file, ha_delete_file,
+      ha_config_set_yaml) refuse to write.
+  auto_backup_throttle_minutes:
+    name: Auto-backup throttle (minutes)
+    description: How often auto-backup may capture the same entity. 0 captures on
+      every write; N above 0 captures at most one snapshot per N minutes per entity.
+      Range 0–1440.
+  auto_backup_retain_per_entity:
+    name: Auto-backup retention (per entity)
+    description: The most snapshots kept per entity. Each new capture removes the
+      oldest snapshots above this number. Range 1–10000.
+  enable_snapshot_actions:
+    name: Allow full HA snapshot actions
+    description: Allow AI assistants to manage full Home Assistant snapshots through
+      ha_manage_backup and the equivalent backup services and commands in ha_call_service.
+      Turning this off blocks every snapshot action, including listing. Snapshot deletion
+      is only available through ha_manage_backup and also requires Allow snapshot
+      deletion. Edit backups and the backup actions a person takes in the web settings
+      UI remain available.
+  backup_read_only:
+    name: Make backup management read-only
+    description: Allow AI assistants to list, view, and diff edit backups, and list
+      full HA snapshots when snapshot actions are enabled. Block manual backup create,
+      restore (including edit restores), and delete, including the equivalent backup
+      services and commands in ha_call_service. Automatic pre-edit backups continue.
+      The backup actions a person takes in the web settings UI remain available.
+  enable_snapshot_delete:
+    name: Allow snapshot deletion
+    description: Allow ha_manage_backup to delete full Home Assistant snapshots. A
+      snapshot may be the last way back after a mistaken change, so a person must
+      turn this on. Scheduled backups, the newest snapshot and snapshots younger than
+      the minimum age stay protected.
+  snapshot_delete_min_age_days:
+    name: Minimum snapshot age to delete (days)
+    description: How old a snapshot must be, in days, before it can be deleted. 0
+      turns off the age limit; the newest snapshot and scheduled backups stay protected.
+      Range 0–365.
   disabled_tools:
     name: Disabled tools (comma-separated)
     description: Tools listed here are forced off and locked in the web Settings UI
@@ -119,49 +172,9 @@ configuration:
       Tools tab and cannot be unpinned from the web Settings UI without unsetting
       this option first. Useful in combination with Tool Search. Comma-separated tool
       names.
-  enable_auto_backup:
-    name: Enable auto-backup of edits
-    description: 'Captures a per-entity snapshot before every wrapped write/destructive
-      MCP tool call (automation, script, scene, helper, dashboard, dashboard resource,
-      label, category, group, zone, area, calendar, todo, entity, device, integration,
-      and sibling remove/delete tools). The auto-backup throttle bounds how often
-      that happens: 0 (default) captures on every such call, N>0 at most one snapshot
-      per N minutes per entity. Snapshots are saved as YAML files under /data/ha_mcp_backups/
-      (override via HAMCP_BACKUP_DIR) and listed, restored, or deleted via the Backups
-      tab in the web settings UI or via ha_manage_backup(scope=''edits'', ...). For
-      those domains the capture is best-effort — a failure logs a WARNING and the
-      write proceeds. The file and raw-YAML tools are the exception: ha_write_file,
-      ha_delete_file and ha_config_set_yaml treat the snapshot as a precondition,
-      so a write through them is refused while this is off, and a failed capture blocks
-      it. On by default; unchecking opts out of the best-effort captures and takes
-      the file and raw-YAML tools out of service with them. Requires restart to take
-      effect.'
-  auto_backup_throttle_minutes:
-    name: Auto-backup throttle (minutes)
-    description: Per-entity throttle window. 0 (default) captures a snapshot on every
-      wrapped write. N>0 captures at most one snapshot per N minutes per entity. Range
-      0–1440.
-  auto_backup_retain_per_entity:
-    name: Auto-backup retention (per entity)
-    description: Maximum number of snapshots kept per entity. Older snapshots beyond
-      this cap are rotated out on each successful capture. Default 100, range 1–10000.
-  enable_snapshot_delete:
-    name: Allow snapshot deletion
-    description: Lets ha_manage_backup delete full HA snapshot tarballs (scope='snapshot',
-      action='delete'). Off by default — a snapshot may be the last recovery point
-      after a mistaken change, so a human must opt in here. Even when on, scheduled
-      backups, the newest remaining snapshot, and anything younger than the age floor
-      below stay protected.
-  snapshot_delete_min_age_days:
-    name: Minimum snapshot age to delete (days)
-    description: A snapshot must be at least this old before it can be deleted. Range
-      0–365; 0 disables the floor (the newest-snapshot and scheduled-backup protections
-      still apply). Default 7.
-  verify_ssl:
-    name: Verify TLS certificate
-    description: Verify the Home Assistant server's TLS certificate. The add-on connects
-      via the Supervisor proxy, so this normally has no effect and should stay enabled.
-      Disable only if you've reconfigured the add-on to talk to HA over a public HTTPS
-      hostname with a self-signed certificate or hostname mismatch. Disabling weakens
-      transport security — leave on unless you know you need it. Requires restart
-      to take effect.
+  secret_path:
+    name: Secret path override
+    description: 'Optional custom HTTP path for the MCP server. Leave empty to use
+      the auto-generated secure path.
+
+      '

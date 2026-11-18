@@ -11,6 +11,7 @@ focused (see issue #925):
 """
 
 import logging
+from collections.abc import Callable
 
 from ...client.rest_client import HomeAssistantClient
 from ...config import get_global_settings
@@ -20,9 +21,8 @@ from ...utils.fuzzy_search import create_fuzzy_searcher
 # keep resolving.
 from ._config import (
     AUTOMATION_CONFIG_TIME_BUDGET,
-    BULK_REST_TIMEOUT,
-    BULK_WEBSOCKET_TIMEOUT,
     DEFAULT_CONCURRENCY_LIMIT,
+    ENTITY_REGISTRY_TIMEOUT,
     INDIVIDUAL_CONFIG_TIMEOUT,
     INDIVIDUAL_FETCH_BATCH_SIZE,
     SCENE_CONFIG_TIME_BUDGET,
@@ -30,6 +30,7 @@ from ._config import (
 )
 from ._deep import DeepSearchMixin
 from ._entities import EntitySearchMixin
+from ._fetch import record_first_failure, summarize_fetch_error
 from ._overview import SystemOverviewMixin
 
 logger = logging.getLogger(__name__)
@@ -39,9 +40,20 @@ class SmartSearchTools(DeepSearchMixin, SystemOverviewMixin, EntitySearchMixin):
     """Smart search tools with fuzzy matching and AI optimization."""
 
     def __init__(
-        self, client: HomeAssistantClient | None = None, fuzzy_threshold: int = 60
+        self,
+        client: HomeAssistantClient | None = None,
+        fuzzy_threshold: int = 60,
+        clock: Callable[[], float] | None = None,
+        config_timeout: float = INDIVIDUAL_CONFIG_TIMEOUT,
     ):
-        """Initialize with Home Assistant client."""
+        """Initialize with Home Assistant client.
+
+        ``clock`` times the config-fetch budget; ``None`` reads
+        ``time.perf_counter``. ``config_timeout`` bounds each per-id config
+        fetch in seconds of real time.
+        """
+        self.clock = clock
+        self.config_timeout = config_timeout
         # Always load settings for configuration access
         self.settings = get_global_settings()
 

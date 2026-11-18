@@ -4,22 +4,24 @@ import logging
 
 import httpx
 import pytest
-from fastmcp import FastMCP
 
 from ha_mcp.__main__ import ProbeAccessLogFilter, register_browser_landing
-from ha_mcp.browser_landing import _registered_landing_paths
+from ha_mcp._vendor.fastmcp import FastMCP
 
 
 @pytest.fixture(autouse=True)
-def _clear_landing_registry():
-    """Clear the registered-paths set and access-log filters between tests."""
-    _registered_landing_paths.clear()
-    yield
-    _registered_landing_paths.clear()
+def _clear_access_log_filters(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give each test a uvicorn access logger without probe filters.
+
+    Registration is remembered per server instance, and every test builds its
+    own, so only the process-wide uvicorn logger needs putting back.
+    """
     access_logger = logging.getLogger("uvicorn.access")
-    access_logger.filters = [
-        f for f in access_logger.filters if not isinstance(f, ProbeAccessLogFilter)
-    ]
+    monkeypatch.setattr(
+        access_logger,
+        "filters",
+        [f for f in access_logger.filters if not isinstance(f, ProbeAccessLogFilter)],
+    )
 
 
 @pytest.fixture
@@ -217,9 +219,12 @@ async def test_get_405_logs_annotated_note(mcp_app, caplog):
             resp = await client.get("/mcp")
 
     assert resp.status_code == 405
-    assert any(
-        "NORMAL for most non-SSE connections" in r.getMessage() for r in caplog.records
-    )
+    landing = [
+        r.getMessage() for r in caplog.records if r.name == "ha_mcp.browser_landing"
+    ]
+    assert any("NORMAL for most non-SSE connections" in m for m in landing)
+    # The path is the secret path on the in-process server and the app.
+    assert not any("/mcp" in m for m in landing)
 
 
 def test_filter_drops_favicon_with_query_and_slash():

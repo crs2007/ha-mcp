@@ -32,6 +32,13 @@ class TestDockerCompose:
         assert "HOMEASSISTANT_URL" in env_vars
         assert "HOMEASSISTANT_TOKEN" in env_vars
 
+    def test_service_serves_http(self):
+        """A detached service has no stdin, so it must not inherit stdio mode."""
+        with open("docker-compose.yml") as f:
+            ha_mcp = yaml.safe_load(f)["services"]["ha-mcp"]
+        assert ha_mcp["command"] == "ha-mcp-web"
+        assert "8086:8086" in ha_mcp["ports"]
+
     def test_data_dir_is_persisted_by_a_named_volume(self):
         """Verify the example compose keeps ``~/.ha-mcp`` on a named volume.
 
@@ -78,7 +85,7 @@ class TestDockerCompose:
         the pin was introduced to protect.
         """
         pages = [
-            "site/src/pages/setup.astro",
+            "site/src/scripts/setup-wizard/instructions.js",
             "site/src/pages/faq.astro",
         ]
         # Keyed by page, not a running total: counting qualifying blocks would
@@ -88,7 +95,7 @@ class TestDockerCompose:
             with open(page, encoding="utf-8") as f:
                 source = f.read()
 
-            # Each fenced block is `<code>services:` ... `</code>`. Astro
+            # Each fenced block is `<code>services:` ... `</code>`. JS
             # template literals escape `$`, which YAML does not care about.
             for block in re.findall(r"<code>(services:.*?)</code>", source, re.DOTALL):
                 snippet = yaml.safe_load(block.replace("\\${", "${"))

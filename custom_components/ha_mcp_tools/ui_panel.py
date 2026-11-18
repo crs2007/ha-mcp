@@ -82,7 +82,7 @@ _PROXY_URL = f"{_UI_BASE}/app/{{path:.*}}"
 # path-scoped to the proxy so it is never sent to the boot/session endpoints.
 _COOKIE_NAME = "ha_mcp_tools_ui_session"
 _COOKIE_PATH = f"{_UI_BASE}/app"
-# Keep in sync with ``ha_mcp.settings_ui._i18n.LOCALE_COOKIE`` without
+# Keep in sync with ``ha_mcp.settings_ui.i18n.LOCALE_COOKIE`` without
 # importing the separately installed server package into the HA component.
 _LOCALE_COOKIE_NAME = "ha_mcp_locale"
 
@@ -358,7 +358,11 @@ class _ProxyView(HomeAssistantView):
             ) as upstream:
                 return await _relay_response(request, upstream)
         except aiohttp.ClientError as err:
-            _LOGGER.error("HA-MCP settings proxy: upstream request failed: %s", err)
+            # Type only: the error can render the target URL (the secret path).
+            _LOGGER.error(
+                "HA-MCP settings proxy: upstream request failed: %s",
+                type(err).__name__,
+            )
             return web.Response(status=502, text="MCP settings server unavailable")
         except Exception as err:
             _LOGGER.exception("HA-MCP settings proxy: unexpected error: %s", err)
@@ -690,7 +694,10 @@ async function showApp() {{
     if (!timer) {{
       showMessage(
         "The in-process MCP server is starting or is not running yet. " +
-          "This view will refresh automatically."
+          "This view will refresh automatically. If the server's Access " +
+          "switch is off, turn it on (enable it on the HA-MCP Server " +
+          "device first if it is disabled); if it does not start, " +
+          "Settings - System - Repairs says what it needs."
       );
     }}
     setTimeout(mint, RETRY_MS);
@@ -745,16 +752,6 @@ _BOOT_HTML = f"""<!doctype html>
 </body>
 </html>
 """
-
-
-def render_boot_script() -> str:
-    """Return the boot-page script source (used by the JS-parse tests)."""
-    return _BOOT_JS
-
-
-def render_boot_page() -> str:
-    """Return the boot-page HTML (used by the tests)."""
-    return _BOOT_HTML
 
 
 def panel_config() -> ConfigType:

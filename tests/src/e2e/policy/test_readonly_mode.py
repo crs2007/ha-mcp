@@ -9,7 +9,8 @@ against the testcontainer HA (function-scoped — the session-scoped
 - exempt mixed read/write tools stay listed, their read actions work,
   and their write actions return the structured READ_ONLY_MODE error;
 - direct calls to hidden write tools return the same error;
-- with tool search enabled, proxy-dispatched writes are blocked too;
+- with tool search enabled, proxy-dispatched writes are blocked too, and
+  only the read proxy is listed;
 - ``ha_get_overview`` reports the mode to the LLM;
 - the real catalog satisfies the invariant that every mandatory tool is
   either read-safe or exempt (a unit test cannot see the real registered
@@ -23,10 +24,10 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-from fastmcp import Client
-from fastmcp.exceptions import ToolError
 from test_constants import TEST_TOKEN
 
+from ha_mcp._vendor.fastmcp import Client
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 from ha_mcp.client.rest_client import HomeAssistantClient
 from ha_mcp.read_only import READ_ONLY_EXEMPT_TOOLS, is_read_safe
 from ha_mcp.server import HomeAssistantSmartMCPServer
@@ -38,6 +39,7 @@ from ..utilities.assertions import (
     parse_mcp_result,
     tool_error_to_result,
 )
+from ..utilities.cleanup import CleanupSteps
 
 
 async def _expect_read_only_blocked(
@@ -271,14 +273,24 @@ async def test_overview_reports_read_only_mode(readonly_mcp):
 @pytest.mark.asyncio
 async def test_direct_write_tool_call_blocked(readonly_mcp):
     client, _server = readonly_mcp
-    body = await _expect_read_only_blocked(
-        client,
-        "ha_call_service",
+    for arguments in (
         {"domain": "light", "service": "turn_on", "entity_id": "light.bed_light"},
-    )
-    assert body["tool_name"] == "ha_call_service"
-    # The error must point the user at the toggle.
-    assert "Read Only Mode" in body["error"]["message"]
+        {
+            "domain": "persistent_notification",
+            "service": "create",
+            "data": {"message": "read-only regression"},
+        },
+        {"domain": "weather", "service": "get_forecasts", "return_response": True},
+        {"ws_command": "repairs/list_issues"},
+        {
+            "ws_command": "repairs/ignore_issue",
+            "data": {"domain": "sun", "issue_id": "test", "ignore": True},
+        },
+    ):
+        body = await _expect_read_only_blocked(client, "ha_call_service", arguments)
+        assert body["tool_name"] == "ha_call_service"
+        # The error must point the user at the toggle.
+        assert "Read Only Mode" in body["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -395,27 +407,84 @@ async def test_string_envelope_proxy_write_blocked(readonly_toolsearch_mcp):
     catalog = await server.mcp.local_provider._list_tools()
     names = {t.name for t in catalog}
 
-    # ha_manage_addon registers unconditionally (not supervisor-gated), but
+    # ha_manage_app registers unconditionally (not supervisor-gated), but
     # fall back to the always-registered energy tool if a future change
     # gates it, so this test stays meaningful on a non-HAOS container.
-    if "ha_manage_addon" in names:
-        inner_name = "ha_manage_addon"
+    if "ha_manage_app" in names:
+        inner_name = "ha_manage_app"
         inner_args = '{"slug": "x", "action": "install"}'
     else:
         inner_name = "ha_manage_energy_prefs"
         inner_args = '{"mode": "set", "config": {}}'
 
-    try:
-        result = await client.call_tool(
-            "ha_call_write_tool",
-            {"name": inner_name, "arguments": inner_args},
-        )
-    except ToolError as exc:
-        body = tool_error_to_result(exc)
-    else:
-        body = parse_mcp_result(result)
-    assert body.get("error", {}).get("code") == "READ_ONLY_MODE", body
+    body = await _expect_read_only_blocked(
+        client,
+        "ha_call_write_tool",
+        {"name": inner_name, "arguments": inner_args},
+    )
     assert body.get("tool_name") == inner_name, body
+
+
+@pytest.mark.asyncio
+async def test_tool_search_lists_only_the_read_proxy(readonly_toolsearch_mcp):
+    """The read-only filter runs before the search transform and never sees
+    the proxies it synthesises, so the transform leaves the write and delete
+    proxies out itself; a manage tool's read action still works through the
+    read proxy, and its search hint points only there (#2358)."""
+    client, _server = readonly_toolsearch_mcp
+    names = {t.name for t in await client.list_tools()}
+    assert "ha_search_tools" in names
+    assert "ha_call_read_tool" in names
+    assert "ha_call_write_tool" not in names, sorted(names)
+    assert "ha_call_delete_tool" not in names, sorted(names)
+
+    read = parse_mcp_result(
+        await client.call_tool(
+            "ha_call_read_tool",
+            {"name": "ha_manage_energy_prefs", "arguments": {"mode": "get"}},
+        )
+    )
+    assert read.get("success") is True, read
+
+    body = parse_mcp_result(
+        await client.call_tool(
+            "ha_search_tools", {"query": "energy dashboard preferences"}
+        )
+    )
+    entries: list = body if isinstance(body, list) else []
+    if isinstance(body, dict):
+        for key in ("tools", "results", "matches"):
+            entries.extend(body.get(key) or [])
+    hints = {
+        e["name"]: e.get("execute_via", "")
+        for e in entries
+        if isinstance(e, dict) and isinstance(e.get("name"), str)
+    }
+    assert "ha_manage_energy_prefs" in hints, sorted(hints)
+    hint = hints["ha_manage_energy_prefs"]
+    assert "ha_call_read_tool" in hint, hint
+    assert "ha_call_write_tool" not in hint, hint
+    assert "ha_call_delete_tool" not in hint, hint
+
+
+@pytest.mark.asyncio
+async def test_unlisted_write_proxy_still_runs_a_manage_tools_read_action(
+    readonly_toolsearch_mcp,
+):
+    """Unlisted is not unresolvable. A client holding ``ha_call_write_tool``
+    in a cached tool list must still reach the proxy: the middleware lets an
+    exempt read action through, and the search transform resolves the name
+    even though the read-only catalog filter would hide it. This exercises
+    transform registration order, the catalog filter and the middleware
+    together, which only the real server composes."""
+    client, _server = readonly_toolsearch_mcp
+    body = parse_mcp_result(
+        await client.call_tool(
+            "ha_call_write_tool",
+            {"name": "ha_manage_energy_prefs", "arguments": {"mode": "get"}},
+        )
+    )
+    assert body.get("success") is True, body
 
 
 @pytest.mark.asyncio
@@ -526,8 +595,8 @@ async def test_inaddon_read_only_mode_blocks_radio_writes(
     a fresh in-process server).
 
     Enables read_only_mode through the add-on's OWN settings API — which merges it
-    into the Supervisor add-on options the production way (a bare options POST is
-    full-replacement and would drop required keys) — self-restarts ONLY the add-on
+    into the Supervisor add-on options the production way (a bare options POST
+    replaces them in full and resets the others to defaults) — self-restarts ONLY the add-on
     (~10s; Home Assistant is untouched) so it boots with ``READ_ONLY_MODE=true``,
     asserts ha_manage_radio's read action still works while a write is blocked with
     the structured READ_ONLY_MODE error, then RESTORES read-only to off.
@@ -546,8 +615,10 @@ async def test_inaddon_read_only_mode_blocks_radio_writes(
     import time
 
     import httpx
-    from fastmcp.client.transports import StreamableHttpTransport
+    import httpx2
     from haos_runtime import HA_MCP_TEST_SECRET_PATH, wait_for_addon_mcp_ready
+
+    from ha_mcp._vendor.fastmcp.client.transports import StreamableHttpTransport
 
     container_info = ha_container_with_fresh_config
     addon_mcp_url = container_info.get("addon_mcp_url")
@@ -555,7 +626,15 @@ async def test_inaddon_read_only_mode_blocks_radio_writes(
     # The settings UI is mounted at the secret-path root (see TestSettingsUiRestartReal).
     base = addon_mcp_url.split("/mcp", 1)[0]
     settings = f"{base}{HA_MCP_TEST_SECRET_PATH}/api/settings"
-    _transient = (AssertionError, TimeoutError, OSError, httpx.HTTPError, RuntimeError)
+    # httpx for the settings POSTs, httpx2 for FastMCP's client transport.
+    _transient = (
+        AssertionError,
+        TimeoutError,
+        OSError,
+        httpx.HTTPError,
+        httpx2.HTTPError,
+        RuntimeError,
+    )
 
     async def _set_read_only(enabled: bool) -> None:
         """POST the flag (handler merges into Supervisor options) + self-restart
@@ -612,6 +691,7 @@ async def test_inaddon_read_only_mode_blocks_radio_writes(
             )
             assert blocked.get("tool_name") == "ha_manage_radio", blocked
     finally:
-        await _restore_read_only_and_warm_client(
-            _set_read_only, _await_read_only, mcp_client, _transient
-        )
+        with CleanupSteps() as cleanup, cleanup.step():
+            await _restore_read_only_and_warm_client(
+                _set_read_only, _await_read_only, mcp_client, _transient
+            )

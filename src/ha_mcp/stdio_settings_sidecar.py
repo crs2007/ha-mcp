@@ -62,7 +62,7 @@ import socket
 import subprocess
 import sys
 import threading
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -183,12 +183,7 @@ def _save_sidecar_state(port: int, secret_path: str) -> None:
 
 
 def read_sidecar_url() -> str | None:
-    """Return the current sidecar URL, or None if no sidecar is running.
-
-    Reads ``~/.ha-mcp/ui.url`` if present. Consumed by
-    ``ha_get_overview`` to surface the URL to the LLM (and through it,
-    the user) on every overview call.
-    """
+    """Return the URL recorded in ``ui.url``, or None when absent/unreadable."""
     try:
         return _url_file().read_text().strip() or None
     except FileNotFoundError:
@@ -196,6 +191,14 @@ def read_sidecar_url() -> str | None:
     except OSError:
         logger.debug("Cannot read sidecar URL file", exc_info=True)
         return None
+
+
+def live_sidecar_url() -> str | None:
+    """Return the URL ``ha_get_overview`` may surface: UI enabled, recorded pid alive."""
+    pid = _read_recorded_pid()
+    if _is_disabled() or pid is None or not _pid_alive(pid):
+        return None
+    return read_sidecar_url()
 
 
 def _is_disabled() -> bool:
@@ -250,7 +253,7 @@ def _read_recorded_pid() -> int | None:
     """Return the PID recorded in ``ui.pid``, or None if absent/garbage."""
     try:
         return int(_pid_file().read_text().strip())
-    except (OSError, ValueError):
+    except OSError, ValueError:
         return None
 
 
@@ -277,7 +280,15 @@ def _no_proxy_opener() -> Any:
     """
     import urllib.request
 
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        """Keep the loopback-only shutdown request on its original target."""
+
+        def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+    return urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), _NoRedirectHandler()
+    )
 
 
 # Shape run_main() writes into ui.url. Doubles as the legacy-migration
@@ -285,6 +296,15 @@ def _no_proxy_opener() -> Any:
 _SIDECAR_URL_RE = re.compile(
     r"http://127\.0\.0\.1:(\d{1,5})(/private_[A-Za-z0-9_-]+)/settings"
 )
+
+
+def _is_trusted_sidecar_url(url: str) -> bool:
+    """Return whether a URL matches the loopback sidecar producer contract."""
+    match = _SIDECAR_URL_RE.fullmatch(url.strip())
+    if match is None:
+        return False
+    port = int(match.group(1))
+    return 1024 <= port <= 65535
 
 
 def _seed_state_from_url(url: str) -> None:
@@ -335,6 +355,13 @@ def _post_shutdown(url: str) -> tuple[bool, bool | None]:
     """
     import urllib.error
 
+    if not _is_trusted_sidecar_url(url):
+        logger.warning(
+            "Recorded sidecar URL is invalid; refusing the shutdown request and "
+            "replacing state files only."
+        )
+        return False, None
+
     try:
         import urllib.request
 
@@ -384,6 +411,185 @@ def _post_shutdown(url: str) -> tuple[bool, bool | None]:
     return False, None
 
 
+def _read_external_retirement_url(config_dir: Path) -> str | None:
+    """Read the sidecar URL used by an external-process cleanup."""
+    url_path = config_dir / "ui.url"
+    try:
+        url = url_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        logger.debug("Sidecar URL file %s not found; nothing to retire.", url_path)
+        return None
+    except PermissionError:
+        logger.warning(
+            "Cannot read sidecar URL file %s; a detached listener may still be "
+            "running for config dir %s.",
+            url_path,
+            config_dir,
+            exc_info=True,
+        )
+        return None
+    except OSError:
+        logger.warning(
+            "Failed to read sidecar URL file %s; a detached listener may still be "
+            "running for config dir %s.",
+            url_path,
+            config_dir,
+            exc_info=True,
+        )
+        return None
+    if not url:
+        logger.warning(
+            "Sidecar URL file %s is empty; a detached listener may still be running "
+            "for config dir %s.",
+            url_path,
+            config_dir,
+        )
+        return None
+    return url
+
+
+def _read_external_retirement_pid(config_dir: Path) -> int | None:
+    """Read the recorded PID so an acknowledged retirement can await exit."""
+    pid_path = config_dir / "ui.pid"
+    try:
+        return int(pid_path.read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        logger.debug("Sidecar PID file %s not found; exit cannot be polled.", pid_path)
+    except PermissionError:
+        logger.warning(
+            "Cannot read sidecar PID file %s; exit cannot be polled for config dir %s.",
+            pid_path,
+            config_dir,
+            exc_info=True,
+        )
+    except OSError:
+        logger.warning(
+            "Failed to read sidecar PID file %s; exit cannot be polled for config "
+            "dir %s.",
+            pid_path,
+            config_dir,
+            exc_info=True,
+        )
+    except ValueError:
+        logger.warning(
+            "Sidecar PID file %s is invalid; exit cannot be polled for config dir %s.",
+            pid_path,
+            config_dir,
+        )
+    return None
+
+
+def _external_retirement_sentinel_preexisting(sentinel_path: Path) -> bool:
+    """Snapshot whether the user already disabled the settings sidecar."""
+    try:
+        return sentinel_path.exists()
+    except OSError:
+        logger.warning(
+            "Cannot inspect sidecar disable sentinel %s; preserving it.",
+            sentinel_path,
+            exc_info=True,
+        )
+        return True
+
+
+def _clear_external_retirement_sentinel(
+    sentinel_path: Path,
+    *,
+    url: str,
+    sentinel_preexisting: bool,
+    sentinel_created: bool | None,
+) -> None:
+    """Clear only a legacy disable sentinel attributable to this retirement."""
+    should_clear = (
+        sentinel_created if sentinel_created is not None else not sentinel_preexisting
+    )
+    if not should_clear:
+        return
+    try:
+        sentinel_path.unlink()
+    except FileNotFoundError:
+        logger.debug(
+            "Sidecar disable sentinel %s was already absent after retiring %s.",
+            sentinel_path,
+            url,
+        )
+    except OSError:
+        logger.warning(
+            "Retired sidecar at %s but could not remove its disable sentinel %s.",
+            url,
+            sentinel_path,
+            exc_info=True,
+        )
+
+
+def _wait_for_external_retired_pid(
+    pid: int | None,
+    *,
+    url: str,
+    config_dir: Path,
+) -> None:
+    """Wait a bounded interval for an acknowledged detached sidecar to exit."""
+    if pid is None:
+        return
+    import time
+
+    deadline = time.monotonic() + _OLD_SIDECAR_EXIT_WAIT
+    while _pid_alive(pid):
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Retired sidecar pid %s at %s is still alive after %.0fs for "
+                "config dir %s.",
+                pid,
+                url,
+                _OLD_SIDECAR_EXIT_WAIT,
+                config_dir,
+            )
+            return
+        time.sleep(_OLD_SIDECAR_EXIT_POLL)
+
+
+def retire_sidecar(config_dir: Path) -> bool:
+    """Best-effort retirement for an externally managed stdio test process.
+
+    This public helper intentionally crosses the process boundary: callers that
+    spawn a real ``ha-mcp`` stdio server otherwise have no handle to its detached
+    settings listener. It uses discovery files in ``config_dir``, reports each
+    failure mode, and returns whether the sidecar acknowledged shutdown.
+
+    The replacement path in ``_shutdown_existing_sidecar`` deliberately remains
+    separate because it seeds global sidecar state and immediately spawns a successor.
+    """
+    url = _read_external_retirement_url(config_dir)
+    if url is None:
+        return False
+    # Capture both before the POST: an acknowledged sidecar may remove its PID,
+    # and the sentinel snapshot distinguishes a legacy endpoint's write from a
+    # user's preexisting disable choice.
+    pid = _read_external_retirement_pid(config_dir)
+    sentinel_path = config_dir / "settings_ui_disabled"
+    sentinel_preexisting = _external_retirement_sentinel_preexisting(sentinel_path)
+
+    acked, sentinel_created = _post_shutdown(url)
+    if not acked:
+        logger.warning(
+            "Sidecar at %s did not acknowledge retirement for config dir %s; "
+            "the detached listener may still be running.",
+            url,
+            config_dir,
+        )
+        return False
+
+    _clear_external_retirement_sentinel(
+        sentinel_path,
+        url=url,
+        sentinel_preexisting=sentinel_preexisting,
+        sentinel_created=sentinel_created,
+    )
+    logger.info("Retired settings UI sidecar at %s for config dir %s", url, config_dir)
+    _wait_for_external_retired_pid(pid, url=url, config_dir=config_dir)
+    return True
+
+
 def _log_shutdown_timeout(exc: BaseException) -> None:
     logger.warning(
         "Old sidecar did not answer /shutdown within %.1fs (%s); "
@@ -420,6 +626,9 @@ def _shutdown_existing_sidecar() -> None:
     replacement, so nothing hands out the old URL anymore (if the
     replacement loses the port to that lingering process, it serves on
     an ephemeral fallback instead).
+
+    External test-process cleanup uses ``retire_sidecar``; the sequences stay
+    separate because only this path seeds state and immediately replaces the listener.
     """
     url = read_sidecar_url()
     if url is None:
@@ -557,7 +766,7 @@ def _spawn_lock() -> Iterator[bool]:
         os.close(fd)
 
 
-def _bind_listener(preferred: int, source: str) -> socket.socket:
+def bind_listener(preferred: int, source: str) -> socket.socket:
     """Bind and return the sidecar's actual serving socket.
 
     Binding the real socket up front (instead of probing a port and
@@ -611,10 +820,10 @@ def _bind_listener(preferred: int, source: str) -> socket.socket:
 def maybe_spawn(prepare: Callable[[], None] | None = None) -> None:
     """Retire any previous sidecar and spawn a fresh one.
 
-    Called once from stdio ``main()`` after argument validation. No-op
-    when the sidecar is disabled (env var or sentinel), when a
-    concurrent parent already holds the spawn lock, or when subprocess
-    spawn raises (best effort; the MCP server continues regardless).
+    Called once from stdio ``main()`` after argument validation. When the
+    sidecar is disabled (env var or sentinel) it only retires a running one
+    (#2954). No-op when a concurrent parent already holds the spawn lock or
+    when subprocess spawn raises (best effort; the MCP server continues).
 
     A previously spawned sidecar is never reused (issue #2131): it
     serves the code and environment of the parent that spawned it, which
@@ -632,6 +841,9 @@ def maybe_spawn(prepare: Callable[[], None] | None = None) -> None:
             "Settings UI sidecar disabled (env var or %s sentinel); skipping spawn.",
             _disabled_sentinel().name,
         )
+        with _spawn_lock() as acquired:
+            if acquired:
+                _shutdown_existing_sidecar()
         return
 
     # Serialize concurrent spawn attempts. Two parent stdio processes
@@ -747,10 +959,10 @@ def _do_spawn() -> None:
         if log_handle is not None:
             log_handle.close()
         return
+    # Reap the child on exit: a zombie still passes os.kill(pid, 0) (#2954).
+    threading.Thread(target=proc.wait, name="sidecar-reaper", daemon=True).start()
 
-    # The child writes its own pid/url file once it's bound — but log the
-    # spawn here so users grepping the parent stderr see something
-    # immediately, even before the child reports back.
+    # Log now so parent stderr shows the spawn before the child publishes.
     logger.info(
         "Spawned settings UI sidecar pid=%d (log: %s). URL written to %s once ready.",
         proc.pid,
@@ -925,13 +1137,6 @@ def _write_pid_url(url: str) -> None:
                 pid_path.unlink()
 
 
-# Note: a custom ``_install_shutdown_handlers`` lived here previously.
-# Removed because uvicorn's ``Server.run()`` already installs SIGTERM /
-# SIGINT handlers that set ``should_exit = True`` — the same behavior
-# the custom handler provided. The /shutdown HTTP endpoint reaches the
-# same stop callable via ``app.state.shutdown_state`` and is unaffected.
-
-
 def _build_shutdown_handler(
     shutdown_lock: threading.Lock,
     shutdown_state: dict[str, Callable[[], None] | None],
@@ -1057,7 +1262,7 @@ def _build_app(
     from starlette.responses import PlainTextResponse
     from starlette.routing import Route
 
-    from .settings_ui import build_settings_handlers
+    from .settings_ui import SETTINGS_ROUTES, build_settings_handlers
 
     handlers = build_settings_handlers(server=None, is_sidecar=True)
 
@@ -1113,110 +1318,17 @@ def _build_app(
 
     secret_prefix = secret_path.rstrip("/")
 
+    # Mount under the secret path; the user's bookmark / overview URL includes
+    # it. A bare GET on / returns a generic 404 because the only way to reach
+    # the page is via the secret path. The table is the shared HTTP surface,
+    # minus the app restart the sidecar cannot perform, so the two never drift.
+    # Policy pending/approve/deny answer 503 here (the ApprovalQueue lives in
+    # the main process); the decision-pin routes must still work, because the
+    # config PUT refuses event-bus decisions without a stored PIN.
     routes = [
-        # Mount under the secret path; the user's bookmark / overview URL
-        # includes it. A bare GET on / returns a generic 404 because the
-        # only way to reach the page is via the secret path.
-        Route(
-            f"{secret_prefix}/settings",
-            handlers["settings_page"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/settings/tools",
-            handlers["get_tools"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/settings/tools",
-            handlers["save_tools"],
-            methods=["POST"],
-        ),
-        Route(
-            f"{secret_prefix}/api/settings/info",
-            handlers["settings_info"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/settings/features",
-            handlers["get_feature_flags"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/settings/features",
-            handlers["save_feature_flags"],
-            methods=["POST"],
-        ),
-        # Theme / accessibility prefs (#1574 review). The sidecar is the
-        # very mode these exist for: its port (= the localStorage origin)
-        # is stable by default since #2131 but still changes on first
-        # spawn, a lost ui.state, a pin change, or a taken remembered
-        # port — and each change is a fresh empty origin the server-side
-        # copy re-seeds with the user's choices.
-        Route(
-            f"{secret_prefix}/api/settings/theme",
-            handlers["get_theme_prefs"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/settings/theme",
-            handlers["save_theme_prefs"],
-            methods=["POST"],
-        ),
-        # Custom filesystem directories (issue #1567). The sub-form is rendered
-        # in the features panel, so the stdio sidecar must serve these too — its
-        # route list is hand-maintained and does NOT derive from
-        # register_settings_routes. The handler builds a transient HA client
-        # from the inherited env when server is None (sidecar mode).
-        Route(
-            f"{secret_prefix}/api/settings/fs-custom-paths",
-            handlers["get_fs_custom_paths"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/settings/fs-custom-paths",
-            handlers["save_fs_custom_paths"],
-            methods=["POST"],
-        ),
-        # Tool security policies endpoints (#966). Pending/approve/deny
-        # are wired as stubs that return 503 in sidecar mode — the
-        # in-memory ApprovalQueue lives in the main server process, so
-        # only config GET/PUT are usefully reachable here.
-        Route(
-            f"{secret_prefix}/api/policy/config",
-            handlers["policy_get_config"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/policy/config",
-            handlers["policy_put_config"],
-            methods=["PUT"],
-        ),
-        Route(
-            f"{secret_prefix}/api/policy/pending",
-            handlers["policy_get_pending"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/policy/approve",
-            handlers["policy_post_approve"],
-            methods=["POST"],
-        ),
-        Route(
-            f"{secret_prefix}/api/policy/deny",
-            handlers["policy_post_deny"],
-            methods=["POST"],
-        ),
-        Route(
-            f"{secret_prefix}/api/policy/tool-schema",
-            handlers["policy_get_tool_schema"],
-            methods=["GET"],
-        ),
-        Route(
-            f"{secret_prefix}/api/policy/value-source",
-            handlers["policy_get_value_source"],
-            methods=["GET"],
-        ),
+        Route(f"{secret_prefix}{path}", handlers[key], methods=methods)
+        for path, methods, key in SETTINGS_ROUTES
+        if key != "restart_addon"
     ]
 
     # /shutdown — POST endpoint that drops the disable sentinel and
@@ -1235,12 +1347,18 @@ def _build_app(
         )
     )
 
+    # uvicorn re-raises a captured SIGTERM after shutdown, killing the process
+    # before run_main's finally; app shutdown is the last code a signal reaches.
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: Any) -> AsyncIterator[None]:
+        yield
+        _cleanup_owned_serving_files()
+
     app = Starlette(
         routes=routes,
         middleware=[Middleware(SecurityMiddleware)],
+        lifespan=_lifespan,
     )
-    # Stash the shutdown_state on the app so run_main() can install the
-    # uvicorn stop callable into it once the server is built.
     app.state.shutdown_state = shutdown_state
     app.state.shutdown_lock = shutdown_lock
     return app
@@ -1287,7 +1405,7 @@ def run_main() -> int:
     remembered_port, remembered_secret = persisted if persisted else (0, None)
     pin_port = get_global_settings().sidecar_pin_port
     try:
-        listener = _bind_listener(
+        listener = bind_listener(
             pin_port or remembered_port, "Pinned" if pin_port else "Remembered"
         )
     except OSError:
@@ -1318,16 +1436,15 @@ def run_main() -> int:
         # Bounded graceful drain keeps a retiring sidecar's exit inside
         # the parent's _OLD_SIDECAR_EXIT_WAIT window.
         timeout_graceful_shutdown=3,
+        ws="none",
     )
     server = uvicorn.Server(config)
 
     def _stop() -> None:
         server.should_exit = True
 
-    # Wire the stop callable into app state so the /shutdown HTTP
-    # endpoint can reach it. OS signals (SIGTERM / SIGINT) are handled
-    # by uvicorn's own ``Server.run()`` installation — see the note
-    # earlier in this module for why we don't install our own.
+    # Wire the stop callable into app state so the /shutdown HTTP endpoint
+    # can reach it; uvicorn's ``Server.run()`` handles SIGTERM / SIGINT.
     with app.state.shutdown_lock:
         app.state.shutdown_state["stop"] = _stop
 
@@ -1347,16 +1464,12 @@ def run_main() -> int:
 
     try:
         # Hand uvicorn the pre-bound socket — re-binding host/port here
-        # would reintroduce the probe-then-rebind race _bind_listener
+        # would reintroduce the probe-then-rebind race bind_listener
         # exists to close.
         server.run(sockets=[listener])
     finally:
-        # Best-effort cleanup of serving files on graceful exit — but only
-        # the ones this process still owns. The retire wait in
-        # _shutdown_existing_sidecar is bounded, so a slow exit can outlive
-        # its replacement's file writes; a blind unlink here would delete
-        # the NEW sidecar's discovery files. (ui.state is deliberately
-        # never cleaned: it carries the stable URL to the next spawn.)
+        # Covers exits that never reach app shutdown. ui.state is kept on
+        # purpose: it carries the stable URL to the next spawn.
         _cleanup_owned_serving_files()
 
     return 0

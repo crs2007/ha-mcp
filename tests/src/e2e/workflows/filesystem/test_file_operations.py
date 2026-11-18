@@ -39,6 +39,10 @@ from ...utilities.wait_helpers import wait_for_tool_result
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Every test here drives the component's privileged filesystem services, which
+# register only in the "File & YAML Tools" config entry (#2292).
+pytestmark = pytest.mark.requires_tools_entry
+
 # Feature flag name
 FEATURE_FLAG = "HAMCP_ENABLE_FILESYSTEM_TOOLS"
 
@@ -96,7 +100,7 @@ async def mcp_client_with_filesystem(
             f"{missing}. The inaddon addon needs enable_filesystem_tools=true in "
             f"its install-time options (build_image.install_ha_mcp_dev_addon); the "
             f"embedded backend needs it in feature_flags.json "
-            f"(conftest._EMBEDDED_FEATURE_FLAGS)."
+            f"(_conftest_embedded._EMBEDDED_FEATURE_FLAGS)."
         )
         logger.debug("FastMCP client (%s, HTTP) reused for filesystem tests", backend)
         # Session-scope mcp_client owns __aexit__; the per-test fixture
@@ -104,7 +108,7 @@ async def mcp_client_with_filesystem(
         yield mcp_client
         return
 
-    from fastmcp import Client
+    from ha_mcp._vendor.fastmcp import Client
 
     client = Client(mcp_server.mcp)
 
@@ -134,7 +138,7 @@ async def _check_filesystem_tools_available(mcp_client) -> tuple[bool, str | Non
 
         return True, None
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return False, f"Error checking tools: {e}"
 
 
@@ -174,7 +178,7 @@ async def _check_mcp_tools_service_available(mcp_client) -> tuple[bool, str | No
 
         return False, "Unexpected response format"
 
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return False, f"Error checking services: {e}"
 
 
@@ -941,72 +945,6 @@ class TestFullCRUDWorkflow:
         logger.info("Complete CRUD lifecycle test PASSED")
 
 
-@pytest.mark.filesystem
-class TestMcpToolsComponentNotInstalled:
-    """Test behavior when ha_mcp_tools component is not installed."""
-
-    async def test_graceful_error_when_component_missing(
-        self, mcp_client_with_filesystem
-    ):
-        """Test that tools return helpful error when component is missing.
-
-        This test verifies the error handling in the MCP tools layer
-        when the HA custom component is not available. This test should
-        PASS regardless of whether the component is installed - it validates
-        the error message format when the component is missing.
-        """
-        available, _ = await _check_filesystem_tools_available(
-            mcp_client_with_filesystem
-        )
-        if not available:
-            pytest.skip("Filesystem tools not registered")
-
-        # Check if the ha_mcp_tools service is actually available
-        service_available, _ = await _check_mcp_tools_service_available(
-            mcp_client_with_filesystem
-        )
-
-        if not service_available:
-            # This is the expected case when component is not installed
-            # The MCP tool should return a helpful error message
-            async with MCPAssertions(mcp_client_with_filesystem) as mcp:
-                data = await safe_call_tool(
-                    mcp.client,
-                    "ha_list_files",
-                    {"path": "www/"},
-                )
-
-                # Should fail with helpful message about installing component
-                if data.get("success") is False:
-                    error = data.get("error", {})
-                    error_msg = (
-                        error.get("message", "")
-                        if isinstance(error, dict)
-                        else str(error)
-                    )
-                    error_code = (
-                        error.get("code", "") if isinstance(error, dict) else ""
-                    )
-
-                    # Check for helpful installation guidance
-                    assert (
-                        "not installed" in error_msg.lower()
-                        or "ha_mcp_tools" in error_msg.lower()
-                        or error_code == "COMPONENT_NOT_INSTALLED"
-                    ), f"Should provide helpful error: {data}"
-
-                    logger.info(
-                        "Correctly returned helpful error when component not installed"
-                    )
-                else:
-                    # This means the component IS installed - test passes
-                    logger.info("Component appears to be installed (unexpected in CI)")
-        else:
-            logger.info(
-                "ha_mcp_tools service is available, component is installed - test passes"
-            )
-
-
 # ---------------------------------------------------------------------------
 # #1579 PR2 — ha_write_file / ha_delete_file fold into the edits auto-backup
 # ---------------------------------------------------------------------------
@@ -1103,11 +1041,11 @@ def _auto_backup_disabled():
     their mandatory writes refuse. Restoring + re-resetting in ``finally``
     keeps the toggle scoped to this test.
     """
-    from ha_mcp.config import _reset_global_settings
+    from ha_mcp.config import reset_global_settings
 
     prev = os.environ.get("ENABLE_AUTO_BACKUP")
     os.environ["ENABLE_AUTO_BACKUP"] = "false"
-    _reset_global_settings()
+    reset_global_settings()
     try:
         yield
     finally:
@@ -1115,7 +1053,7 @@ def _auto_backup_disabled():
             os.environ.pop("ENABLE_AUTO_BACKUP", None)
         else:
             os.environ["ENABLE_AUTO_BACKUP"] = prev
-        _reset_global_settings()
+        reset_global_settings()
 
 
 @pytest.mark.filesystem

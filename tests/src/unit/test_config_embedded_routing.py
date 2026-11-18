@@ -22,19 +22,21 @@ from unittest.mock import MagicMock
 import pytest
 
 config = pytest.importorskip("ha_mcp.config")
+config_backup = pytest.importorskip("ha_mcp.config_backup")
+config_overrides = pytest.importorskip("ha_mcp.config_overrides")
 
 
 @pytest.fixture(autouse=True)
 def _clean_env(monkeypatch):
     monkeypatch.delenv("SUPERVISOR_TOKEN", raising=False)
     monkeypatch.delenv("HA_MCP_EMBEDDED", raising=False)
-    config._reset_embedded_connection()
+    config.reset_embedded_connection()
     yield
     # Drop the embedded connection AND the settings singleton so a test that
     # exercised get_global_settings() can't leak the in-memory url/token into a
     # later test's Settings.
-    config._reset_embedded_connection()
-    config._reset_global_settings()
+    config.reset_embedded_connection()
+    config.reset_global_settings()
 
 
 def _a_backup_env_name() -> str:
@@ -106,7 +108,7 @@ class TestApplyBackupOverrides:
     def test_addon_short_circuits_without_reading_file(self, monkeypatch):
         monkeypatch.setenv("SUPERVISOR_TOKEN", "tok")
         reader = MagicMock(return_value={})
-        monkeypatch.setattr(config, "_read_backup_override_file", reader)
+        monkeypatch.setattr(config_backup, "_read_backup_override_file", reader)
         config._apply_backup_overrides(MagicMock())
         reader.assert_not_called()
 
@@ -114,7 +116,7 @@ class TestApplyBackupOverrides:
         monkeypatch.setenv("SUPERVISOR_TOKEN", "tok")
         monkeypatch.setenv("HA_MCP_EMBEDDED", "1")
         reader = MagicMock(return_value={})
-        monkeypatch.setattr(config, "_read_backup_override_file", reader)
+        monkeypatch.setattr(config_backup, "_read_backup_override_file", reader)
         config._apply_backup_overrides(MagicMock())
         reader.assert_called_once()
 
@@ -129,7 +131,7 @@ class TestApplyFeatureFlagOverrides:
         monkeypatch.setenv("SUPERVISOR_TOKEN", "tok")
         monkeypatch.setenv("HA_MCP_EMBEDDED", "1")
         monkeypatch.setattr(
-            config, "_read_feature_flag_override_file", lambda: {field: True}
+            config_overrides, "_read_feature_flag_override_file", lambda: {field: True}
         )
         settings = MagicMock()
         settings.enable_beta_features = True  # keep the master gate from clearing
@@ -141,7 +143,7 @@ class TestApplyFeatureFlagOverrides:
         monkeypatch.delenv(env_name, raising=False)
         monkeypatch.setenv("SUPERVISOR_TOKEN", "tok")  # add-on, not embedded
         monkeypatch.setattr(
-            config, "_read_feature_flag_override_file", lambda: {field: True}
+            config_overrides, "_read_feature_flag_override_file", lambda: {field: True}
         )
         settings = MagicMock()
         settings.enable_beta_features = True
@@ -183,13 +185,13 @@ class TestEmbeddedConnection:
         monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
 
         config.set_embedded_connection("http://127.0.0.1:8123", "tok-mem")
-        config._reset_global_settings()
+        config.reset_global_settings()
         settings = config.get_global_settings()
         assert settings.homeassistant_url == "http://127.0.0.1:8123"
         assert settings.homeassistant_token == "tok-mem"
 
         # Settings-UI reset+rebuild re-applies the registered connection.
-        config._reset_global_settings()
+        config.reset_global_settings()
         rebuilt = config.get_global_settings()
         assert rebuilt.homeassistant_url == "http://127.0.0.1:8123"
         assert rebuilt.homeassistant_token == "tok-mem"
@@ -205,7 +207,7 @@ class TestEmbeddedConnection:
         monkeypatch.delenv("HOMEASSISTANT_TOKEN", raising=False)
         monkeypatch.setenv("HA_MCP_CONFIG_DIR", str(tmp_path))
 
-        config._reset_global_settings()
+        config.reset_global_settings()
         stale = config.get_global_settings()  # built first, sentinel connection
         assert stale.homeassistant_url == config.OAUTH_MODE_URL
 
@@ -252,3 +254,49 @@ class TestEmbeddedConnection:
         settings = config.Settings(_env_file=None)
         config._apply_embedded_connection(settings)
         assert settings.verify_ssl is True
+
+    def test_config_dir_is_read_back_only_through_the_getter(self):
+        # Issue #2329: the component hands over HA's own config directory so
+        # the in-process server can read blueprint files directly. It is
+        # deliberately NOT a Settings field — nothing env- or override-file
+        # driven can point it anywhere — so the getter is the only reader.
+        config.set_embedded_connection(
+            "http://127.0.0.1:8123", "tok123", config_dir="/config"
+        )
+        assert config.get_embedded_config_dir() == "/config"
+        settings = config.Settings(_env_file=None)
+        config._apply_embedded_connection(settings)
+        assert not hasattr(settings, "embedded_config_dir")
+        assert not hasattr(settings, "config_dir")
+
+    def test_config_dir_absent_by_default(self):
+        assert config.get_embedded_config_dir() is None
+        config.set_embedded_connection("http://127.0.0.1:8123", "tok123")
+        assert config.get_embedded_config_dir() is None
+
+    def test_config_dir_reregistration_without_it_clears_it(self):
+        # An entry reload against an older component that no longer passes
+        # config_dir must not keep serving the previous directory.
+        config.set_embedded_connection(
+            "http://127.0.0.1:8123", "tok123", config_dir="/config"
+        )
+        config.set_embedded_connection("http://127.0.0.1:8123", "tok123")
+        assert config.get_embedded_config_dir() is None
+
+    def test_blank_config_dir_reads_as_none(self):
+        config.set_embedded_connection("http://127.0.0.1:8123", "tok123", config_dir="")
+        assert config.get_embedded_config_dir() is None
+
+    def test_llm_metadata_is_off_outside_embedded_mode(self):
+        assert config.should_emit_llm_api_metadata() is False
+
+    def test_old_component_keeps_embedded_llm_metadata(self):
+        config.set_embedded_connection("http://127.0.0.1:8123", "tok123")
+        assert config.should_emit_llm_api_metadata() is True
+
+    @pytest.mark.parametrize("enabled", [True, False])
+    def test_embedded_llm_metadata_follows_component_option(self, enabled):
+        config.set_embedded_connection(
+            "http://127.0.0.1:8123", "tok123", llm_api_enabled=enabled
+        )
+        assert config.should_emit_llm_api_metadata() is enabled

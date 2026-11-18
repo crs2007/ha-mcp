@@ -16,6 +16,11 @@ name: Locale Sync
 # them, or that no locale carries — so a hand translation survives exactly
 # when its PR also repinned the baseline (scripts/update_locale_baseline.py,
 # which is what tells the bot the changed English is already covered).
+# Klingon (`tlh`) is an explicit best-effort/manual locale. The planner skips
+# it, so it consumes no Gemini quota and cannot make a run partial; generated
+# projections use its valid hand-authored strings and English fallback for
+# missing ones. `tlh`-specific drift and validation report warnings only. All
+# other locales, English sources, and shared pipeline failures remain strict.
 #
 # Verification is three layers. (1) Every returned string is validated
 # before it is written (placeholder, markup, formatting-tag and panel-link
@@ -26,8 +31,8 @@ name: Locale Sync
 # BLOCKS the push — machine translations are recomputable, so dropping them
 # loses nothing. (3) The English-source staleness check runs separately and
 # does NOT block the push: after a clean run the only way it fails is a
-# held feature-gated stub key awaiting human review (see AGENTS.md
-# § Translations), which is routine — blocking on it would wedge every
+# held feature-gated stub key awaiting human review (see the locale README
+# § English changes and retranslation), which is routine — blocking would wedge
 # unrelated translation and re-burn the Gemini quota daily until someone
 # runs update_locale_baseline.py. It reddens the job instead.
 #
@@ -44,11 +49,11 @@ name: Locale Sync
 #
 # Two jobs on purpose, as blast-radius reduction: the translate job executes
 # everything `uv sync` resolves (a supply chain of hundreds of packages) and
-# holds no credential beyond the free-tier Gemini key; the push job runs on
-# a fresh runner, executes only git against a fresh clone (no hooks, no
-# project code), and refuses any patch that touches files outside the locale
-# allowlist — data-only catalog files; settings.js is deliberately not
-# exportable (see the export step). A compromised dependency in the
+# holds no credential beyond the rotatable API key for its free-tier Gemini
+# project; the push job runs on a fresh runner against a fresh clone, executes
+# only git (no hooks or project code), and refuses any patch touching files
+# outside the locale allowlist — data-only catalogs; settings_js/ is deliberately
+# not exportable (see the export step). A compromised dependency in the
 # translate job can therefore corrupt at most the locale catalogs the
 # pipeline legitimately writes — never reach the ruleset-bypassing push
 # credential and never land executable code.
@@ -118,12 +123,15 @@ jobs:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       with:
         # This job executes the resolved dependency tree, so it gets no
-        # credential except GEMINI_API_KEY (free-tier, rotatable) — never
-        # the push token.
+        # credential except the free-tier project's rotatable GEMINI_API_KEY
+        # — never the push token.
         persist-credentials: false
 
     - name: Install uv
-      uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      with:
+        # renovate: datasource=github-releases depName=astral-sh/uv
+        version: "0.13.7"
 
     - name: Install dependencies
       run: uv sync --dev
@@ -143,7 +151,7 @@ jobs:
 
     - name: Export changes as a patch
       id: export
-      # settings.js is deliberately NOT staged: its generated FEATURE_META
+      # settings_js/ is deliberately NOT staged: its generated FEATURE_META
       # block derives from en.json alone, which this pipeline never touches
       # — PR CI's ungated derived-catalogs check keeps it current — so the
       # sync never legitimately changes the file, and excluding it means no
@@ -173,7 +181,7 @@ jobs:
 
     - name: Upload patch
       if: steps.export.outputs.have_patch == 'true'
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
       with:
         name: locale-sync-patch
         path: ${{ runner.temp }}/locale-sync.patch
@@ -186,9 +194,9 @@ jobs:
       # Runs even with no diff: a clean no-op run over a tree a hand edit
       # broke must still go red. Skipped after a partial run — the state is
       # incomplete by construction and the job already fails for it.
-      # --maxfail=0 overrides pytest.ini's --maxfail=3: a systemic failure
-      # must name every string, not the first three. The junitxml assertion
-      # closes the fail-open hole where a renamed env var or refactored
+      # --maxfail=0 overrides pyproject.toml's --maxfail=3: a systemic
+      # failure must name every string, not the first three. The junitxml
+      # assertion closes the fail-open hole where a renamed env var or refactored
       # marker skips every gated test and pytest exits 0 having verified
       # nothing (test_locale_sync_gate_shape.py pins the wiring pre-merge;
       # this asserts it at run time).
@@ -305,7 +313,7 @@ jobs:
          steps.staleness.outcome == 'failure')
       run: |
         if [ "${{ steps.translate.outcome }}" != "success" ]; then
-          echo "::error::scripts/translate_locales.py did not finish cleanly; any finished strings are exported for the push job (see its result for whether they landed) and the remainder is recorded in the progress file. Re-run this workflow — or let tomorrow's cron — continue from it, or hand-translate per AGENTS.md § Translations."
+          echo "::error::scripts/translate_locales.py did not finish cleanly; any finished strings are exported for the push job (see its result for whether they landed) and the remainder is recorded in the progress file. Re-run this workflow — or let tomorrow's cron — continue from it, or hand-translate per src/ha_mcp/settings_ui/locales/README.md#english-changes-and-retranslation."
         fi
         if [ "${{ steps.verify.outcome }}" = "failure" ]; then
           echo "::error::content-completeness verification failed after a clean translate run, so nothing will be pushed — the output may be corrupt (English pasted back, parity broken). The pytest output above names exactly what is off."
@@ -341,8 +349,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Shared group for every workflow that pushes to master (semver-release,
-    # addon-publish-dev, sync-tool-docs): a bot push landing
-    # while semantic-release is mid-run aborts the release un-retryably
+    # addon-publish-dev, sync-tool-docs, sync-ratchet-baselines): a bot push
+    # landing while semantic-release is mid-run aborts the release un-retryably
     # ("Upstream branch ... has changed"), so master writers must not
     # overlap. On this short job only — the translate leg never writes to
     # master and must not hold the slot. cancel-in-progress must be false:
@@ -359,7 +367,7 @@ jobs:
     steps:
     - name: Generate GitHub App token
       id: app-token
-      uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+      uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3
       with:
         app-id: ${{ secrets.RELEASE_APP_ID }}
         private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -384,7 +392,7 @@ jobs:
         persist-credentials: false
 
     - name: Download patch
-      uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
       with:
         name: locale-sync-patch
         path: ${{ runner.temp }}

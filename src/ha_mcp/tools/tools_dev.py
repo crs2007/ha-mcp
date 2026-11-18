@@ -17,11 +17,12 @@ import sys
 from typing import Annotated, Any, Literal
 
 import httpx
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
 from pydantic import Field
 
-from .._version import get_version, is_dev_version, is_embedded, is_running_in_addon
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import tool
+
+from .._version import is_embedded, is_running_in_addon
 from ..client.rest_client import (
     HomeAssistantAPIError,
     HomeAssistantCommandError,
@@ -30,19 +31,25 @@ from ..client.rest_client import (
 from ..client.websocket_client import get_websocket_client
 from ..errors import ErrorCode, create_error_response
 from ..policy.editing import PolicyCaller
+from ..renamed_tools import current_tool_name
+from .coercion import JSON_STRING_COERCION
 from .component_api import (
     component_supports,
     get_component_caps,
     invalidate_caps,
     is_unknown_command,
 )
+from .config_entry_flow import COMPONENT_DOMAIN
+from .config_entry_flow_form import MISSING, shown_value
+from .config_entry_flow_introspect import abort_probe_flow
 from .helpers import (
     exception_to_structured_error,
     log_tool_usage,
     raise_tool_error,
     register_tool_methods,
 )
-from .util_helpers import JSON_STRING_COERCION
+from .server_version import running_version_report
+from .tool_hints import write_hints
 
 logger = logging.getLogger(__name__)
 
@@ -50,44 +57,20 @@ logger = logging.getLogger(__name__)
 # section of the web settings UI (Server Settings tab, bottom).
 FEATURE_FLAG = "HAMCP_ENABLE_DEV_MODE"
 
-# Domain of the ha_mcp_tools custom component. Its "server" config entry
-# runs the ha-mcp server in-process inside HA and exposes channel /
-# pip-spec options that ha_dev_manage_server drives.
-COMPONENT_DOMAIN = "ha_mcp_tools"
-
 # The component's own in-process command for locating its "server" config
 # entry (see ``_fetch_server_entry_via_component``) — replaces probing every
 # ha_mcp_tools-domain entry's options-flow schema from the outside.
 WS_SERVER_ENTRY = "ha_mcp_tools/server_entry"
 
-# The WRITE counterpart: applies a channel / pip_spec delta to the server entry via
+# The WRITE counterpart: applies a pip_spec delta to the server entry via
 # ``async_update_entry`` directly (embedded mode only — see
 # ``_update_source_via_component``), collapsing update_source's options-flow start +
 # submit round-trip. Gated on the ``server_entry_update`` capability.
 WS_SERVER_ENTRY_UPDATE = "ha_mcp_tools/server_entry_update"
 
-# Options-flow field names of the component's server entry
-# (custom_components/ha_mcp_tools/const.py OPT_CHANNEL / OPT_PIP_SPEC).
-_OPT_CHANNEL = "channel"
+# Options-flow field name of the component's server entry
+# (custom_components/ha_mcp_tools/const.py OPT_PIP_SPEC).
 _OPT_PIP_SPEC = "pip_spec"
-_OPT_SERVER_URL = "server_url"
-_OPT_EXTERNAL_URL = "external_url"
-_OPT_WEBHOOK_ID_OVERRIDE = "webhook_id_override"
-_OPT_SECRET_PATH_OVERRIDE = "secret_path_override"
-_VALID_CHANNELS = ("stable", "dev")
-
-# Optional text fields the component's options flow pre-fills via
-# suggested_value (so the UI can clear them). Because an OMITTED optional field
-# reads as "cleared" rather than "unchanged", a partial update_source submit
-# must resend these at their current values or it would blank the user's
-# server-URL / connect-secret overrides.
-_PRESERVED_OPTION_KEYS = (
-    _OPT_PIP_SPEC,
-    _OPT_SERVER_URL,
-    _OPT_EXTERNAL_URL,
-    _OPT_WEBHOOK_ID_OVERRIDE,
-    _OPT_SECRET_PATH_OVERRIDE,
-)
 
 # Delay before a self-affecting action (embedded entry reload / options
 # submit) fires, so this tool's JSON response flushes to the MCP client
@@ -177,7 +160,8 @@ def _apply_policy_guard_row_locks(fname: str, row: dict[str, Any]) -> None:
     see ``editable: true`` on rows whose set/reset the guards refuse:
     ``enable_tool_security_policies`` while access is off, and
     ``dev_tools_security_policy_access`` plus
-    ``enable_security_policy_tool`` always (web UI / env var only).
+    ``enable_security_policy_tool`` and ``custom_instructions`` always
+    (web UI / env var only).
     A row that is ALREADY non-editable (env-pinned) keeps its plain env
     story: the pin refuses the write before these guards would, and
     stamping a policy reason there would misdirect the fix toward the
@@ -194,7 +178,7 @@ def _apply_policy_guard_row_locks(fname: str, row: dict[str, Any]) -> None:
             row["editable"] = False
             row["locked_reason"] = "web_ui_or_env_only"
         row["value"] = _security_policy_access_enabled()
-    elif fname == "enable_security_policy_tool":
+    elif fname in _HUMAN_ONLY_SETTINGS:
         if row["editable"]:
             row["editable"] = False
             row["locked_reason"] = "web_ui_or_env_only"
@@ -228,48 +212,46 @@ def _require_security_policy_access(operation: str) -> None:
     )
 
 
+# Settings dev tools may never write, in either direction, with the refusal
+# message and where a human changes them instead.
+_HUMAN_ONLY_SETTINGS: dict[str, tuple[str, str]] = {
+    "enable_security_policy_tool": (
+        "it registers ha_manage_security_policy, which can rewrite the tool "
+        "security policies gating the agent.",
+        "Change it in the web settings UI (Tool Security Policies tab) or via "
+        "the ENABLE_SECURITY_POLICY_TOOL env var.",
+    ),
+    "dev_tools_security_policy_access": (
+        "it is the toggle governing their own access to tool security policies.",
+        "Change it in the web settings UI (Server Settings tab, Developer "
+        "section) or via the HAMCP_DEV_SECURITY_POLICY_ACCESS env var.",
+    ),
+    "custom_instructions": (
+        "its text is sent to every connected agent as server instructions.",
+        "Change it in the web settings UI (Server Settings tab, Advanced) or "
+        "via the HAMCP_CUSTOM_INSTRUCTIONS env var.",
+    ),
+}
+
+
 def _guard_security_policy_setting(setting: str) -> None:
     """Gate set/reset of the settings that define the dev tools' leash.
 
-    ``dev_tools_security_policy_access`` is refused unconditionally — even
-    with access ON — so the agent can neither grant itself policy access
-    nor revoke it; that toggle belongs to the web settings UI and the env
-    var alone. ``enable_security_policy_tool`` gets the same unconditional
-    refusal: it registers ha_manage_security_policy, which can rewrite the
-    policies gating the agent, and its toggle belongs to the Tool Security
-    Policies tab (issue #2148) — a dev-tools write would reach the same
-    end state as unbuckling the leash, one restart later.
-    ``enable_tool_security_policies`` is the whole gating engine's master
-    switch, so writing it needs access.
+    ``_HUMAN_ONLY_SETTINGS`` are refused even with access ON: the agent may
+    neither grant nor revoke its own policy access, nor register
+    ha_manage_security_policy (#2148; the same end state as unbuckling the
+    leash, one restart later), nor rewrite the text steering every agent.
+    ``enable_tool_security_policies`` is the gating engine's master switch,
+    so writing it needs access.
     """
-    if setting == "enable_security_policy_tool":
+    if setting in _HUMAN_ONLY_SETTINGS:
+        reason, where = _HUMAN_ONLY_SETTINGS[setting]
         raise_tool_error(
             create_error_response(
                 ErrorCode.AUTH_INSUFFICIENT_PERMISSIONS,
-                "'enable_security_policy_tool' cannot be changed by dev "
-                "tools: it registers ha_manage_security_policy, which can "
-                "rewrite the tool security policies gating the agent.",
+                f"'{setting}' cannot be changed by dev tools: {reason}",
                 context={"setting": setting},
-                suggestions=[
-                    "Change it in the web settings UI (Tool Security "
-                    "Policies tab) or via the ENABLE_SECURITY_POLICY_TOOL "
-                    "env var.",
-                ],
-            )
-        )
-    if setting == "dev_tools_security_policy_access":
-        raise_tool_error(
-            create_error_response(
-                ErrorCode.AUTH_INSUFFICIENT_PERMISSIONS,
-                "'dev_tools_security_policy_access' cannot be changed by dev "
-                "tools: it is the toggle governing their own access to tool "
-                "security policies.",
-                context={"setting": setting},
-                suggestions=[
-                    "Change it in the web settings UI (Server Settings tab, "
-                    "Developer section) or via the "
-                    "HAMCP_DEV_SECURITY_POLICY_ACCESS env var.",
-                ],
+                suggestions=[where],
             )
         )
     if setting == "enable_tool_security_policies":
@@ -294,7 +276,7 @@ def _field_prefill(item: dict[str, Any]) -> Any:
     fields carry their value there rather than as a schema ``default`` (a
     ``default`` equal to the value would make the field impossible to clear).
     Falls back to ``default`` then ``value`` for the dropdown/toggle fields.
-    Mirrors ``tools_integrations.options_from_form_flow``.
+    Mirrors ``integration_schema.options_from_form_flow``.
     """
     description = item.get("description")
     if isinstance(description, dict) and description.get("suggested_value") is not None:
@@ -305,7 +287,7 @@ def _field_prefill(item: dict[str, Any]) -> Any:
 async def _fetch_server_entry_via_component(client: Any) -> dict[str, Any] | None:
     """One ``ha_mcp_tools/server_entry`` read; ``None`` ⇒ use the legacy probe.
 
-    Returns the component's ``{entry_id, channel, pip_spec}`` payload —
+    Returns the component's ``{entry_id, pip_spec}`` payload —
     ``entry_id`` is ``None`` when no server entry exists, an AUTHORITATIVE
     verdict the component reaches in-process (its own ``DOMAIN`` entries),
     not a "try the legacy path" signal. Returns ``None`` (⇒ legacy probe) on
@@ -324,7 +306,11 @@ async def _fetch_server_entry_via_component(client: Any) -> dict[str, Any] | Non
     if not component_supports(caps, "server_entry"):
         return None
     try:
-        ws = await get_websocket_client(url=client.base_url, token=client.token)
+        ws = await get_websocket_client(
+            url=client.base_url,
+            token=client.token,
+            verify_ssl=getattr(client, "verify_ssl", None),
+        )
         raw = await ws.send_command(WS_SERVER_ENTRY)
     except (HomeAssistantCommandError, HomeAssistantCommandTimeout) as exc:
         if is_unknown_command(exc):
@@ -332,8 +318,8 @@ async def _fetch_server_entry_via_component(client: Any) -> dict[str, Any] | Non
         else:
             logger.warning("%s failed; fell back to legacy: %r", WS_SERVER_ENTRY, exc)
         return None
-    except Exception as exc:
-        # HomeAssistantConnectionError / plain establish Exception → legacy probe
+    except Exception as exc:  # noqa: BLE001
+        # HomeAssistantConnectionError or any other error → legacy probe
         # (which rides the send_websocket_message bridge).
         logger.warning(
             "%s connection error; falling back to legacy: %r", WS_SERVER_ENTRY, exc
@@ -363,6 +349,32 @@ def _fields_from_flow_schema(flow: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _preserved_flow_overrides(flow: dict[str, Any]) -> dict[str, Any]:
+    """Overrides an open server-entry flow carries stored values for.
+
+    A partial ``update_source`` submit must resend these or it would blank
+    them: an omitted optional field reads as "cleared", not "unchanged". The
+    resend is harvested from ``description.suggested_value`` on the flow's own
+    schema — the clearable text fields, the values ``form_submission`` posts
+    back for a field left out (issue #2254) — rather than a hardcoded key
+    list, so a field added to the
+    component's options flow later cannot be silently wiped here. A toggle or
+    dropdown carries only a schema default (= its current value), never a
+    suggestion, so it drops out naturally; an empty or cleared override carries no
+    resendable value and stays omitted, which is how a cleared field stays
+    cleared.
+    """
+    preserved: dict[str, Any] = {}
+    for item in flow.get("data_schema") or []:
+        if not isinstance(item, dict) or not item.get("name"):
+            continue
+        stored = shown_value(item)
+        if stored is MISSING or stored in (None, ""):
+            continue
+        preserved[str(item["name"])] = stored
+    return preserved
+
+
 async def _open_server_entry_flow(
     client: Any, entry_id: str
 ) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
@@ -370,10 +382,10 @@ async def _open_server_entry_flow(
 
     Builds ``current_options`` from the freshly-opened flow's own schema (via
     ``_fields_from_flow_schema``) rather than the component's narrower
-    ``{channel, pip_spec}`` shape, so callers like ``_update_source`` that
-    resend ``_PRESERVED_OPTION_KEYS`` (``server_url`` / ``external_url`` /
-    ``webhook_id_override`` / ``secret_path_override`` — fields the
-    ``server_entry`` capability does not carry) still see them.
+    ``{entry_id, pip_spec}`` shape, so callers like ``_update_source`` — whose
+    preserved-overrides resend harvests the flow schema itself (``server_url``
+    / ``external_url`` / ``webhook_id_override`` / ``secret_path_override`` —
+    fields the ``server_entry`` capability does not carry) — still see them.
     """
     try:
         flow = await client.start_options_flow(entry_id)
@@ -464,13 +476,8 @@ async def find_server_config_entry(
 
 async def abort_options_flow_quietly(client: Any, flow: dict[str, Any]) -> None:
     """Abort an open options flow, ignoring failures."""
-    flow_id = flow.get("flow_id")
-    if not flow_id:
-        return
-    try:
-        await client.abort_options_flow(flow_id)
-    except Exception as exc:
-        logger.debug("Options-flow abort failed: %s", exc)
+    if flow_id := flow.get("flow_id"):
+        await abort_probe_flow(client.abort_options_flow, flow_id, quiet=True)
 
 
 def schedule_deferred_entry_reload(client: Any, entry_id: str) -> None:
@@ -553,10 +560,10 @@ class DevTools:
     def _settings_rows(self) -> list[dict[str, Any]]:
         """Build the full settings matrix from both registries."""
         from ..config import (
-            _ADVANCED_SETTINGS_BOUNDS,
             _ADVANCED_SETTINGS_CHOICES,
             _ADVANCED_SETTINGS_SENTINELS,
             _FEATURE_FLAG_INT_BOUNDS,
+            ADVANCED_SETTINGS_BOUNDS,
             ADVANCED_SETTINGS_FIELDS,
             FEATURE_FLAG_FIELDS,
             OAUTH_MODE_TOKEN,
@@ -608,12 +615,12 @@ class DevTools:
                 "origin": origin,
                 "editable": registry_editable and origin != "env",
             }
-            bounds = _ADVANCED_SETTINGS_BOUNDS.get(fname)
+            bounds = ADVANCED_SETTINGS_BOUNDS.get(fname)
             if bounds is not None:
                 row["min"], row["max"] = bounds
                 sentinel = _ADVANCED_SETTINGS_SENTINELS.get(fname)
                 if sentinel is not None:
-                    row["min"] = sentinel
+                    row["off_value"] = sentinel
             choices = _ADVANCED_SETTINGS_CHOICES.get(fname)
             if choices is not None:
                 row["choices"] = list(choices)
@@ -797,11 +804,12 @@ class DevTools:
     @tool(
         name="ha_dev_manage_settings",
         tags={"Developer"},
-        annotations={
-            "openWorldHint": False,
-            "title": "Manage Server Settings (dev)",
-            "destructiveHint": True,
-        },
+        annotations=write_hints(
+            "Manage Server Settings (dev)",
+            destructive=True,
+            idempotent=False,
+            open_world=False,
+        ),
     )
     @log_tool_usage
     async def ha_dev_manage_settings(
@@ -861,8 +869,12 @@ class DevTools:
             Field(
                 default=None,
                 description=(
-                    "set_tool: require user approval before every call to this "
-                    "tool (adds/removes an unconditional security-policy rule)"
+                    "set_tool: toggle the tool's unconditional security-policy "
+                    "rule. In a require-approval list gated=true adds it (every "
+                    "call needs approval); in an allow list that rule approves "
+                    "the tool, so gated=true removes it. Conditional rules are "
+                    "left in place and still apply. gated=true is refused while "
+                    "an allow list's unconditional '*' rule approves every tool"
                 ),
             ),
         ] = None,
@@ -873,8 +885,14 @@ class DevTools:
                 default=None,
                 description=(
                     "set_policy: the full policy object "
-                    "{wait_seconds, approval_ttl_minutes, rules, version, "
-                    "schema_version}"
+                    "{rule_effect, wait_seconds, approval_ttl_minutes, "
+                    "event_decisions_enabled, rules, version, "
+                    "schema_version}. Replaces the WHOLE document: a field "
+                    "you omit reverts to its default, so send back an "
+                    "edited copy of get_policy rather than a fragment "
+                    "(omitting event_decisions_enabled switches the "
+                    "event-bus approval channel off; omitting rule_effect "
+                    "while the stored policy is an allow list is refused)"
                 ),
             ),
         ] = None,
@@ -904,10 +922,9 @@ class DevTools:
         """Manage ha-mcp server settings and the Tools/Policies/Backups surfaces (developer mode).
 
         Drives everything the web settings UI can change: the Server
-        Settings matrix (list/set/reset), the Tools tab (enable/disable/pin,
-        LLM-API exposure, and the per-tool security gate), the Tool Security
-        Policies editor (get_policy/set_policy), and the auto-backup config
-        (get_backup_config/set_backup_config). Use ha_dev_manage_server for
+        Settings matrix, the Tools tab, the Tool Security Policies editor,
+        and agent-editable backup config. Snapshot Actions and Backup Read
+        Only are human-only controls. Use ha_dev_manage_server for
         the live approval queue and to restart.
 
         When NOT to use: for HA entity/automation configuration use the
@@ -949,7 +966,7 @@ class DevTools:
             return await self._apply_set_backup_config(backup)
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             exception_to_structured_error(
                 e,
                 context={"action": action, "setting": setting, "tool": tool},
@@ -990,14 +1007,15 @@ class DevTools:
                     f"'setting' is required for action={action!r}",
                 )
             )
-        # set/reset only; 'list' returned above, and reads are never gated.
+        # set/reset only; 'list' returned above, and reads never need
+        # security-policy access.
         _guard_security_policy_setting(setting)
 
         from ..config import (
-            _ADVANCED_SETTINGS_BOUNDS,
             _ADVANCED_SETTINGS_CHOICES,
             _ADVANCED_SETTINGS_SENTINELS,
             _FEATURE_FLAG_INT_BOUNDS,
+            ADVANCED_SETTINGS_BOUNDS,
             ADVANCED_SETTINGS_FIELDS,
             FEATURE_FLAG_FIELDS,
             _read_feature_flag_override_file,
@@ -1021,7 +1039,7 @@ class DevTools:
             overrides = await asyncio.to_thread(_read_feature_flag_override_file)
             origin = self._advanced_origin(setting, env_name, overrides)
             editable = registry_editable and origin != "env"
-            bounds = _ADVANCED_SETTINGS_BOUNDS.get(setting)
+            bounds = ADVANCED_SETTINGS_BOUNDS.get(setting)
             sentinel = _ADVANCED_SETTINGS_SENTINELS.get(setting)
             choices = _ADVANCED_SETTINGS_CHOICES.get(setting)
         else:
@@ -1068,27 +1086,21 @@ class DevTools:
         return load_tool_metadata_cache()
 
     @staticmethod
-    def _gated_tool_names() -> set[str] | None:
-        """Tool names carrying the bare unconditional gate (the Tools-tab toggle).
+    def _load_policy_or_none() -> Any | None:
+        """The stored policy, or ``None`` when ``tool_policy.json`` is unreadable.
 
-        The Tools-tab per-tool gate toggle manages only the bare rule (no
-        predicates); conditional rules are authored in the Policies tab. Keying
-        this on the bare rule keeps the reported toggle state consistent with
-        what set_tool(gated=...) writes.
-
-        Returns ``None`` when ``tool_policy.json`` is unreadable — the caller
-        must surface that (a silent ``set()`` would render every tool
-        ``gated=False``, indistinguishable from a clean no-gates policy, while
-        the sibling actions raise CONFIG_INVALID for the same file).
+        ``None`` must be surfaced by the caller: a silent empty policy would
+        render every tool ``gated=False``, indistinguishable from a clean
+        no-gates policy, while the sibling actions raise CONFIG_INVALID for the
+        same file.
         """
         from ..policy.persistence import load_policy
         from ..utils.data_paths import get_data_dir
 
         try:
-            policy = load_policy(get_data_dir())
+            return load_policy(get_data_dir())
         except ValueError:
             return None
-        return {rule.tool_name for rule in policy.rules if not rule.when}
 
     async def _list_tool_states(self) -> dict[str, Any]:
         """List every tool with its state / LLM-API / gate + lock flags.
@@ -1112,13 +1124,15 @@ class DevTools:
             states.setdefault(name, "pinned")
         env_pinned = env_pinned_tools()
         overrides = load_llm_api_overrides()
-        gated = self._gated_tool_names()
+        from ..policy.model import Policy, bare_rule_gates
+
+        policy = self._load_policy_or_none()
         warnings: list[str] = []
-        if gated is None:
+        if policy is None:
             # Degrade rather than fail the whole listing: states/exposure stay
             # useful for troubleshooting, but the gate column must not read as
             # a clean no-gates policy.
-            gated = set()
+            policy = Policy()
             warnings.append(
                 "tool_policy.json is invalid; 'gated' is reported as false "
                 "for every tool. Call get_policy for the parse error."
@@ -1149,7 +1163,7 @@ class DevTools:
                     ],
                     overrides,
                 ),
-                "gated": t["name"] in gated,
+                "gated": bare_rule_gates(policy, t["name"]),
                 "env_pinned": t["name"] in env_pinned,
                 "mandatory": t["name"] in mandatory,
                 "bps_locked": t["name"] in bps_locked,
@@ -1195,13 +1209,21 @@ class DevTools:
                     "'tool' is required for action='set_tool'",
                 )
             )
+        # The alias middleware dispatches a *call* on a retired tool name, so
+        # the same name arriving as data has to reach the same tool. Without
+        # this the stale-catalog client the alias exists for is told its tool
+        # is unknown — and on the fallback path, where a failed metadata read
+        # skips the unknown-name guard below, the retired name reaches the
+        # writers and set_tool reports a gate it never put in force.
+        tool = current_tool_name(tool)
         if tool == "*":
             raise_tool_error(
                 create_error_response(
                     ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    "tool='*' is a policy wildcard, not a specific tool; it "
-                    "would gate every tool. Use set_policy to author a wildcard "
-                    "rule deliberately.",
+                    "tool='*' is a policy wildcard, not a specific tool; its "
+                    "rule would gate (or, in an allow list, approve) every "
+                    "tool. Use set_policy to author a wildcard rule "
+                    "deliberately.",
                 )
             )
         if not any(v is not None for v in (state, llm_api, gated)):
@@ -1276,6 +1298,7 @@ class DevTools:
         gate_changed); raises ToolError on the first invalid field.
         """
         from ..config import get_global_settings
+        from ..policy.model import bare_rule_gates
         from ..policy.persistence import load_policy
         from ..settings_ui._persistence import env_pinned_tools
         from ..utils.data_paths import get_data_dir
@@ -1306,6 +1329,21 @@ class DevTools:
                     )
                 )
             new_policy, changed = self._apply_gate_to_policy(policy, tool, gate_val)
+            if bare_rule_gates(new_policy, tool) != gate_val:
+                # Only an allow list's bare `*` rule, which approves every
+                # tool, leaves the toggle without effect.
+                raise_tool_error(
+                    create_error_response(
+                        ErrorCode.VALIDATION_INVALID_PARAMETER,
+                        "An unconditional '*' rule in this allow list approves "
+                        f"every tool, so {tool} cannot be gated.",
+                        suggestions=[
+                            "Remove the '*' rule with no conditions first "
+                            "(set_policy, or the Tool Security Policies tab), "
+                            "then retry.",
+                        ],
+                    )
+                )
             plan["gate_val"] = gate_val
             plan["new_policy"] = new_policy
             plan["gate_changed"] = changed
@@ -1371,7 +1409,7 @@ class DevTools:
             return self._commit_gate(plan, data)
         except ToolError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             suffix = (
                 " The state/LLM-API change WAS already saved — re-run set_tool "
                 "with only gated= to finish the gate."
@@ -1390,10 +1428,11 @@ class DevTools:
     def _commit_gate(self, plan: dict[str, Any], data: dict[str, Any]) -> list[str]:
         """Persist the gate portion of a set_tool plan; returns any warnings."""
         from ..config import get_global_settings
+        from ..policy.model import bare_rule_gates
         from ..policy.persistence import load_policy, save_policy
         from ..utils.data_paths import get_data_dir
 
-        data["gated"] = bool(plan["gate_val"])
+        data["gated"] = bare_rule_gates(plan["new_policy"], data["tool"])
         data["policy_rules_changed"] = plan["gate_changed"]
         if plan["gate_changed"]:
             data_dir = get_data_dir()
@@ -1498,16 +1537,19 @@ class DevTools:
         """Return (policy, changed) after adding/removing the bare gate rule.
 
         Pure (no I/O): manages only the bare unconditional rule (when == [])
-        for ``tool``; predicate-bearing rules are preserved.
+        for ``tool``; predicate-bearing rules are preserved. Under an allow
+        list the bare rule approves the tool, so gating removes it.
         """
         from ..policy.model import Rule
 
+        want_bare = gated != (policy.rule_effect == "allow")
         has_bare = any(r.tool_name == tool and not r.when for r in policy.rules)
-        if gated and not has_bare:
+        if want_bare and not has_bare:
             # Insert before the first wildcard rule (mirrors the web UI's
-            # wildcardInsertIndex): find_matching_rule() is first-match, so a
-            # gate appended after a `*` rule would never supply this tool's
-            # remember_minutes / matched_rule.
+            # wildcardInsertIndex): in a require-approval list
+            # find_matching_rule() is first-match, so a gate appended after a
+            # `*` rule would never supply this tool's remember_minutes /
+            # matched_rule. An allow list does not depend on the order.
             rules = list(policy.rules)
             insert_at = next(
                 (i for i, r in enumerate(rules) if r.tool_name == "*"), len(rules)
@@ -1515,7 +1557,7 @@ class DevTools:
             rules.insert(insert_at, Rule(tool_name=tool))
             updated = policy.model_copy(update={"rules": rules})
             return updated, True
-        if not gated and has_bare:
+        if not want_bare and has_bare:
             updated = policy.model_copy(
                 update={
                     "rules": [r for r in policy.rules if r.tool_name != tool or r.when]
@@ -1556,67 +1598,23 @@ class DevTools:
 
     async def _get_backup_config(self) -> dict[str, Any]:
         """Return the auto-backup config fields (shared with the web handler)."""
-        from ..settings_ui._handlers_backups import backup_config_fields
+        from .dev_backup import dev_backup_config_fields
 
         return {
             "success": True,
             "data": {
                 "is_addon": is_running_in_addon(),
-                "fields": backup_config_fields(),
+                "fields": dev_backup_config_fields(),
             },
         }
 
     async def _apply_set_backup_config(
         self, backup: dict[str, Any] | None
     ) -> dict[str, Any]:
-        """Apply auto-backup config changes (same routing as the web UI)."""
-        from ..settings_ui._handlers_backups import (
-            _validate_backup_payload,
-            apply_backup_config,
-        )
+        """Apply backup configuration while preserving human-only controls."""
+        from .dev_backup import apply_dev_backup_config
 
-        if not isinstance(backup, dict):
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_MISSING_PARAMETER,
-                    "'backup' (an object of {field: value}) is required for "
-                    "action='set_backup_config'",
-                    suggestions=[
-                        "Call ha_dev_manage_settings('get_backup_config') for "
-                        "field names"
-                    ],
-                )
-            )
-        clean, err = _validate_backup_payload(backup)
-        if err is not None:
-            raise_tool_error(
-                create_error_response(ErrorCode.VALIDATION_INVALID_PARAMETER, err)
-            )
-        response = await apply_backup_config(self._server, clean)
-        # JSONResponse.body is typed bytes | memoryview; bytes() normalizes both
-        # (no-op for bytes) so json.loads accepts it.
-        body = json.loads(bytes(response.body))
-        if response.status_code >= 400:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.SERVICE_CALL_FAILED,
-                    self._backup_error_message(body),
-                    context={"status": response.status_code, "response": body},
-                )
-            )
-        return {"success": True, "data": body}
-
-    @staticmethod
-    def _backup_error_message(body: Any) -> str:
-        """Pull a human message out of a backup-config error response body."""
-        err = body.get("error") if isinstance(body, dict) else None
-        if isinstance(err, dict):
-            return str(
-                err.get("message") or err.get("code") or "backup config update failed"
-            )
-        if isinstance(err, str):
-            return err
-        return "backup config update failed"
+        return await apply_dev_backup_config(self._server, backup)
 
     async def _apply_setting_reset(
         self, setting: str, env_name: str, origin: str
@@ -1626,7 +1624,7 @@ class DevTools:
         Extracted verbatim from the inline branch: rejects env/addon-managed
         settings, removes any file override, and reports whether one existed.
         """
-        from ..config import _reset_global_settings
+        from ..config import reset_global_settings
 
         if origin == "env":
             raise_tool_error(
@@ -1648,7 +1646,7 @@ class DevTools:
         had_override = origin == "file"
         if had_override:
             await self._merge_file_override({setting: _REMOVE})
-            _reset_global_settings()
+            reset_global_settings()
         return {
             "success": True,
             "data": {
@@ -1678,8 +1676,8 @@ class DevTools:
         """
         from ..config import (
             BETA_FEATURE_FIELDS,
-            _reset_global_settings,
             get_global_settings,
+            reset_global_settings,
         )
 
         if value is None:
@@ -1756,7 +1754,7 @@ class DevTools:
             mode = "addon"
         else:
             await self._merge_file_override({setting: coerced})
-            _reset_global_settings()
+            reset_global_settings()
             mode = "file"
         return {
             "success": True,
@@ -1771,11 +1769,12 @@ class DevTools:
     @tool(
         name="ha_dev_manage_server",
         tags={"Developer"},
-        annotations={
-            "openWorldHint": True,
-            "title": "Manage MCP Server (dev)",
-            "destructiveHint": True,
-        },
+        annotations=write_hints(
+            "Manage MCP Server (dev)",
+            destructive=True,
+            idempotent=False,
+            open_world=True,
+        ),
     )
     @log_tool_usage
     async def ha_dev_manage_server(
@@ -1793,21 +1792,13 @@ class DevTools:
                 description=(
                     "info: deployment/version report; update_source: point the "
                     "ha_mcp_tools component's separate in-process server at a "
-                    "channel or pip spec and reinstall it (never changes the "
-                    "server serving this connection, unless embedded); "
+                    "pip spec (or clear it) and reinstall it; "
                     "restart: restart this server; list_pending: list tool calls "
                     "blocked on a security-policy approval; approve / deny: decide "
                     "one blocked call by token"
                 )
             ),
         ],
-        channel: Annotated[
-            str | None,
-            Field(
-                default=None,
-                description="Release channel for update_source: 'stable' or 'dev'",
-            ),
-        ] = None,
         pip_spec: Annotated[
             str | None,
             Field(
@@ -1815,13 +1806,10 @@ class DevTools:
                 description=(
                     "Explicit pip requirement for update_source — a version pin "
                     "(ha-mcp==7.9.0) or a GitHub tarball URL such as "
-                    "https://github.com/homeassistant-ai/ha-mcp/archive/refs/"
-                    "pull/<PR>/head.tar.gz. The bare name 'clear' "
-                    "(case-insensitive) is reserved: it clears the override "
-                    "and falls back to the release channel instead of being "
-                    "treated as a requirement (pin a specific version, e.g. "
-                    "'clear==2.0.0', if you genuinely need that PyPI "
-                    "package). An empty string also clears but some MCP "
+                    "https://github.com/homeassistant-ai/ha-mcp/archive/refs/pull/<PR>/head.tar.gz."
+                    " The bare name 'clear' (case-insensitive) is reserved: it clears the "
+                    "override and returns to the server the component release pins "
+                    "instead of being treated as a requirement. An empty string also clears but some MCP "
                     "clients mangle it in transit — prefer 'clear'."
                 ),
             ),
@@ -1837,19 +1825,13 @@ class DevTools:
         """Manage the running ha-mcp server itself (developer mode).
 
         When NOT to use: to restart Home Assistant use ha_restart; to
-        update HA add-ons or HACS packages use ha_manage_addon /
-        ha_manage_hacs.
-
-        When to use: development/testing workflows — inspecting how this
-        server is deployed, switching the in-process (custom component)
-        server to another release channel or an arbitrary pip spec such
-        as a PR tarball, and restarting the server so config or code
-        changes take effect.
+        update Home Assistant Apps (add-ons) or HACS packages use
+        ha_manage_app / ha_manage_hacs.
 
         Caveats: update_source changes ONLY the ha_mcp_tools custom
         component's separate in-process server entry — it never updates
-        the add-on, Docker, standalone, or PyPI server that may be
-        serving this connection (update those via ha_manage_addon /
+        the app (add-on), Docker, standalone, or PyPI server that may be
+        serving this connection (update those via ha_manage_app /
         docker pull / pip). In embedded mode that entry IS this server,
         so the update self-interrupts; elsewhere this connection is
         untouched and keeps its current version. Success means the
@@ -1857,24 +1839,15 @@ class DevTools:
         the background, which can take minutes and can still fail
         (check HA logs). update_source requires the component's
         in-process server entry to exist. restart interrupts this MCP
-        connection in embedded and add-on deployments (the reply
+        connection in embedded and app deployments (the reply
         arrives just before the server goes down) and supports those
         two deployments only (standalone processes must be restarted
-        externally). list_pending/approve/deny are exempt from policy
-        gating (gating queue management would deadlock approvals), so
-        approve/deny instead require the separate
-        'dev_tools_security_policy_access' setting — off by default,
-        because gated-call errors carry the approval token and an agent
-        could otherwise self-approve its own gated calls. Dev mode is a
-        trusted-operator feature; leave it off otherwise.
+        externally). approve/deny require the separate
+        'dev_tools_security_policy_access' setting, off by default.
 
         EXAMPLES:
-        ha_dev_manage_server("info")
-        ha_dev_manage_server("update_source", channel="dev")
         ha_dev_manage_server("update_source", pip_spec="https://github.com/homeassistant-ai/ha-mcp/archive/refs/pull/1234/head.tar.gz")
-        ha_dev_manage_server("update_source", pip_spec="clear", channel="stable")
-        ha_dev_manage_server("restart")
-        ha_dev_manage_server("list_pending")
+        ha_dev_manage_server("update_source", pip_spec="clear")
         ha_dev_manage_server("approve", token="abc123")
         """
         try:
@@ -1890,7 +1863,7 @@ class DevTools:
                 # so the caller sees the collapse at the call site.
                 if pip_spec is not None and pip_spec.strip().lower() in ("", "clear"):
                     pip_spec = ""
-                return await self._update_source(channel, pip_spec)
+                return await self._update_source(pip_spec)
             if action == "restart":
                 return await self._restart_server()
             if action == "list_pending":
@@ -1898,10 +1871,10 @@ class DevTools:
             return await self._decide_approval(token, approve=action == "approve")
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             exception_to_structured_error(
                 e,
-                context={"action": action, "channel": channel, "pip_spec": pip_spec},
+                context={"action": action, "pip_spec": pip_spec},
                 suggestions=["Check server and Home Assistant logs for details"],
             )
             return None  # unreachable; explicit for CodeQL
@@ -1909,7 +1882,7 @@ class DevTools:
     async def _server_info(self) -> dict[str, Any]:
         from ..utils.data_paths import get_data_dir
 
-        version = await asyncio.to_thread(get_version)
+        versions, warnings = await asyncio.to_thread(running_version_report)
         if is_embedded():
             mode = "embedded"
         elif is_running_in_addon():
@@ -1917,17 +1890,15 @@ class DevTools:
         else:
             mode = "standalone"
         data: dict[str, Any] = {
-            "server_version": version,
-            "is_dev_build": is_dev_version(version),
+            **versions,
             "deployment_mode": mode,
             "python_version": sys.version.split()[0],
             "data_dir": str(get_data_dir()),
         }
-        warnings: list[str] = []
         try:
             ha_config = await self._client.get_config()
             data["ha_version"] = ha_config.get("version")
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             warnings.append(f"Could not read HA version: {exc}")
         try:
             found = await find_server_config_entry(self._client)
@@ -1938,7 +1909,6 @@ class DevTools:
                 await abort_options_flow_quietly(self._client, flow)
                 data["component_server_entry"] = {
                     "entry_id": entry_id,
-                    "channel": options.get(_OPT_CHANNEL),
                     "pip_spec": options.get(_OPT_PIP_SPEC),
                     "role": (
                         "this server (embedded)"
@@ -1952,7 +1922,7 @@ class DevTools:
                         )
                     ),
                 }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # Best-effort probe: a failure here (including the ToolError the
             # entry discovery raises on a config_entries/get failure) must
             # degrade the info report to a warning, mirroring the HA-version
@@ -1964,30 +1934,21 @@ class DevTools:
         return result
 
     @staticmethod
-    def _validate_update_source_args(channel: str | None, pip_spec: str | None) -> None:
-        """Validate ``update_source``'s channel/pip_spec arguments.
+    def _validate_update_source_args(pip_spec: str | None) -> None:
+        """Validate ``update_source``'s pip_spec argument.
 
-        Extracted verbatim from ``_update_source``: raises a structured
-        ToolError when neither is given, the channel is unknown, or the
-        pip_spec is multi-line / over 500 chars.
+        Raises a structured ToolError when it is missing, multi-line, or over
+        500 chars.
         """
-        if channel is None and pip_spec is None:
+        if pip_spec is None:
             raise_tool_error(
                 create_error_response(
                     ErrorCode.VALIDATION_MISSING_PARAMETER,
-                    "update_source needs 'channel' and/or 'pip_spec'",
+                    "update_source needs 'pip_spec' (a requirement, or 'clear' "
+                    "to return to the server the component release pins)",
                 )
             )
-        if channel is not None and channel not in _VALID_CHANNELS:
-            raise_tool_error(
-                create_error_response(
-                    ErrorCode.VALIDATION_INVALID_PARAMETER,
-                    f"channel must be one of {list(_VALID_CHANNELS)}",
-                )
-            )
-        if pip_spec is not None and (
-            len(pip_spec) > 500 or any(ord(c) < 32 for c in pip_spec)
-        ):
+        if len(pip_spec) > 500 or any(ord(c) < 32 for c in pip_spec):
             raise_tool_error(
                 create_error_response(
                     ErrorCode.VALIDATION_INVALID_PARAMETER,
@@ -1995,10 +1956,8 @@ class DevTools:
                 )
             )
 
-    async def _update_source(
-        self, channel: str | None, pip_spec: str | None
-    ) -> dict[str, Any]:
-        self._validate_update_source_args(channel, pip_spec)
+    async def _update_source(self, pip_spec: str | None) -> dict[str, Any]:
+        self._validate_update_source_args(pip_spec)
 
         if is_embedded():
             # Embedded self-reload: prefer the component's one-hop direct write
@@ -2011,9 +1970,7 @@ class DevTools:
             # Non-embedded deployments never route here — they reload the SEPARATE
             # in-process server entry synchronously and keep this connection, so the
             # collapse buys nothing there.
-            component_result = await self._update_source_via_component(
-                channel, pip_spec
-            )
+            component_result = await self._update_source_via_component(pip_spec)
             if component_result is not None:
                 return component_result
 
@@ -2023,8 +1980,8 @@ class DevTools:
                 create_error_response(
                     ErrorCode.COMPONENT_NOT_INSTALLED,
                     "No ha_mcp_tools in-process server entry found. "
-                    "update_source drives that entry's channel/pip-spec "
-                    "options, so it needs the entry to exist.",
+                    "update_source drives that entry's pip-spec option, so "
+                    "it needs the entry to exist.",
                     suggestions=[
                         "Install the ha_mcp_tools component and add its "
                         + "'server' entry (Settings > Devices & Services)",
@@ -2035,16 +1992,19 @@ class DevTools:
             )
         entry_id, flow, current = found
 
-        # Resend the user's current overrides (see _PRESERVED_OPTION_KEYS) so a
-        # channel/pip-spec change here does not blank them — an omitted optional
-        # field reads as "cleared", not "unchanged".
-        user_input: dict[str, Any] = {
-            key: current[key] for key in _PRESERVED_OPTION_KEYS if current.get(key)
-        }
-        if channel is not None:
-            user_input[_OPT_CHANNEL] = channel
+        user_input: dict[str, Any] = _preserved_flow_overrides(flow)
+        # What goes BACK to the caller is only what the caller asked to change.
+        # user_input also carries every override resent to avoid wiping it, and
+        # the component's options form exposes OPT_OAUTH_CLIENT_SECRET as a
+        # suggested_value — echoing the whole payload would hand that
+        # credential to the MCP client. This probe submits the flow directly
+        # rather than through the step driver, so the flow-schema redaction
+        # path never sees it either. Preserve it in the submission, keep it out of
+        # the response.
+        requested: dict[str, Any] = {}
         if pip_spec is not None:
             user_input[_OPT_PIP_SPEC] = pip_spec
+            requested[_OPT_PIP_SPEC] = pip_spec
         flow_id = flow.get("flow_id")
         if not flow_id:
             raise_tool_error(
@@ -2066,11 +2026,8 @@ class DevTools:
                     "target": (
                         "this server (the embedded ha_mcp_tools in-process entry)"
                     ),
-                    "applying": user_input,
-                    "previous": {
-                        _OPT_CHANNEL: current.get(_OPT_CHANNEL),
-                        _OPT_PIP_SPEC: current.get(_OPT_PIP_SPEC),
-                    },
+                    "applying": requested,
+                    "previous": {_OPT_PIP_SPEC: current.get(_OPT_PIP_SPEC)},
                     "note": (
                         "The in-process server will reinstall and restart "
                         "now; this connection will drop. Reconnect in 1-5 "
@@ -2094,11 +2051,8 @@ class DevTools:
             "data": {
                 "entry_id": entry_id,
                 "target": "ha_mcp_tools in-process server entry",
-                "applied": user_input,
-                "previous": {
-                    _OPT_CHANNEL: current.get(_OPT_CHANNEL),
-                    _OPT_PIP_SPEC: current.get(_OPT_PIP_SPEC),
-                },
+                "applied": requested,
+                "previous": {_OPT_PIP_SPEC: current.get(_OPT_PIP_SPEC)},
                 "note": (
                     "Applied to the ha_mcp_tools component's SEPARATE "
                     "in-process server entry, which is now reinstalling in "
@@ -2111,9 +2065,9 @@ class DevTools:
         }
 
     async def _update_source_via_component(
-        self, channel: str | None, pip_spec: str | None
+        self, pip_spec: str | None
     ) -> dict[str, Any] | None:
-        """Apply the channel/pip_spec delta via the component's direct write.
+        """Apply the pip_spec delta via the component's direct write.
 
         Embedded-only fast path: when the component advertises
         ``server_entry_update``, one ``ha_mcp_tools/server_entry_update`` frame
@@ -2144,7 +2098,7 @@ class DevTools:
                 token=self._client.token,
                 verify_ssl=getattr(self._client, "verify_ssl", None),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             logger.warning(
                 "%s establishment failed; falling back to legacy: %r",
                 WS_SERVER_ENTRY_UPDATE,
@@ -2152,8 +2106,6 @@ class DevTools:
             )
             return None
         deltas: dict[str, Any] = {}
-        if channel is not None:
-            deltas[_OPT_CHANNEL] = channel
         if pip_spec is not None:
             deltas[_OPT_PIP_SPEC] = pip_spec
         try:
@@ -2174,7 +2126,7 @@ class DevTools:
                     exc,
                 )
             return None
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             # HomeAssistantConnectionError (pooled-WS drop) or a plain post-send
             # transport failure. The write is idempotent, so a legacy re-apply is
             # safe (see docstring) — fall back rather than report a phantom error.
@@ -2216,7 +2168,7 @@ class DevTools:
         if result.get("unchanged"):
             data["unchanged"] = True
             data["note"] = (
-                "No change: the requested channel/pip_spec already matches the "
+                "No change: the requested pip_spec already matches the "
                 "current in-process server source."
             )
         else:

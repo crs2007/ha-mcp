@@ -18,10 +18,11 @@ import logging
 from collections.abc import Iterable
 from typing import TYPE_CHECKING, Any, NamedTuple, NotRequired, TypedDict
 
+from ..server_tool_text import SKILL_TOOL_NAME
 from ..transforms import categorize_capability
 
 if TYPE_CHECKING:
-    from fastmcp import FastMCP
+    from ha_mcp._vendor.fastmcp import FastMCP
 
     from ..config import Settings
     from ..server import HomeAssistantSmartMCPServer
@@ -107,7 +108,7 @@ MANDATORY_TOOLS: set[str] = {
 # exclusively through ha_get_skill_guide, so disabling the tool in strict
 # mode would permanently lock out every gated write. Regular
 # (non-strict) mandatory BPS does NOT need the tool: it attaches skill
-# content server-side straight from the skills-vendor (util_helpers.
+# content server-side straight from the skills-vendor (config_write_helpers.
 # build_skill_content), so users who consume the skills through a local
 # install (``npx skills add homeassistant-ai/skills``) may disable the
 # tool whenever strict mode is off. Enforced in three places: here at
@@ -116,7 +117,7 @@ MANDATORY_TOOLS: set[str] = {
 # _save_feature_flags) so each direction of the conflict gets an
 # actionable error.
 BPS_MANDATORY_TOOLS: set[str] = {
-    "ha_get_skill_guide",
+    SKILL_TOOL_NAME,
 }
 
 
@@ -136,6 +137,39 @@ def effective_mandatory_tools(settings: Settings) -> set[str]:
     ):
         return MANDATORY_TOOLS | BPS_MANDATORY_TOOLS
     return set(MANDATORY_TOOLS)
+
+
+def ignored_disabled_tools(config: dict[str, Any], settings: Settings) -> list[str]:
+    """Return mandatory tools whose requested disable state is ignored."""
+    mandatory = effective_mandatory_tools(settings)
+    return sorted(
+        name
+        for name, state in config.get("tools", {}).items()
+        if state == "disabled" and name in mandatory
+    )
+
+
+def mandatory_disable_warning(name: str) -> str:
+    """Explain the ignored request, including the strict BPS dependency."""
+    warning = (
+        f"Ignoring disabled_tools entry '{name}': "
+        "this tool is mandatory and remains enabled."
+    )
+    if name in BPS_MANDATORY_TOOLS:
+        warning += (
+            " Strict best-practices mode (enable_strict_mandatory_bps) is on "
+            "and publishes its acknowledgment key only through it. "
+            "Turn strict mode off first to disable the tool."
+        )
+    return warning
+
+
+def tool_config_warnings(config: dict[str, Any], settings: Settings) -> list[str]:
+    """Share mandatory disable warnings across startup, settings, and reports."""
+    return [
+        mandatory_disable_warning(name)
+        for name in ignored_disabled_tools(config, settings)
+    ]
 
 
 # Tools created by FastMCP transforms (not registered through
@@ -305,12 +339,8 @@ async def _get_tool_metadata(
     for tool in registered:
         tags = sorted(tool.tags) if tool.tags else []
         primary = primary_tag(tags)
-        read_only = bool(
-            tool.annotations and getattr(tool.annotations, "readOnlyHint", None)
-        )
-        destructive = bool(
-            tool.annotations and getattr(tool.annotations, "destructiveHint", None)
-        )
+        read_only = bool(tool.annotations and tool.annotations.read_only_hint)
+        destructive = bool(tool.annotations and tool.annotations.destructive_hint)
         title = getattr(tool, "title", None) or tool.name
         if tool.annotations and getattr(tool.annotations, "title", None):
             title = tool.annotations.title
@@ -404,19 +434,8 @@ def apply_tool_visibility(
         disabled_names.add("ha_config_set_yaml")
 
     mandatory = effective_mandatory_tools(settings)
-    stripped_bps = disabled_names & mandatory & BPS_MANDATORY_TOOLS
-    if stripped_bps:
-        # The save handlers reject this combination, but env seeds and
-        # hand-edited tool_config.json bypass them — keep the tool on and
-        # say why, rather than silently locking out every strict-gated
-        # write (the acknowledgment key is published only through it).
-        logger.warning(
-            "Keeping %s enabled despite a disable entry: strict "
-            "best-practices mode (enable_strict_mandatory_bps) is on and "
-            "publishes its acknowledgment key only through it. Turn "
-            "strict mode off first to disable the tool.",
-            ", ".join(sorted(stripped_bps)),
-        )
+    for warning in tool_config_warnings(config, settings):
+        logger.warning("%s", warning)
     disabled_names -= mandatory
 
     if disabled_names:

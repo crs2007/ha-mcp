@@ -9,8 +9,7 @@ mid-``__anext__`` (``RuntimeError: aclose(): asynchronous generator is
 already running``) and ``loop.close()`` destroyed the survivors ("Task was
 destroyed but it is pending!"), one error pair per entry reload.
 
-Home Assistant and aiohttp are stubbed via ``_embedded_stubs``; the
-``_shutdown_server_resources`` tests use the real ``ha_mcp`` package (which
+The ``shutdown_server_resources`` tests use the real ``ha_mcp`` package (which
 imports neither), monkeypatched at its own module seams.
 """
 
@@ -22,12 +21,7 @@ from collections.abc import AsyncIterator
 from typing import Any
 from unittest.mock import AsyncMock
 
-from ._embedded_stubs import install
-
-# Install stubs before importing the component module (isort barrier).
-install()
-
-import custom_components.ha_mcp_tools.embedded_server as es  # noqa: E402
+import custom_components.ha_mcp_tools.embedded_worker_teardown as wt
 
 
 def _park_reader_and_watcher(
@@ -82,7 +76,7 @@ def test_teardown_cancels_pending_tasks_and_finalizes_generators() -> None:
 
     tasks, events = _park_reader_and_watcher(loop)
 
-    es._teardown_worker_loop(loop)
+    wt.teardown_worker_loop(loop)
 
     assert loop.is_closed()
     assert tasks["reader"].cancelled()
@@ -97,17 +91,17 @@ def test_teardown_with_nothing_pending_still_closes_the_loop() -> None:
     errors: list[dict[str, Any]] = []
     loop.set_exception_handler(lambda _loop, context: errors.append(context))
 
-    es._teardown_worker_loop(loop)
+    wt.teardown_worker_loop(loop)
 
     assert loop.is_closed()
     assert errors == []
 
 
-def test_teardown_survives_a_task_that_raises_on_cancel() -> None:
+def test_teardown_survives_a_task_that_raises_on_cancel(caplog) -> None:
     """A task that turns cancellation into its own error cannot stop teardown.
 
     The raise is reported (never silent) but the loop still finalizes and
-    closes — the per-step guards in ``_teardown_worker_loop`` and the
+    closes — the per-step guards in ``teardown_worker_loop`` and the
     exception sweep in ``_cancel_pending_tasks`` own this.
     """
     loop = asyncio.new_event_loop()
@@ -125,24 +119,32 @@ def test_teardown_survives_a_task_that_raises_on_cancel() -> None:
 
     tasks = loop.run_until_complete(start())
 
-    es._teardown_worker_loop(loop)
+    with caplog.at_level(logging.WARNING, logger=wt.__name__):
+        wt.teardown_worker_loop(loop)
 
     assert loop.is_closed()
     assert tasks["defiant"].done()
     assert isinstance(tasks["defiant"].exception(), RuntimeError)
+    assert "cleanup went sideways" in caplog.text
+
+
+def drop_destroyed_pending(
+    loop: asyncio.AbstractEventLoop, context: dict[str, Any]
+) -> None:
+    if context.get("message") != "Task was destroyed but it is pending!":
+        loop.default_exception_handler(context)
 
 
 def test_teardown_bounds_a_task_that_ignores_cancellation(monkeypatch, caplog) -> None:
     """A task that swallows cancellation is logged and abandoned, not joined.
 
     ``async_stop`` joins the worker thread for a fixed deadline, so the sweep
-    must give up on stragglers after ``_TEARDOWN_TIMEOUT_SECONDS``. Against an
+    must give up on stragglers after ``TEARDOWN_TIMEOUT_SECONDS``. Against an
     unbounded sweep this test does not fail an assertion — it hangs until the
     suite's timeout kills it, which is exactly the production hang it pins.
     """
-    monkeypatch.setattr(es, "_TEARDOWN_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(wt, "TEARDOWN_TIMEOUT_SECONDS", 0.1)
     loop = asyncio.new_event_loop()
-
     tasks: dict[str, asyncio.Task[Any]] = {}
 
     async def stubborn() -> None:
@@ -158,17 +160,17 @@ def test_teardown_bounds_a_task_that_ignores_cancellation(monkeypatch, caplog) -
 
     loop.run_until_complete(start())
 
-    with caplog.at_level(logging.WARNING, logger=es._LOGGER.name):
-        es._teardown_worker_loop(loop)
+    with caplog.at_level(logging.WARNING, logger=wt.__name__):
+        wt.teardown_worker_loop(loop)
+    # The abandoned task stays pending by design. When it is collected, asyncio
+    # reports "Task was destroyed but it is pending!" (the exact signature this
+    # fix removes from production) through the closed loop's handler; that one
+    # message is expected here, anything else is still reported.
+    loop.set_exception_handler(drop_destroyed_pending)
 
     assert loop.is_closed()
     assert not tasks["stubborn"].done()
     assert "ignored cancellation during worker-loop teardown" in caplog.text
-
-    # The abandoned task stays pending by design; silence asyncio's "Task
-    # was destroyed but it is pending!" destroy log — the exact signature
-    # this fix removes from production — when the reference is collected.
-    tasks["stubborn"]._log_destroy_pending = False
 
 
 async def test_shutdown_server_resources_runs_every_step(monkeypatch) -> None:
@@ -183,7 +185,7 @@ async def test_shutdown_server_resources_runs_every_step(monkeypatch) -> None:
 
     server = AsyncMock(name="server")
 
-    await es._shutdown_server_resources(server)
+    await wt.shutdown_server_resources(server)
 
     stop_listener.assert_awaited_once()
     pool_disconnect.assert_awaited_once()
@@ -205,7 +207,7 @@ async def test_shutdown_server_resources_bounded_abandons_a_swallowing_hang(
     import ha_mcp.client.websocket_client as ws_client
     import ha_mcp.client.websocket_listener as ws_listener
 
-    monkeypatch.setattr(es, "_TEARDOWN_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(wt, "TEARDOWN_TIMEOUT_SECONDS", 0.05)
     monkeypatch.setattr(ws_client.websocket_manager, "disconnect", AsyncMock())
     release = asyncio.Event()
     cancellation_seen = asyncio.Event()
@@ -225,8 +227,8 @@ async def test_shutdown_server_resources_bounded_abandons_a_swallowing_hang(
     monkeypatch.setattr(ws_listener, "stop_websocket_listener", swallowing_hang)
 
     try:
-        with caplog.at_level(logging.WARNING, logger=es._LOGGER.name):
-            await es._shutdown_server_resources_bounded(AsyncMock(name="server"))
+        with caplog.at_level(logging.WARNING, logger=wt.__name__):
+            await wt.shutdown_server_resources_bounded(AsyncMock(name="server"))
 
         assert "Embedded resource cleanup timed out" in caplog.text
         # The abandon branch cancels before logging; the swallow must have
@@ -255,7 +257,7 @@ async def test_shutdown_server_resources_isolates_step_failures(
 
     server = AsyncMock(name="server")
 
-    await es._shutdown_server_resources(server)
+    await wt.shutdown_server_resources(server)
 
     stop_listener.assert_awaited_once()
     pool_disconnect.assert_awaited_once()

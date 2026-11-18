@@ -2,7 +2,7 @@
 
 ``ha_manage_security_policy`` edits the same ``tool_policy.json`` the
 developer-mode settings tool does, so these mirror the assertions in
-``test_tools_dev.py::TestManagePolicy`` — the two surfaces share
+``test_tools_dev_policy.py`` — the two surfaces share
 ``policy.editing`` and must not drift.
 """
 
@@ -14,8 +14,8 @@ from typing import get_args
 from unittest.mock import MagicMock
 
 import pytest
-from fastmcp.exceptions import ToolError
 
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 from ha_mcp.config import reset_global_settings
 from ha_mcp.tools.tools_security_policy import (
     FEATURE_FLAG,
@@ -195,6 +195,48 @@ class TestManagePolicy:
         assert not queue.is_remembered("ha_call_service", "argshash")
 
 
+class TestEventDecisionsNeedAPersonsPin:
+    """Switching on event-bus decisions is not something a tool may do alone.
+
+    The PIN is the one part of this feature no MCP surface can write, so an
+    agent holding this tool can still not hand itself a decision channel.
+    """
+
+    @pytest.fixture
+    def policy_tools(self):
+        return SecurityPolicyTools(MagicMock(), None)
+
+    async def test_set_enabling_without_a_pin_is_rejected(self, policy_tools):
+        with pytest.raises(ToolError, match="approval PIN"):
+            await policy_tools.ha_manage_security_policy(
+                action="set",
+                policy={"rules": [], "event_decisions_enabled": True},
+            )
+        got = await policy_tools.ha_manage_security_policy(action="get")
+        assert got["data"]["policy"]["event_decisions_enabled"] is False
+
+    async def test_set_enabling_with_a_pin_is_allowed(self, policy_tools):
+        from ha_mcp.policy.decision_pin import set_pin
+
+        set_pin(get_data_dir(), "2468")
+
+        await policy_tools.ha_manage_security_policy(
+            action="set",
+            policy={"rules": [], "event_decisions_enabled": True},
+        )
+        got = await policy_tools.ha_manage_security_policy(action="get")
+        assert got["data"]["policy"]["event_decisions_enabled"] is True
+
+    async def test_get_never_carries_the_pin(self, policy_tools):
+        from ha_mcp.policy.decision_pin import set_pin
+
+        set_pin(get_data_dir(), "2468")
+
+        result = await policy_tools.ha_manage_security_policy(action="get")
+        assert "2468" not in json.dumps(result)
+        assert not [k for k in result["data"]["policy"] if "pin" in k.lower()]
+
+
 class TestMissingRulesGuard:
     """A payload without ``rules`` used to validate (the model defaults it
     to []) and silently delete every approval gate."""
@@ -251,6 +293,51 @@ class TestMissingRulesGuard:
         assert removed, result["warnings"]
         assert "ha_call_service" in removed[0]
         assert "ha_restart" in removed[0]
+
+    async def test_switching_the_event_channel_off_warns(self, policy_tools, tmp_path):
+        """Omitting a field is how a whole-document write closes the channel.
+
+        ``set`` replaces the document, so a caller working from an example
+        that predates ``event_decisions_enabled`` sends no such field, and
+        an omitted field reads as false. Without the warning the channel
+        the user opened closes with a plain success.
+        """
+        from ha_mcp.policy.decision_pin import set_pin
+
+        set_pin(tmp_path, "2468")
+        await policy_tools.ha_manage_security_policy(
+            action="set",
+            policy={"rules": [], "event_decisions_enabled": True, "version": 0},
+        )
+
+        result = await policy_tools.ha_manage_security_policy(
+            action="set", policy={"rules": [], "version": 1}
+        )
+
+        switched_off = [w for w in result["warnings"] if "event_decisions_enabled" in w]
+        assert switched_off, result["warnings"]
+        assert "switched off" in switched_off[0]
+
+    async def test_no_channel_warning_when_the_field_is_kept(
+        self, policy_tools, tmp_path
+    ):
+        """The control: a write that keeps the channel on says nothing."""
+        from ha_mcp.policy.decision_pin import set_pin
+
+        set_pin(tmp_path, "2468")
+        await policy_tools.ha_manage_security_policy(
+            action="set",
+            policy={"rules": [], "event_decisions_enabled": True, "version": 0},
+        )
+
+        result = await policy_tools.ha_manage_security_policy(
+            action="set",
+            policy={"rules": [], "event_decisions_enabled": True, "version": 1},
+        )
+
+        assert not [
+            w for w in result.get("warnings", []) if "event_decisions_enabled" in w
+        ]
 
     async def test_no_removal_warning_when_rules_are_kept(self, policy_tools):
         await policy_tools.ha_manage_security_policy(
@@ -419,3 +506,111 @@ class TestCrossSurfaceInterop:
         assert policy["rules"][0]["tool_name"] in {"ha_restart", "ha_call_service"}
         raw = json.loads((get_data_dir() / "tool_policy.json").read_text("utf-8"))
         assert raw["version"] == 2
+
+
+class TestAllowListGuard:
+    """rule_effect defaults to require_approval, so dropping it from a
+    whole-document write would invert a stored allow list (issue #2540)."""
+
+    @pytest.fixture
+    def policy_tools(self):
+        return SecurityPolicyTools(MagicMock(), None)
+
+    async def _store_allow_list(self, policy_tools):
+        await policy_tools.ha_manage_security_policy(
+            action="set",
+            policy={"rule_effect": "allow", "rules": [{"tool_name": "ha_get_state"}]},
+        )
+
+    async def test_omitting_rule_effect_from_an_allow_list_is_rejected(
+        self, policy_tools
+    ):
+        await self._store_allow_list(policy_tools)
+        with pytest.raises(ToolError, match="rule_effect") as exc:
+            await policy_tools.ha_manage_security_policy(
+                action="set", policy={"rules": [{"tool_name": "ha_get_state"}]}
+            )
+        assert "ha_manage_security_policy('get')" in str(exc.value)
+        got = await policy_tools.ha_manage_security_policy(action="get")
+        assert got["data"]["policy"]["rule_effect"] == "allow"
+
+    async def test_omitting_rule_effect_is_fine_for_a_require_approval_list(
+        self, policy_tools
+    ):
+        result = await policy_tools.ha_manage_security_policy(
+            action="set", policy={"rules": []}
+        )
+        assert result["success"] is True
+
+    async def test_switching_back_explicitly_is_allowed_and_warns(self, policy_tools):
+        await self._store_allow_list(policy_tools)
+        result = await policy_tools.ha_manage_security_policy(
+            action="set",
+            policy={
+                "rule_effect": "require_approval",
+                "rules": [{"tool_name": "ha_get_state"}],
+            },
+        )
+        assert any(
+            "switched rule_effect from 'allow' to 'require_approval'" in w
+            for w in result["warnings"]
+        )
+
+    async def test_switching_to_an_allow_list_warns(self, policy_tools):
+        result = await policy_tools.ha_manage_security_policy(
+            action="set", policy={"rule_effect": "allow", "rules": []}
+        )
+        assert any(
+            "switched rule_effect from 'require_approval' to 'allow'" in w
+            and "every other call requires approval" in w
+            for w in result["warnings"]
+        )
+
+    async def test_switching_effect_clears_remember_cache(self):
+        queue = _queue(remembered=True)
+        await SecurityPolicyTools(
+            MagicMock(), SimpleNamespace(approval_queue=queue)
+        ).ha_manage_security_policy(
+            action="set", policy={"rule_effect": "allow", "rules": []}
+        )
+        assert not queue.is_remembered("ha_call_service", "argshash")
+
+    async def test_empty_allow_list_still_warns_while_policies_disabled(
+        self, policy_tools
+    ):
+        # An empty allow list gates every call, so its enforcement state matters.
+        result = await policy_tools.ha_manage_security_policy(
+            action="set", policy={"rule_effect": "allow", "rules": [], "version": 0}
+        )
+        assert any("won't enforce" in w for w in result["warnings"])
+
+    async def test_misspelled_rule_effect_is_rejected(self, policy_tools):
+        # Dropped silently, the typo would store a require-approval list and
+        # turn the intended approvals into gates.
+        with pytest.raises(ToolError, match="rule_efect"):
+            await policy_tools.ha_manage_security_policy(
+                action="set",
+                policy={"rule_efect": "allow", "rules": [{"tool_name": "ha_x"}]},
+            )
+        got = await policy_tools.ha_manage_security_policy(action="get")
+        assert got["data"]["policy"]["rules"] == []
+
+    async def test_adding_an_approving_rule_warns(self, policy_tools):
+        await self._store_allow_list(policy_tools)
+        result = await policy_tools.ha_manage_security_policy(
+            action="set",
+            policy={
+                "rule_effect": "allow",
+                "rules": [{"tool_name": "ha_get_state"}, {"tool_name": "ha_restart"}],
+            },
+        )
+        assert any(
+            "added 1 approving rule(s), covering: ha_restart" in w
+            for w in result["warnings"]
+        )
+
+    async def test_adding_a_gating_rule_does_not_warn(self, policy_tools):
+        result = await policy_tools.ha_manage_security_policy(
+            action="set", policy={"rules": [{"tool_name": "ha_restart"}]}
+        )
+        assert not [w for w in result["warnings"] if "approving rule" in w]

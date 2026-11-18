@@ -15,7 +15,6 @@ from unittest.mock import MagicMock
 
 from ha_mcp.tools.tools_config_dashboards import DashboardConfigTools
 from ha_mcp.tools.tools_dashboard_screenshot import DashboardScreenshotTools
-from ha_mcp.transforms.categorized_search import _categorize_tool
 
 
 def _annotations(method):
@@ -28,24 +27,13 @@ class TestDashboardReadOnlyHints:
         annotations = _annotations(
             DashboardConfigTools(MagicMock()).ha_config_get_dashboard
         )
-        assert annotations.readOnlyHint is True
-        # Guard against re-regression to the #1837 state, which marked the
-        # tool destructiveHint=False instead of read-only.
-        assert annotations.destructiveHint is None
+        # #1837 marked the tool destructiveHint=False instead of read-only.
+        assert annotations.read_only_hint is True
+        assert annotations.destructive_hint is False
 
     def test_get_dashboard_screenshot_is_read_only(self):
         annotations = _annotations(
             DashboardScreenshotTools(MagicMock()).ha_get_dashboard_screenshot
         )
-        assert annotations.readOnlyHint is True
-        assert annotations.destructiveHint is None
-
-    def test_both_tools_categorize_as_read(self):
-        """The categorized tool-search bucketing must classify both as read so
-        a ``ha_call_read_tool`` invocation no longer hard-fails (#1991)."""
-        get_dashboard = DashboardConfigTools(MagicMock()).ha_config_get_dashboard
-        get_screenshot = DashboardScreenshotTools(
-            MagicMock()
-        ).ha_get_dashboard_screenshot
-        assert _categorize_tool(get_dashboard.__fastmcp__) == "read"
-        assert _categorize_tool(get_screenshot.__fastmcp__) == "read"
+        assert annotations.read_only_hint is True
+        assert annotations.destructive_hint is False

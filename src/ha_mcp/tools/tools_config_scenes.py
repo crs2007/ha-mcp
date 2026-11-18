@@ -11,9 +11,10 @@ import asyncio
 import logging
 from typing import Annotated, Any, NoReturn, cast
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
 from pydantic import Field
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import tool
 
 from ..client.rest_client import (
     HomeAssistantAPIError,
@@ -21,7 +22,11 @@ from ..client.rest_client import (
     HomeAssistantConnectionError,
     SceneStorageConfigNotFoundError,
 )
-from ..errors import ErrorCode, create_error_response
+from ..errors import (
+    ErrorCode,
+    create_entity_not_found_error,
+    create_error_response,
+)
 from ..strict_bps import BestPracticeKeyParam
 from ..utils.config_hash import compute_config_hash
 from ..utils.python_sandbox import (
@@ -31,7 +36,19 @@ from ..utils.python_sandbox import (
     safe_execute,
 )
 from .auto_backup import with_auto_backup
+from .coercion import JSON_STRING_COERCION, parse_json_param
 from .component_config_reads import fetch_entity_lookup_via_component
+from .config_helpers.registry import validate_registry_ids
+from .config_write_helpers import (
+    apply_entity_category,
+    attach_skill_content,
+    augment_error_dict_with_skill_content,
+    augment_tool_error_with_skill_content,
+    config_reload_waiter,
+    fetch_entity_category,
+    merge_validation_meta,
+)
+from .entity_registration import resolve_entity_id_after_write
 from .helpers import (
     exception_to_structured_error,
     log_tool_usage,
@@ -39,20 +56,10 @@ from .helpers import (
     register_tool_methods,
     validate_identifier_not_empty,
 )
-from .reference_validator import validate_config_references
-from .tools_config_helpers import validate_registry_ids
-from .util_helpers import (
-    JSON_STRING_COERCION,
-    apply_entity_category,
-    attach_skill_content,
-    augment_error_dict_with_skill_content,
-    augment_tool_error_with_skill_content,
-    fetch_entity_category,
-    merge_validation_meta,
-    parse_json_param,
-    wait_for_entity_registered,
-    wait_for_entity_removed,
-)
+from .reference_validator import validate_config_references as ref_check
+from .scene_discovery import discover_scenes
+from .tool_hints import read_only_hints, write_hints
+from .ws_waiters import verify_entity_removed, wait_for_entity_registered
 
 # No scene-specific reference file exists in home-assistant-best-practices;
 # SKILL.md is the top-level generic best-practice doc covering entity-naming,
@@ -78,8 +85,7 @@ def _raise_scene_not_storage_error(scene_id: str, platform: str | None) -> NoRet
     """
     entity_id = f"scene.{scene_id.removeprefix('scene.')}"
     suggestions = [
-        "Activate it with the scene.turn_on service: "
-        f"ha_call_service('scene', 'turn_on', {{'entity_id': '{entity_id}'}}).",
+        f"Activate it with ha_config_set_scene(scene_id='{entity_id}', activate=True).",
     ]
     if platform and platform != "homeassistant":
         platform_note = (
@@ -109,16 +115,43 @@ def _raise_scene_not_storage_error(scene_id: str, platform: str | None) -> NoRet
     )
 
 
+def _activate_once_reloaded(
+    result: dict[str, Any], reloaded: bool | None, activate: bool, scene_id: str
+) -> bool:
+    """Keep activate after a write only once the scene reload is confirmed.
+
+    Activating before the reload would apply the previous snapshot or hit a
+    scene entity the reload is about to replace.
+    """
+    if not activate or reloaded:
+        return activate
+    result["activated"] = False
+    result.setdefault("warnings", []).append(
+        "Scene was written, but not activated: the scene reload the write "
+        "scheduled could not be confirmed, so the previous snapshot could have "
+        f"been applied. Activate it with ha_config_set_scene(scene_id='{scene_id}', "
+        "activate=True)."
+    )
+    return False
+
+
+def _skip_scene_activation_backup(kwargs: dict[str, Any]) -> bool:
+    """Skip config snapshots for a standalone activation (no config change)."""
+    return (
+        bool(kwargs.get("activate"))
+        and kwargs.get("config") is None
+        and kwargs.get("python_transform") is None
+    )
+
+
 class ConfigSceneTools:
     """Scene configuration management tools for Home Assistant."""
 
     def __init__(self, client: Any) -> None:
         self._client = client
 
-    # Time to wait between the first and second registry-list query when the
-    # scene was just upserted but hasn't yet been indexed. Exposed as a class
-    # attribute so tests can patch it down to ``0`` instead of waiting 200 ms
-    # in suite runs.
+    # Short retry retained for config reads and removals; post-write polling
+    # has its own deadline in entity_registration.
     _RESOLVE_RETRY_DELAY = 0.2
 
     @staticmethod
@@ -133,53 +166,19 @@ class ConfigSceneTools:
     async def _resolve_scene_entity_id(
         self, scene_id: str, *, allow_component: bool = False
     ) -> str:
-        """Resolve a scene's actual entity_id via the entity registry.
+        """Resolve the entity ID for config reads and removals, with one retry.
 
-        Unlike scripts (where ``entity_id == 'script.<storage_key>'``), HA
-        derives a scene's entity_id from the ``name`` field. So a scene
-        upserted with ``scene_id='night_light_led_desk_strip'`` and
-        ``name='LED Desk Strip Night Light'`` lands at entity_id
-        ``scene.led_desk_strip_night_light`` while the storage key (and the
-        unique_id) stays ``night_light_led_desk_strip``.
+        HA derives scene entity IDs from the name; the storage key remains
+        the registry unique_id. Match that key instead of assuming the slug.
+        Accept either a bare key or a key prefixed with ``scene.``.
 
-        Naively assuming ``f"scene.{scene_id}"`` for the wait/category
-        callsites surfaces a false-negative warning ("not yet queryable")
-        whenever a name is supplied. This helper finds the actual entity_id
-        by matching the scene_id to ``unique_id`` in the entity registry.
+        Only removals enable ``allow_component``. Config reads use the legacy
+        registry path to preserve the GET-path invariant documented in
+        ``component_config_reads``. An empty component result is rechecked
+        once; component unavailability falls through to the legacy path.
 
-        On a freshly-upserted scene the registry can lag the storage write
-        by tens to ~200 ms — the first query returns no match and the naive
-        ``scene.{scene_id}`` fallback is then chased by
-        ``wait_for_entity_registered`` to its phantom-404 timeout. Retry
-        the registry list once after a short delay so the post-upsert
-        callsites see the real entity_id instead of trailing the lookup
-        with a phantom (issue #1168 R3 blocker 1).
-
-        When ``allow_component`` (set/remove/post-write call sites only — a
-        config-get must never route through the component, see
-        ``component_config_reads`` and ``TestConfigGetSeam``) AND the component
-        advertises ``entity_lookup``, one in-process
-        ``entity_lookup(unique_id=scene_id, domain="scene")`` frame replaces the
-        whole-registry dump. A hit returns immediately — the in-process read
-        needs no settle. But an EMPTY result right after an upsert can be HA's
-        async entity-registration lag (#1168) rather than a true absence: the
-        in-process read removes the network latency, not the registration lag
-        (the upsert and this resolve are separate round-trips). So an empty
-        result is rechecked ONCE after ``_RESOLVE_RETRY_DELAY`` — the same delay
-        the legacy path uses — before the naive ``scene.{scene_id}`` fallback. If the recheck answers
-        AUTHORITATIVELY (component still available) its verdict is final: a hit is
-        returned, a genuine empty falls to the naive guess. But if the recheck
-        itself returns ``None`` (component went unavailable / errored / downgraded
-        mid-retry) the first empty read is NOT authoritative, so resolution drops
-        to the legacy list+retry path below (its own retry absorbs the same lag)
-        rather than trusting the empty and guessing.
-        The component unavailable / errored ⇒ the legacy list+retry path below
-        runs unchanged; that is the FIRST-read case (issue #1813 Phase 2).
-
-        Accepts a bare ``scene_id`` ("movie_night") or a fully-qualified
-        ``entity_id`` ("scene.movie_night") — the leading ``scene.`` is
-        stripped so callers don't accidentally produce ``scene.scene.movie_night``
-        on fallback. Mirrors ``rest_client.resolve_scene_id`` ergonomics.
+        Post-write waits and categories use ``resolve_entity_id_after_write``:
+        their registration window requires deadline-based polling (#2426).
         """
         scene_id = scene_id.removeprefix("scene.")
         if allow_component:
@@ -197,8 +196,7 @@ class ConfigSceneTools:
         non-authoritative (capability miss, or the recheck went
         unavailable/errored mid-retry), so the caller falls through to the
         legacy registry list+retry path. ``scene_id`` must already have its
-        ``scene.`` prefix stripped; see ``_resolve_scene_entity_id`` for the
-        full lag-vs-absence reasoning.
+        ``scene.`` prefix stripped.
         """
         matches = await fetch_entity_lookup_via_component(
             self._client, scene_id, domain="scene"
@@ -251,7 +249,7 @@ class ConfigSceneTools:
                             "scene."
                         ):
                             return entity_id
-            except (TimeoutError, HomeAssistantAPIError, HomeAssistantConnectionError):
+            except TimeoutError, HomeAssistantAPIError, HomeAssistantConnectionError:
                 # Programming bugs (AttributeError, KeyError, …) propagate; only
                 # genuine HA-API failures fall through to the naive form so the
                 # caller still gets a best-effort entity_id rather than a 500.
@@ -302,37 +300,60 @@ class ConfigSceneTools:
     @tool(
         name="ha_config_get_scene",
         tags={"Scenes"},
-        annotations={
-            "openWorldHint": False,
-            "idempotentHint": True,
-            "readOnlyHint": True,
-            "title": "Get Scene Config",
-        },
+        annotations=read_only_hints("Get or Find Scenes", open_world=False),
     )
     @log_tool_usage
     async def ha_config_get_scene(
         self,
         scene_id: Annotated[
-            str, Field(description="Scene identifier (e.g., 'movie_night')")
-        ],
+            str | None,
+            Field(
+                description="Scene storage ID from listing (e.g. 'movie_night') "
+                "or the scene's entity_id; an entity_id is resolved to the "
+                "storage ID."
+            ),
+        ] = None,
+        query: Annotated[
+            str | None, Field(description="Filter scene names or IDs")
+        ] = None,
+        search_in_config: Annotated[
+            bool,
+            Field(
+                description="Also search full stored scene attribute values within a bounded scan"
+            ),
+        ] = False,
+        limit: Annotated[
+            int, Field(description="Maximum scenes per page", ge=1, le=100)
+        ] = 20,
+        offset: Annotated[int, Field(description="Pagination offset", ge=0)] = 0,
     ) -> dict[str, Any]:
-        """
-        Retrieve Home Assistant scene configuration.
+        """Get a scene's complete configuration, or list and search scenes without scene_id.
 
-        Returns the complete configuration for a scene, including the ``entities``
-        dict and other settings (``name``, ``icon``, ``id``).
+        Use ha_search for cross-domain discovery and dependency searches. For ordinary
+        scene discovery, use this tool and pass a returned scene_id back to retrieve
+        the complete entities dict and config_hash for editing (pass that hash to
+        ha_config_set_scene for python_transform updates).
+
+        Listing returns compact metadata. Integration-managed scenes have no editable
+        storage config or scene_id. Partial content-search results explicitly
+        report unread configs and are not exhaustive.
 
         EXAMPLES:
         - Get scene: ha_config_get_scene("movie_night")
-        - Get scene: ha_config_get_scene("bedroom_dim")
-
-        RELATED TOOLS:
-        - ha_config_set_scene — pass the returned ``config_hash`` for
-          ``python_transform`` updates.
+        - Find scenes: ha_config_get_scene(query="movie")
+        - Find attribute values: ha_config_get_scene(query="rainbow", search_in_config=True)
 
         For detailed scene configuration help, use ha_get_skill_guide.
         """
         try:
+            if scene_id is None:
+                return await discover_scenes(
+                    self._client,
+                    query=query,
+                    search_in_config=search_in_config,
+                    limit=limit,
+                    offset=offset,
+                )
             # Issue #1168 R6 blocker 16: empty ``scene_id`` previously
             # surfaced as ``RESOURCE_NOT_FOUND`` with a misleading
             # `entities`-related suggestion. Pre-flight here so the caller
@@ -345,11 +366,11 @@ class ConfigSceneTools:
                 message="scene_id must not be empty",
                 suggestions=[
                     "Pass a non-empty scene identifier (e.g. 'movie_night')",
-                    "Use ha_search(domain_filter='scene') to find existing scene_ids",
+                    "Call ha_config_get_scene() without scene_id to discover scenes",
                 ],
                 context={"scene_id": scene_id},
             )
-            # Scenes ALWAYS take the legacy path — deliberately no component
+            # Full scene config reads ALWAYS take the legacy path — no component
             # routing here, unlike the automation/script gets. Scenes do not
             # retain their raw storage body in memory: HomeAssistantScene's
             # ``scene_config.states`` holds runtime State OBJECTS built at
@@ -377,10 +398,14 @@ class ConfigSceneTools:
                 e,
                 context={
                     "scene_id": scene_id,
-                    "entity_id": f"scene.{scene_id.removeprefix('scene.')}",
+                    **(
+                        {"entity_id": f"scene.{scene_id.removeprefix('scene.')}"}
+                        if scene_id is not None
+                        else {}
+                    ),
                 },
                 suggestions=[
-                    "Verify scene_id exists using ha_search(domain_filter='scene')",
+                    "Call ha_config_get_scene() without scene_id to discover scenes",
                     "Check Home Assistant connection",
                     "Use ha_get_skill_guide for help",
                 ],
@@ -571,13 +596,18 @@ class ConfigSceneTools:
     @tool(
         name="ha_config_set_scene",
         tags={"Scenes"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "title": "Create or Update Scene",
-        },
+        annotations=write_hints(
+            "Create or Update Scene",
+            destructive=True,
+            idempotent=False,
+            open_world=False,
+        ),
     )
-    @with_auto_backup(domain="scene", id_param="scene_id")
+    @with_auto_backup(
+        domain="scene",
+        id_param="scene_id",
+        skip_fn=_skip_scene_activation_backup,
+    )
     @log_tool_usage
     async def ha_config_set_scene(
         self,
@@ -603,7 +633,6 @@ class ConfigSceneTools:
                 description=(
                     "Python expression to transform existing scene config. "
                     "Mutually exclusive with config. "
-                    "Requires config_hash for validation. "
                     "WARNING: Expressions with infinite loops will hang the server. "
                     "Examples: "
                     "Add entity: python_transform=\"config['entities']['light.bed'] = {'state': 'on'}\" "
@@ -637,12 +666,25 @@ class ConfigSceneTools:
             bool,
             Field(
                 description=(
-                    "Wait for scene to be queryable before returning. Default: True. "
-                    "Set to False for bulk operations."
+                    "Wait for scene to be queryable before returning. Set to False for bulk"
+                    " operations."
                 ),
                 default=True,
             ),
         ] = True,
+        activate: Annotated[
+            bool,
+            Field(
+                description=(
+                    "Activate the scene (scene.turn_on). Alone with scene_id it "
+                    "activates any scene entity, including integration and YAML "
+                    "scenes (pass their entity_id). With config or "
+                    "python_transform it runs after Home Assistant has reloaded "
+                    "scenes from the write."
+                ),
+                default=False,
+            ),
+        ] = False,
         MandatoryBPS: Annotated[
             bool,
             Field(default=True),
@@ -659,24 +701,21 @@ class ConfigSceneTools:
         Supports two modes: full config replacement (``config``) or
         Python transformation of an existing scene (``python_transform``).
         See the field descriptions for ``python_transform`` examples and
-        the ``config`` shape contract.
+        the ``config`` shape contract. Either mode can also take
+        ``activate``, which can be passed alone with ``scene_id`` to activate
+        a scene without touching its config.
 
         WHEN TO USE:
         - ``python_transform``: surgical edits to an existing scene
-          (add/remove/update a single entity entry). Requires ``config_hash``
-          from ha_config_get_scene() for optimistic locking.
+          (add/remove/update a single entity entry).
         - ``config``: creating a new scene, or wholesale replacement.
+        - ``activate`` (with scene_id, no config): activate any scene,
+          e.g. ha_config_set_scene(scene_id="scene.movie_night", activate=True).
 
         WHEN NOT TO USE:
-        - To activate a scene at runtime, use ha_call_service(domain="scene",
-          service="turn_on", target=...) — this tool only manages scene
-          *configuration*, not the runtime turn-on/off side.
-        - To list or look up existing scenes, use
-          ha_search(domain_filter="scene").
+        - To list or look up existing scenes, use ha_config_get_scene.
 
-        SCENE SHAPE: ``entities`` is a dict keyed by entity_id (e.g.,
-        ``{'light.kitchen': {'state': 'on', 'brightness': 200}}``), NOT a
-        list. Automations use a list of actions; scenes capture a snapshot
+        SCENE SHAPE: Automations use a list of actions; scenes capture a snapshot
         of states as a dict.
 
         EXAMPLE:
@@ -727,6 +766,9 @@ class ConfigSceneTools:
                     )
                 )
 
+            if activate and config is None and python_transform is None:
+                return await self._activate_scene_only(scene_id, category, MandatoryBPS)
+
             if python_transform is not None:
                 return await self._run_scene_python_transform(
                     scene_id,
@@ -735,6 +777,7 @@ class ConfigSceneTools:
                     category,
                     wait,
                     MandatoryBPS,
+                    activate=activate,
                 )
 
             if config is None:
@@ -757,6 +800,7 @@ class ConfigSceneTools:
                 category,
                 wait,
                 MandatoryBPS,
+                activate=activate,
             )
 
         except ToolError as te:
@@ -767,7 +811,7 @@ class ConfigSceneTools:
             # config (Hue/vendor or raw-YAML). Same CONFIG_NOT_FOUND
             # classification as get/delete (#1971), not a generic write failure.
             _raise_scene_not_storage_error(e.scene_id, e.platform)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             error = exception_to_structured_error(
                 e,
                 context={"scene_id": scene_id},
@@ -782,6 +826,78 @@ class ConfigSceneTools:
             augment_error_dict_with_skill_content(error, bp_warnings=None)
             raise_tool_error(error)
 
+    async def _activate_scene_only(
+        self, scene_id: str, category: str | None, MandatoryBPS: bool
+    ) -> dict[str, Any]:
+        """Activate an existing scene without touching its config."""
+        if category is not None:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    "category requires a config update",
+                    suggestions=[
+                        "Pass config or python_transform when assigning a category",
+                        "Omit category to only activate the scene",
+                    ],
+                    context={"action": "activate", "category": category},
+                )
+            )
+        # Integration and YAML scenes have no storage key, so an entity_id is
+        # taken as-is; a bare key goes through the registry like other reads.
+        entity_id = (
+            scene_id
+            if scene_id.startswith("scene.")
+            else await self._resolve_scene_entity_id(scene_id)
+        )
+        # HA's scene.turn_on is a silent no-op on an unknown entity.
+        try:
+            await self._client.get_entity_state(entity_id)
+        except HomeAssistantAPIError as e:
+            if e.status_code == 404:
+                raise_tool_error(create_entity_not_found_error(entity_id))
+            raise
+        response: dict[str, Any] = {
+            "success": True,
+            "action": "activate",
+            "scene_id": scene_id,
+            "entity_id": entity_id,
+        }
+        await self._activate_scene(response, entity_id, standalone=True)
+        attach_skill_content(
+            response,
+            MandatoryBPS=MandatoryBPS,
+            canonical_files=_SCENE_SKILL_FILES,
+            referenced_files=None,
+        )
+        return response
+
+    async def _activate_scene(
+        self, response: dict[str, Any], entity_id: str, *, standalone: bool
+    ) -> None:
+        """Call scene.turn_on; raise when standalone, warn after a config write."""
+        try:
+            await self._client.call_service(
+                "scene", "turn_on", {"entity_id": entity_id}
+            )
+        except (
+            HomeAssistantAPIError,
+            HomeAssistantAuthError,
+            HomeAssistantConnectionError,
+        ) as exc:
+            if standalone:
+                exception_to_structured_error(
+                    exc, context={"action": "activate", "entity_id": entity_id}
+                )
+            logger.warning(
+                "Scene %s not activated after config write: %s", entity_id, exc
+            )
+            response["activated"] = False
+            response.setdefault("warnings", []).append(
+                f"Scene config was written, but the scene could not be activated: {exc}"
+            )
+            return
+        response["activated"] = True
+
     async def _run_scene_python_transform(
         self,
         scene_id: str,
@@ -790,6 +906,8 @@ class ConfigSceneTools:
         category: str | None,
         wait: bool,
         MandatoryBPS: bool,
+        *,
+        activate: bool = False,
     ) -> dict[str, Any]:
         """Execute ``ha_config_set_scene``'s python_transform mode.
 
@@ -852,9 +970,16 @@ class ConfigSceneTools:
         # ``resolved_id`` is the storage key (write target); ``scene_id``
         # stays the caller id so a missing ``name`` defaults caller-facing
         # rather than to the storage key (#1935).
-        result = await self._client.upsert_scene_config(
-            transformed_config, scene_id, resolved_id=resolved_id
-        )
+        references = await ref_check(self._client, transformed_config, "scene")
+        # Scene writes reload every scene; activation has to follow that reload.
+        async with config_reload_waiter(
+            self._client, "scene_reloaded", enabled=activate
+        ) as wait_for_reload:
+            result = await self._client.upsert_scene_config(
+                transformed_config, scene_id, resolved_id=resolved_id
+            )
+            reloaded = await wait_for_reload()
+        activate = _activate_once_reloaded(result, reloaded, activate, scene_id)
         # The upsert re-resolves when ``resolved_id`` was None (envelope
         # omitted the key); re-bind to the authoritative write target it
         # returned so the re-fetch, entity resolution, and response all
@@ -871,8 +996,10 @@ class ConfigSceneTools:
         # post-upsert finalisation the full-config branch runs. Without
         # these, ``wait`` and ``category`` are silently dropped on
         # python_transform calls.
-        entity_id = await self._resolve_scene_entity_id(
-            resolved_id, allow_component=True
+        entity_id = (
+            await resolve_entity_id_after_write(self._client, resolved_id, "scene")
+            if wait or category or activate
+            else f"scene.{resolved_id}"
         )
         if wait:
             try:
@@ -897,6 +1024,8 @@ class ConfigSceneTools:
                 result,
                 "scene",
             )
+        if activate:
+            await self._activate_scene(result, entity_id, standalone=False)
 
         # Issue #1168 R3 blocker 6: build the response from
         # ``resolved_id`` directly (not the caller-input ``scene_id``)
@@ -913,6 +1042,7 @@ class ConfigSceneTools:
             "python_expression": python_transform,
             "message": f"Scene {resolved_id} updated via Python transform",
         }
+        merge_validation_meta(response, references)
         attach_skill_content(
             response,
             MandatoryBPS=MandatoryBPS,
@@ -985,27 +1115,15 @@ class ConfigSceneTools:
                 )
             )
 
-        # Issue #1168 R5 blocker 10: a transform that mutates
-        # ``config['id']`` produces a duplicate scene at the new
-        # storage key AND orphans the original (state goes
-        # ``unavailable``, registry row left behind). HA itself
-        # accepts the mismatched-id upsert silently. Reject the
-        # rename here — renaming a scene means delete-old +
-        # create-new through the explicit tools, not an in-place
-        # ``id`` rebind. R6 blocker 18: only reject an explicit
-        # mismatched id; a transform that ``del config['id']`` is
-        # legitimate (HA treats ``id`` as optional) and should pass
-        # through. R7 blocker 24: ``transformed_config["id"] = None``
-        # is the in-place equivalent of ``del`` — normalise both
-        # by checking against ``(None, original_id)``, so only an
-        # explicit non-None mismatch triggers the reject. Compare against
-        # the scene's own captured ``id`` (not ``resolved_id``, which may
-        # be None on the structural-invariant path) — in production the
-        # two are equal.
-        if "id" in transformed_config and transformed_config["id"] not in (
-            None,
-            original_id,
-        ):
+        # A transform that changes ``config['id']`` would leave a duplicate
+        # scene under the new key and orphan the original (#1168): Core accepts
+        # the upsert. Renaming is remove + create through the tools. Dropping
+        # the id is no rename: ``id`` is optional, and ``None`` means the same
+        # as ``del`` but Core refuses it, so it is removed. Compared with the
+        # scene's own ``id``; ``resolved_id`` can be None.
+        if transformed_config.get("id", original_id) is None:
+            del transformed_config["id"]
+        if "id" in transformed_config and transformed_config["id"] != original_id:
             raise_tool_error(
                 create_error_response(
                     ErrorCode.VALIDATION_FAILED,
@@ -1062,6 +1180,8 @@ class ConfigSceneTools:
         category: str | None,
         wait: bool,
         MandatoryBPS: bool,
+        *,
+        activate: bool = False,
     ) -> dict[str, Any]:
         """Execute ``ha_config_set_scene``'s full-config replacement mode.
 
@@ -1131,18 +1251,21 @@ class ConfigSceneTools:
             ):
                 await self._client.get_scene_config(scene_id, resolution=resolution)
 
-        # Cross-check literal service and entity references against the
-        # live registries. Soft warnings only.
-        validation_meta = await validate_config_references(self._client, config_dict)
-
+        references = await ref_check(self._client, config_dict, "scene")
         # ``resolved_id`` is already the storage key (from the hash-verify
         # fetch or the resolve above) — pass it as the write target to skip
         # the redundant re-resolve. ``scene_id`` stays the caller id so a
         # missing ``name`` defaults caller-facing, not to the storage key
         # (#1935).
-        result = await self._client.upsert_scene_config(
-            config_dict, scene_id, resolved_id=resolved_id
-        )
+        # Scene writes reload every scene; activation has to follow that reload.
+        async with config_reload_waiter(
+            self._client, "scene_reloaded", enabled=activate
+        ) as wait_for_reload:
+            result = await self._client.upsert_scene_config(
+                config_dict, scene_id, resolved_id=resolved_id
+            )
+            reloaded = await wait_for_reload()
+        activate = _activate_once_reloaded(result, reloaded, activate, scene_id)
         # The upsert re-resolves when ``resolved_id`` was None (envelope
         # omitted the key); re-bind to the authoritative write target it
         # returned so entity resolution and the response use the resolved
@@ -1152,8 +1275,10 @@ class ConfigSceneTools:
         # Resolve actual entity_id via registry — HA derives scene
         # entity_ids from the 'name' slug, not the scene_id storage key,
         # so f"scene.{scene_id}" is wrong whenever a name is supplied.
-        entity_id = await self._resolve_scene_entity_id(
-            resolved_id, allow_component=True
+        entity_id = (
+            await resolve_entity_id_after_write(self._client, resolved_id, "scene")
+            if wait or effective_category or activate
+            else f"scene.{resolved_id}"
         )
 
         # Wait for scene to be queryable
@@ -1182,8 +1307,10 @@ class ConfigSceneTools:
                 result,
                 "scene",
             )
+        if activate:
+            await self._activate_scene(result, entity_id, standalone=False)
 
-        merge_validation_meta(result, validation_meta)
+        merge_validation_meta(result, references)
 
         # Issue #1168 R3 blocker 6: build response from ``resolved_id``
         # so the outer ``scene_id`` always matches the storage key.
@@ -1197,7 +1324,7 @@ class ConfigSceneTools:
         }
         # attach AFTER the outer dict is built so hint lands at
         # position 0 of the FINAL response (see
-        # util_helpers._SKILL_CONTENT_OPTOUT_HINT).
+        # config_write_helpers._SKILL_CONTENT_OPTOUT_HINT).
         attach_skill_content(
             response,
             MandatoryBPS=MandatoryBPS,
@@ -1209,12 +1336,9 @@ class ConfigSceneTools:
     @tool(
         name="ha_config_remove_scene",
         tags={"Scenes"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "idempotentHint": True,
-            "title": "Remove Scene",
-        },
+        annotations=write_hints(
+            "Remove Scene", destructive=True, idempotent=True, open_world=False
+        ),
     )
     @with_auto_backup(domain="scene", id_param="scene_id")
     @log_tool_usage
@@ -1226,26 +1350,21 @@ class ConfigSceneTools:
         wait: Annotated[
             bool,
             Field(
-                description="Wait for scene to be fully removed before returning. Default: True.",
+                description="Wait for scene to be fully removed before returning.",
                 default=True,
             ),
         ] = True,
     ) -> dict[str, Any]:
-        """
-        Delete a Home Assistant scene.
+        """Delete a Home Assistant scene.
 
-        EXAMPLES:
-        - Delete scene: ha_config_remove_scene("old_scene")
-        - Delete scene: ha_config_remove_scene("temporary_scene")
+        EXAMPLE: ha_config_remove_scene("old_scene")
 
-        **IMPORTANT LIMITATION:**
-        This tool can only delete scenes created via the Home Assistant UI.
-        Scenes defined in YAML configuration files (scenes.yaml or configuration.yaml)
-        cannot be deleted through the API and will return a 405 Method Not Allowed error.
+        Only scenes created via the Home Assistant UI can be deleted. Scenes
+        defined in YAML configuration files (scenes.yaml or configuration.yaml)
+        cannot be deleted through the API and return a 405 Method Not Allowed
+        error; edit the configuration file directly instead.
 
-        To remove YAML-defined scenes, you must edit the configuration file directly.
-
-        **WARNING:** Deleting a scene that is referenced by automations or scripts
+        WARNING: Deleting a scene that is referenced by automations or scripts
         (via ``scene.turn_on``) may cause those to fail.
         """
         try:
@@ -1290,16 +1409,7 @@ class ConfigSceneTools:
             )
 
             if wait:
-                try:
-                    removed = await wait_for_entity_removed(self._client, entity_id)
-                    if not removed:
-                        result.setdefault("warnings", []).append(
-                            f"Deletion confirmed by API but {entity_id} may still appear briefly."
-                        )
-                except (HomeAssistantConnectionError, HomeAssistantAuthError) as e:
-                    result.setdefault("warnings", []).append(
-                        f"Deletion confirmed but removal verification failed: {e}"
-                    )
+                await verify_entity_removed(self._client, entity_id, result)
 
             return {
                 "success": True,

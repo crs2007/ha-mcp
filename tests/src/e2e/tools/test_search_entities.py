@@ -10,7 +10,12 @@ import uuid
 
 import pytest
 
-from ..utilities.assertions import assert_mcp_success, parse_mcp_result, safe_call_tool
+from ..utilities.assertions import (
+    MCPAssertions,
+    assert_mcp_success,
+    parse_mcp_result,
+    safe_call_tool,
+)
 from ..utilities.wait_helpers import wait_for_tool_result
 
 logger = logging.getLogger(__name__)
@@ -365,31 +370,6 @@ async def test_search_entities_multiple_domains(mcp_client):
 
 
 @pytest.mark.asyncio
-async def test_search_entities_successful_fuzzy_search_no_warning(mcp_client):
-    """Test that successful fuzzy search returns no warning or partial flag.
-
-    Issue #214: Normal fuzzy search should work without fallback indicators.
-    """
-    logger.info("Testing successful fuzzy search has no fallback indicators")
-
-    result = await mcp_client.call_tool(
-        "ha_search",
-        {"query": "light", "limit": 5, "exact_match": False},
-    )
-    data = assert_mcp_success(result, "Fuzzy search success")
-
-    assert data.get("success") is True
-    assert data.get("search_type") == "fuzzy_search"
-    # Normal fuzzy search should NOT have warning or partial flag
-    assert not data.get("warnings"), f"Unexpected warnings: {data.get('warnings')}"
-    assert "partial" not in data or data.get("partial") is not True
-    # Strong matches should not include suggestions
-    assert "suggestions" not in data, "Strong matches should not include suggestions"
-
-    logger.info("Fuzzy search succeeded without fallback indicators")
-
-
-@pytest.mark.asyncio
 async def test_search_entities_response_structure_issue_214(mcp_client):
     """Test that search response has the expected structure from issue #214.
 
@@ -634,7 +614,7 @@ async def test_ha_search_combined_surface_populated(mcp_client):
                 "ha_config_remove_automation",
                 {"entity_id": "automation.combined_surface_fixture"},
             )
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.debug("Cleanup of combined-surface fixture failed: %s", e)
 
 
@@ -771,9 +751,7 @@ async def area_with_mixed_domains(mcp_client):
             "helper_type": "input_number",
             "name": f"e2e 1162 num {suffix}",
             "area_id": area_id,
-            "min_value": 0,
-            "max_value": 10,
-            "step": 1,
+            "config": {"min": 0, "max": 10, "step": 1},
         },
     )
     number_data = assert_mcp_success(number_result, "Create input_number")
@@ -814,13 +792,13 @@ async def area_with_mixed_domains(mcp_client):
                     "confirm": True,
                 },
             )
-        except Exception as exc:  # pragma: no cover — cleanup best-effort
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover — cleanup best-effort
             logger.warning(f"Cleanup failed for {entity_id}: {exc}")
     try:
         await mcp_client.call_tool(
             "ha_remove_area_or_floor", {"kind": "area", "id": area_id}
         )
-    except Exception as exc:  # pragma: no cover — cleanup best-effort
+    except Exception as exc:  # pragma: no cover — cleanup best-effort  # noqa: BLE001
         logger.warning(f"Cleanup failed for area {area_id}: {exc}")
 
 
@@ -1118,7 +1096,7 @@ async def two_areas_fuzzy_match(mcp_client):
                     "ha_remove_helpers_integrations",
                     {"target": oid, "helper_type": kind, "confirm": True},
                 )
-        except Exception as exc:  # pragma: no cover — cleanup best-effort
+        except Exception as exc:  # noqa: BLE001  # pragma: no cover — cleanup best-effort
             logger.warning(f"Cleanup failed for {kind} {oid}: {exc}")
 
 
@@ -1291,13 +1269,13 @@ async def populated_area_for_shape_test(mcp_client):
             "ha_remove_helpers_integrations",
             {"target": boolean_id, "helper_type": "input_boolean", "confirm": True},
         )
-    except Exception as exc:  # pragma: no cover — cleanup best-effort
+    except Exception as exc:  # pragma: no cover — cleanup best-effort  # noqa: BLE001
         logger.warning(f"Cleanup of {boolean_id} failed: {exc}")
     try:
         await mcp_client.call_tool(
             "ha_remove_area_or_floor", {"kind": "area", "id": area_id}
         )
-    except Exception as exc:  # pragma: no cover — cleanup best-effort
+    except Exception as exc:  # pragma: no cover — cleanup best-effort  # noqa: BLE001
         logger.warning(f"Cleanup of area {area_id} failed: {exc}")
 
 
@@ -1503,14 +1481,14 @@ async def two_areas_with_shared_prefix(mcp_client):
                 "ha_remove_helpers_integrations",
                 {"target": h, "helper_type": "input_boolean", "confirm": True},
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover  # noqa: BLE001
             logger.warning(f"Cleanup of {h} failed: {exc}")
     for area in areas:
         try:
             await mcp_client.call_tool(
                 "ha_remove_area_or_floor", {"kind": "area", "id": area}
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover  # noqa: BLE001
             logger.warning(f"Cleanup of area {area} failed: {exc}")
 
 
@@ -1611,7 +1589,7 @@ async def helper_with_alias(mcp_client):
             "ha_remove_helpers_integrations",
             {"target": eid, "helper_type": "input_boolean", "confirm": True},
         )
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover  # noqa: BLE001
         logger.warning(f"Cleanup of {eid} failed: {exc}")
 
 
@@ -1682,13 +1660,13 @@ async def area_with_alias(mcp_client):
                 "ha_remove_helpers_integrations",
                 {"target": eid, "helper_type": "input_boolean", "confirm": True},
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover  # noqa: BLE001
             logger.warning(f"Cleanup of {eid} failed: {exc}")
         try:
             await mcp_client.call_tool(
                 "ha_remove_area_or_floor", {"kind": "area", "id": area_id}
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover  # noqa: BLE001
             logger.warning(f"Cleanup of area {area_id} failed: {exc}")
 
 
@@ -1754,7 +1732,7 @@ async def hidden_helper(mcp_client):
             "ha_remove_helpers_integrations",
             {"target": eid, "helper_type": "input_boolean", "confirm": True},
         )
-    except Exception as exc:  # pragma: no cover
+    except Exception as exc:  # pragma: no cover  # noqa: BLE001
         logger.warning(f"Cleanup of {eid} failed: {exc}")
 
 
@@ -1816,7 +1794,7 @@ async def test_search_fuzzy_mode_penalises_hidden_issue_1170(mcp_client, hidden_
     """Fuzzy mode applies the same hidden-score penalty.
 
     Default-True ``exact_match`` and the fuzzy path are SEPARATE code
-    paths in tools_search.py — substring matching vs ``smart_entity_search``
+    paths in search/modes.py — substring matching vs ``smart_entity_search``
     (BM25). Both must apply the penalty or one path silently regresses
     while the other test passes.
     """
@@ -1930,13 +1908,13 @@ async def test_search_area_only_penalises_hidden_issue_1170(mcp_client):
                 "ha_remove_helpers_integrations",
                 {"target": eid, "helper_type": "input_boolean", "confirm": True},
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover  # noqa: BLE001
             logger.warning(f"Cleanup of {eid} failed: {exc}")
         try:
             await mcp_client.call_tool(
                 "ha_remove_area_or_floor", {"kind": "area", "id": area_id}
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover  # noqa: BLE001
             logger.warning(f"Cleanup of area {area_id} failed: {exc}")
 
 
@@ -2042,13 +2020,13 @@ async def test_search_area_filtered_query_penalises_hidden_issue_1170(mcp_client
                         "confirm": True,
                     },
                 )
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:  # pragma: no cover  # noqa: BLE001
                 logger.warning(f"Cleanup of {eid} failed: {exc}")
         try:
             await mcp_client.call_tool(
                 "ha_remove_area_or_floor", {"kind": "area", "id": area_id}
             )
-        except Exception as exc:  # pragma: no cover
+        except Exception as exc:  # pragma: no cover  # noqa: BLE001
             logger.warning(f"Cleanup of area {area_id} failed: {exc}")
 
 
@@ -2124,7 +2102,7 @@ async def test_search_domain_listing_penalises_hidden_issue_1170(mcp_client):
                         "confirm": True,
                     },
                 )
-            except Exception as exc:  # pragma: no cover
+            except Exception as exc:  # pragma: no cover  # noqa: BLE001
                 logger.warning(f"Cleanup of {eid} failed: {exc}")
 
 
@@ -2192,7 +2170,7 @@ class TestSearchEntitiesSeededAreasIssue1170:
                     await mcp_client.call_tool(
                         "ha_set_entity", {"entity_id": eid, "area_id": area_id}
                     )
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001
                     pytest.skip(f"Seed entity {eid} unavailable: {exc}")
             # Wait until all 4 are visible in the bedroom area
             expected = {eid for eid, _ in self.SEED_ASSIGNMENTS}
@@ -2219,7 +2197,7 @@ class TestSearchEntitiesSeededAreasIssue1170:
                     await mcp_client.call_tool(
                         "ha_set_entity", {"entity_id": eid, "area_id": ""}
                     )
-                except Exception as exc:  # pragma: no cover — cleanup best-effort
+                except Exception as exc:  # noqa: BLE001  # pragma: no cover — cleanup best-effort
                     logger.warning(
                         f"Cleanup of area assignment for {eid} failed: {exc}"
                     )
@@ -2293,3 +2271,54 @@ class TestSearchEntitiesSeededAreasIssue1170:
         assert len(data2["entities"]) >= 2, (
             f"page 2 should have at least the remaining entities: {data2}"
         )
+
+
+@pytest.fixture
+async def floor_with_two_areas(mcp_client):
+    """Create a floor with two empty areas for exact-floor expansion testing."""
+    suffix = uuid.uuid4().hex[:8]
+    floor_name = f"e2e floor {suffix}"
+    async with MCPAssertions(mcp_client) as mcp:
+        floor_data = await mcp.call_tool_success(
+            "ha_set_area_or_floor",
+            {"kind": "floor", "name": floor_name, "level": 7},
+        )
+    floor_id = floor_data["floor_id"]
+    area_ids: list[str] = []
+    area_names = [f"e2e floor room A {suffix}", f"e2e floor room B {suffix}"]
+    try:
+        for area_name in area_names:
+            async with MCPAssertions(mcp_client) as mcp:
+                area_data = await mcp.call_tool_success(
+                    "ha_set_area_or_floor",
+                    {"kind": "area", "name": area_name, "floor_id": floor_id},
+                )
+            area_ids.append(area_data["area_id"])
+        yield {"floor_name": floor_name, "area_names": area_names}
+    finally:
+        for area_id in area_ids:
+            await safe_call_tool(
+                mcp_client,
+                "ha_remove_area_or_floor",
+                {"kind": "area", "id": area_id},
+            )
+        await safe_call_tool(
+            mcp_client,
+            "ha_remove_area_or_floor",
+            {"kind": "floor", "id": floor_id},
+        )
+
+
+@pytest.mark.asyncio
+async def test_exact_floor_filter_expands_to_all_floor_areas(
+    mcp_client, floor_with_two_areas
+):
+    """An exact floor name expands through the public ha_search tool."""
+    fixture = floor_with_two_areas
+    async with MCPAssertions(mcp_client) as mcp:
+        data = await mcp.call_tool_success(
+            "ha_search", {"area_filter": fixture["floor_name"], "limit": 50}
+        )
+
+    assert set(data["area_names"]) == set(fixture["area_names"])
+    assert any("expanded to 2 area(s)" in warning for warning in data["warnings"])

@@ -1,11 +1,11 @@
 """Unit tests for ToolsRegistry registration resilience (issues #1783/#1785).
 
 A single tool module whose import or register function fails must not take the
-whole server down: the in-process server auto-updates the ha-mcp package inside
-a running Home Assistant, and a mixed old/new module set (or a module that
-genuinely needs a newer custom component) previously crashed the entire server
-via the registry's fail-fast re-raise. The registry now skips the failing
-module, logs it loudly, and keeps every other module's tools available — but a
+whole server down: the in-process server can swap the ha-mcp package inside a
+running Home Assistant (a pip-spec override), and a mixed old/new module set (or
+a module that genuinely needs a newer custom component) previously crashed the
+entire server via the registry's fail-fast re-raise. The registry now skips the
+failing module, logs it loudly, and keeps every other module's tools available — but a
 TOTAL failure (zero modules registered) still raises, because a tool-less
 server silently "running" would be worse than a visible start failure.
 """
@@ -183,6 +183,30 @@ class TestRegisterAllToolsResilience:
 
         with pytest.raises(RuntimeError, match="tools_boom"):
             registry.register_all_tools()
+
+
+class TestModuleSplitExpansion:
+    """A legacy ENABLED_TOOL_MODULES name keeps its pre-split tool surface."""
+
+    @staticmethod
+    def _registry(enabled: str) -> ToolsRegistry:
+        server = SimpleNamespace(
+            client=MagicMock(name="client"),
+            mcp=MagicMock(name="mcp"),
+            smart_tools=MagicMock(name="smart_tools"),
+            device_tools=MagicMock(name="device_tools"),
+        )
+        return ToolsRegistry(server, enabled_modules=enabled)
+
+    def test_tools_utility_filter_keeps_the_split_off_log_tools(self):
+        """ha_get_logs moved to tools_logs in the #2279 split; a config that
+        filters on tools_utility must not silently lose it on upgrade."""
+        modules = self._registry("tools_utility")._get_enabled_module_list()
+        assert modules == {"tools_utility", "tools_logs"}
+
+    def test_expansion_does_not_leak_into_unrelated_filters(self):
+        modules = self._registry("tools_search")._get_enabled_module_list()
+        assert modules == {"tools_search"}
 
 
 class TestDevModeSettingsFallback:

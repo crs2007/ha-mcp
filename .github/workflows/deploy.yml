@@ -1,15 +1,33 @@
 name: Deploy to GitHub Pages
 
+# The site is built from the `stable` tag, not master, so the published setup
+# instructions always match the current stable release. A site change merged
+# to master goes live at the next stable release, or sooner by dispatching
+# this workflow with another `ref`. That override lasts only until the next
+# scheduled or release-driven rebuild.
+#
+# Stable releases arrive through workflow_run rather than a release or tag
+# trigger: the github-pages environment only lets runs on `master` deploy,
+# and workflow_run runs on the default branch, while release and tag-push
+# runs carry the tag as their ref. Dev pre-releases come from a different
+# workflow and never trigger a deploy.
 on:
+  workflow_run:
+    workflows: ["SemVer Release"]
+    types: [completed]
   push:
     branches: [master]
     paths:
       - '.github/workflows/deploy.yml'
-      - 'scripts/generate_star_history.py'
-      - 'site/**'
   schedule:
     - cron: '17 3 * * 0'
   workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or commit to build the site from (default: the stable tag)"
+        required: false
+        default: stable
+        type: string
 
 permissions: {}
 
@@ -19,6 +37,9 @@ concurrency:
 
 jobs:
   build:
+    # SemVer Release moves `stable` before it publishes the release and app
+    # config; a run that fails after that point must not publish the site.
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
     permissions:
       contents: read
     runs-on: ubuntu-latest
@@ -28,6 +49,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Every non-dispatch trigger builds `stable`; on a gated-out release
+          # week the tag has not moved, so the rebuild is a no-op.
+          ref: ${{ inputs.ref || 'stable' }}
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: "3.14"
 
       - name: Generate star history charts
         # The built-in token cannot access GitHub's restricted stargazer history.
@@ -39,7 +68,7 @@ jobs:
           --output-dir public/star-history
 
       - name: Setup Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
           # Corepack is bundled only through Node 24; `corepack npm ci` enforces packageManager.
           node-version: "22"
@@ -69,4 +98,4 @@ jobs:
     steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128 # v5
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5

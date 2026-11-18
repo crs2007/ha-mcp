@@ -50,13 +50,12 @@ class TestErrorHandling:
             )
             # A tool failure reaches callers two ways depending on the
             # transport: as a raised ToolError (the except below) or as a
-            # returned result carrying the error flag — ``is_error`` on
-            # fastmcp's CallToolResult, ``isError`` on the raw MCP one.
-            # Fold either spelling into the same marked dict, keeping the
-            # structured error payload the shared parser recovers so
-            # _get_error_str still finds a message, and marker-based
-            # discrimination stays transport-independent.
-            if getattr(result, "is_error", False) or getattr(result, "isError", False):
+            # returned result carrying the error flag (``is_error``). Fold
+            # both into the same marked dict, keeping the structured error
+            # payload the shared parser recovers so _get_error_str still finds
+            # a message, and marker-based discrimination stays
+            # transport-independent.
+            if getattr(result, "is_error", False):
                 return {
                     **_parse_error_result(result),
                     "success": False,
@@ -76,7 +75,7 @@ class TestErrorHandling:
                 "timed_out": True,
                 "error": f"Operation timed out after {timeout}s",
             }
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Tool call {tool_name} failed: {e}")
             return {"success": False, "tool_error": True, "error": str(e)}
 
@@ -128,11 +127,11 @@ class TestErrorHandling:
         copied in at container prep — so a successful search on a settled
         instance always has entities. The boot poll that waits for
         light.bed_light to land in the state machine
-        (conftest._wait_for_haos_light_ready) runs only on the HAOS lanes,
+        (_conftest_haos._wait_for_haos_light_ready) runs only on the HAOS lanes,
         though, and the demo platform publishes its states after the
         integration's async_setup returns, so container / embedded lanes can
         briefly race a search that fires first (documented at
-        conftest.py:1863-1874, PR #1379). With ``require_entities`` the
+        ``_wait_for_haos_light_ready``, PR #1379). With ``require_entities`` the
         bounded poll below absorbs that lag, and only a still-empty result
         after the window is a search regression rather than an empty instance.
 
@@ -723,7 +722,7 @@ class TestErrorHandling:
                 )
             else:
                 logger.warning("  ⚠️ Missing name unexpectedly succeeded")
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             error_str = str(e).lower()
             if any(
                 phrase in error_str
@@ -769,10 +768,7 @@ class TestErrorHandling:
             {
                 "helper_type": "input_number",
                 "name": "Test Invalid Range",
-                "min_value": 100.0,
-                "max_value": 50.0,  # max_value < min_value - should fail validation
-                "step": 1.0,
-                "mode": "slider",
+                "config": {"min": 100.0, "max": 50.0, "step": 1.0, "mode": "slider"},
             },
         )
 
@@ -792,7 +788,7 @@ class TestErrorHandling:
             {
                 "helper_type": "input_select",
                 "name": "Test Empty Options",
-                "options": [],
+                "config": {"options": []},
             },
         )
 
@@ -812,8 +808,7 @@ class TestErrorHandling:
             {
                 "helper_type": "input_datetime",
                 "name": "Test No Date Time",
-                "has_date": False,
-                "has_time": False,
+                "config": {"has_date": False, "has_time": False},
             },
         )
 
@@ -856,7 +851,7 @@ class TestErrorHandling:
 
 
 async def _safe_tool_call_standalone(
-    mcp_client, tool_name: str, params: dict[str, Any] = None, timeout: float = 10.0
+    mcp_client, tool_name: str, params: dict | None = None, timeout: float = 10.0
 ):
     """Standalone safe wrapper for tool calls with timeout protection."""
     if params is None:
@@ -868,8 +863,7 @@ async def _safe_tool_call_standalone(
         # Marker parity with the method twin: a returned error-flagged result
         # and a raised ToolError are the same failure over different
         # transports, and callers discriminate on the markers, not the shape.
-        # fastmcp spells the flag ``is_error``, the raw MCP type ``isError``.
-        if getattr(result, "is_error", False) or getattr(result, "isError", False):
+        if getattr(result, "is_error", False):
             return {
                 **_parse_error_result(result),
                 "success": False,
@@ -883,7 +877,7 @@ async def _safe_tool_call_standalone(
             "timed_out": True,
             "error": f"Operation timed out after {timeout}s",
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Tool call {tool_name} failed: {e}")
         return {"success": False, "tool_error": True, "error": str(e)}
 
@@ -926,7 +920,7 @@ async def _run_concurrent_individual_operations(mcp_client, entities):
                 },
             )
             return parse_mcp_result(result)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(
                 f"Service call failed for {entity.get('entity_id', 'unknown')}: {e}"
             )
@@ -977,7 +971,7 @@ async def _run_concurrent_bulk_operations(mcp_client, entities):
                 },
             )
             return parse_mcp_result(result)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Bulk operation failed for action {action}: {e}")
             return {"success": False, "error": str(e)}
 
@@ -1061,7 +1055,7 @@ async def _run_concurrent_helper_creation(mcp_client, cleanup_tracker):
                 if hasattr(cleanup_tracker, "track"):
                     cleanup_tracker.track("helper", entity_id)
             return data
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             logger.warning(f"Helper creation failed for {helper_name}: {e}")
             return {"success": False, "error": str(e)}
 
@@ -1144,7 +1138,7 @@ async def test_system_resilience_under_load(mcp_client):
             logger.warning(
                 f"  ⚠️ System responsiveness degraded: {response_data.get('error', '')}"
             )
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"  ⚠️ System responsiveness check failed: {e}")
 
     logger.info("✅ System resilience under load test completed")

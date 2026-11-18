@@ -1,10 +1,9 @@
 """HTTP-level smoke tests for the OAuth metadata-discovery endpoints.
 
-The route-existence tests in ``test_oauth.py`` (``TestOAuthRoutes``) only assert
-that ``provider.get_routes()`` *lists* the well-known routes. They do not boot the
-assembled ASGI app or make a real request, so they cannot catch a regression where
-our metadata route is shadowed or replaced by a framework default (or a duplicate
-route is mounted for the same path), nor verify the served body.
+Listing ``provider.get_routes()`` shows only that the well-known routes exist. It
+does not boot the assembled ASGI app or make a real request, so it cannot catch a
+regression where our metadata route is shadowed or replaced by a framework default
+(or a duplicate route is mounted for the same path), nor verify the served body.
 
 These tests close that gap: they assemble an OAuth-enabled ASGI app the way the
 production server does in the ways that matter for discovery — ``mcp.auth`` set to
@@ -18,14 +17,15 @@ under Starlette's first-match-wins routing, would not change the served body) is
 also caught.
 """
 
+import json
 import time
 from unittest.mock import AsyncMock, MagicMock
 from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
-from fastmcp import FastMCP
 
+from ha_mcp._vendor.fastmcp import FastMCP
 from ha_mcp.auth import HomeAssistantOAuthProvider
 
 BASE_URL = "http://localhost:8086"
@@ -54,7 +54,7 @@ def oauth_app(tmp_path, monkeypatch):
 
     Constructing the provider persists an HMAC secret (and any registered
     clients) under ``get_data_dir()``, so redirect it to a temp dir to keep the
-    test hermetic — mirrors the ``isolate_data_dir`` fixture in ``test_oauth.py``.
+    test hermetic.
     """
     monkeypatch.setattr("ha_mcp.auth.provider.get_data_dir", lambda: tmp_path)
 
@@ -65,7 +65,7 @@ def oauth_app(tmp_path, monkeypatch):
     # discovery preflight (and 421s a non-loopback Host) before the request
     # reaches our metadata route. The ``hasattr`` check keeps this a no-op on
     # fastmcp < 3.4.3, where the setting field does not exist.
-    import fastmcp
+    from ha_mcp._vendor import fastmcp
 
     monkeypatch.setenv("FASTMCP_HTTP_HOST_ORIGIN_PROTECTION", "false")
     if hasattr(fastmcp.settings, "http_host_origin_protection"):
@@ -73,6 +73,11 @@ def oauth_app(tmp_path, monkeypatch):
 
     server = FastMCP("test")
     server.auth = HomeAssistantOAuthProvider(base_url=BASE_URL)
+
+    @server.tool
+    def ping() -> str:
+        return "pong"
+
     app = server.http_app(path="/mcp", stateless_http=True)
     # Expose the provider that served the document so a test can cross-check it
     # against what that same instance puts on an authorization response.
@@ -182,6 +187,134 @@ async def test_authorization_redirect_iss_matches_served_issuer(oauth_app):
     assert served_issuer == f"{BASE_URL}/"
 
 
+def _mcp_rpc(client, token: str | None, method: str, params: dict | None = None):
+    headers = {"Accept": "application/json, text/event-stream"}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
+    return client.post(
+        "/mcp",
+        headers=headers,
+        json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}},
+    )
+
+
+def _rpc_body(response):
+    if response.headers["content-type"].startswith("application/json"):
+        return response.json()
+    return next(
+        json.loads(line[6:])
+        for line in response.text.splitlines()
+        if line.startswith("data: ")
+    )
+
+
+def test_connector_login_over_http_reaches_an_authenticated_tool_call(oauth_app):
+    """Registration, consent, the SDK token route and a bearer MCP call, end to end.
+
+    The provider tests call ``exchange_authorization_code`` directly; this drives
+    the SDK's registration, authorization and token handlers and our consent route
+    the way a connector does, so a handler change that breaks the login fails here.
+    """
+    import base64
+    import hashlib
+    import secrets
+
+    from starlette.testclient import TestClient
+
+    redirect_uri = "https://claude.ai/api/mcp/auth_callback"
+    verifier = secrets.token_urlsafe(48)
+    challenge = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+        .decode()
+        .rstrip("=")
+    )
+
+    with TestClient(oauth_app, follow_redirects=False) as client:
+        registered = client.post(
+            "/register",
+            json={
+                "redirect_uris": [redirect_uri],
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "client_name": "connector",
+            },
+        )
+        assert registered.status_code == 201, registered.text
+        client_id = registered.json()["client_id"]
+
+        # An SDK-built error redirect carries iss through the wrapped route.
+        rejected = client.get(
+            "/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": "st-0",
+                "scope": "not-a-scope",
+            },
+        )
+        assert rejected.status_code == 302, rejected.text
+        error = parse_qs(urlparse(rejected.headers["location"]).query)
+        assert error["error"] == ["invalid_scope"]
+        assert error["iss"] == [f"{BASE_URL}/"]
+
+        authorize = client.get(
+            "/authorize",
+            params={
+                "response_type": "code",
+                "client_id": client_id,
+                "redirect_uri": redirect_uri,
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": "st-1",
+                "scope": "homeassistant",
+            },
+        )
+        assert authorize.status_code == 302, authorize.text
+        txn_id = parse_qs(urlparse(authorize.headers["location"]).query)["txn_id"][0]
+
+        consent = client.post("/consent", data={"txn_id": txn_id, "ha_token": "llat"})
+        assert consent.status_code == 303, consent.text
+        callback = parse_qs(urlparse(consent.headers["location"]).query)
+        assert callback["state"] == ["st-1"]
+        assert callback["iss"] == [f"{BASE_URL}/"]
+
+        issued = client.post(
+            "/token",
+            data={
+                "grant_type": "authorization_code",
+                "code": callback["code"][0],
+                "redirect_uri": redirect_uri,
+                "client_id": client_id,
+                "code_verifier": verifier,
+            },
+        )
+        assert issued.status_code == 200, issued.text
+        tokens = issued.json()
+        assert tokens["token_type"].lower() == "bearer"
+
+        refreshed = client.post(
+            "/token",
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": tokens["refresh_token"],
+                "client_id": client_id,
+            },
+        )
+        assert refreshed.status_code == 200, refreshed.text
+
+        call = {"name": "ping", "arguments": {}}
+        assert _mcp_rpc(client, None, "tools/call", call).status_code == 401
+        called = _mcp_rpc(client, refreshed.json()["access_token"], "tools/call", call)
+        assert called.status_code == 200, called.text
+        body = _rpc_body(called)
+        assert body["result"]["isError"] is False, body
+        assert body["result"]["content"][0]["text"] == "pong", body
+
+
 def _iter_route_paths(routes):
     """Yield every Route ``path`` in an assembled app, descending into mounts."""
     for route in routes:
@@ -249,3 +382,32 @@ async def test_metadata_endpoint_rejects_non_get(oauth_app, discovery_path):
         f"POST {discovery_path} returned {resp.status_code}, expected 405 "
         "(discovery routes should allow only GET/OPTIONS)"
     )
+
+
+def test_as_documents_pin_the_claude_cimd_selection_contract():
+    """Claude picks CIMD only when BOTH flags are present (Anthropic connector
+    docs, 2026-08); every bearer-capable AS document must keep them, and every
+    advertised endpoint must live under OAUTH_BASE (never core's /auth/*, never
+    the root alias) so a client cache formed in any mode survives any switch."""
+    from custom_components.ha_mcp_tools import mcp_webhook
+    from custom_components.ha_mcp_tools.const import OAUTH_BASE
+
+    base = "https://ha.example"
+    ha_auth_doc = mcp_webhook._authorization_server_document(base)
+    none_doc = mcp_webhook._none_mode_authorization_server_document(base)
+    legacy_doc = mcp_webhook._legacy_authorization_server_document(base)
+
+    for doc in (ha_auth_doc, none_doc):
+        assert doc["client_id_metadata_document_supported"] is True
+        assert "none" in doc["token_endpoint_auth_methods_supported"]
+        assert doc["registration_endpoint"] == f"{base}{OAUTH_BASE}/register"
+
+    for doc in (ha_auth_doc, none_doc, legacy_doc):
+        assert doc["authorization_endpoint"] == f"{base}{OAUTH_BASE}/authorize"
+        assert doc["token_endpoint"] == f"{base}{OAUTH_BASE}/token"
+        assert doc["code_challenge_methods_supported"] == ["S256"]
+        assert doc["issuer"] == f"{base}{OAUTH_BASE}"
+
+    # Legacy remains a pasted-credential AS: no DCR, confidential methods.
+    assert "registration_endpoint" not in legacy_doc
+    assert "client_secret_basic" in legacy_doc["token_endpoint_auth_methods_supported"]

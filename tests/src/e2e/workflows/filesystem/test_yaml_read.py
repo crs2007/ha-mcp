@@ -21,6 +21,7 @@ enabled here only to SEED a package file to then discover.
 Tests are designed for the Docker Home Assistant test environment.
 """
 
+import json
 import logging
 import os
 from typing import Any
@@ -32,6 +33,10 @@ from ...utilities.assertions import MCPAssertions
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# ha_config_get_yaml reads through the component's privileged services, which
+# register only in the "File & YAML Tools" config entry (#2292).
+pytestmark = pytest.mark.requires_tools_entry
+
 TOOL_NAME = "ha_config_get_yaml"
 SET_TOOL = "ha_config_set_yaml"
 READ_TOOL = "ha_read_file"
@@ -42,7 +47,7 @@ FEATURE_FLAG = "ENABLE_YAML_CONFIG_EDITING"
 # detects the configured folder at runtime rather than assuming "packages".
 PACKAGES_DIR = "custom_packages"
 
-# Staged pre-boot by conftest._seed_non_yaml_package_file — the file a
+# Staged pre-boot by _conftest_seed._seed_non_yaml_package_file — the file a
 # `custom_packages/*` glob must skip rather than fail on.
 NON_YAML_FILE = f"{PACKAGES_DIR}/_e2e_not_yaml.md"
 
@@ -66,9 +71,9 @@ def _require_seeded_backend(container_info: dict) -> None:
 @pytest.fixture(scope="module")
 def yaml_editing_enabled(ha_container_with_fresh_config):
     """Enable YAML editing for the module — only needed to seed a package."""
-    os.environ[FEATURE_FLAG] = "true"
-    yield
-    os.environ.pop(FEATURE_FLAG, None)
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv(FEATURE_FLAG, "true")
+        yield
 
 
 async def _set_yaml_confirmed(mcp: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -197,6 +202,46 @@ class TestYamlReadTagPreservation:
         assert "!include automations.yaml" in match["content"]
         assert match["parsed"] == "!include automations.yaml"
 
+    async def test_nested_package_key_is_discovered(self, mcp_client):
+        """Core's annotation load finds a key in a nested package folder."""
+        async with MCPAssertions(mcp_client) as mcp:
+            data = await mcp.call_tool_success(
+                TOOL_NAME,
+                {
+                    "yaml_path": "template",
+                    "file": "custom_packages/*.yaml",
+                    "include_parsed": True,
+                },
+            )
+
+        assert data["count"] >= 1
+        assert any(
+            match["file"].endswith("nested/mcp_nested_2926.yaml")
+            for match in data["matches"]
+        )
+
+    async def test_input_tag_not_resolved(self, mcp_client):
+        """Blueprint ``!input`` markers survive into the parsed view.
+
+        The staged motion-light blueprint uses ``!input motion_entity``. A
+        tag the component's loader did not register reached ``yaml_jsonify``
+        as ruamel's generic scalar and came back as a bare value, dropping
+        the tag from ``include_parsed`` results.
+        """
+        async with MCPAssertions(mcp_client) as mcp:
+            data = await mcp.call_tool_success(
+                TOOL_NAME,
+                {
+                    "yaml_path": "actions",
+                    "file": "blueprints/automation/homeassistant/motion_light.yaml",
+                    "include_parsed": True,
+                },
+            )
+
+        match = data["matches"][0]
+        assert "!input motion_entity" in match["content"]
+        assert "!input motion_entity" in json.dumps(match["parsed"])
+
 
 @pytest.mark.filesystem
 class TestReadFileYamlPath:
@@ -241,9 +286,10 @@ class TestReadFileYamlPath:
 class TestSecretsMasking:
     """secrets.yaml reads back masked through the yaml_path views too.
 
-    The unit half (test_custom_component_filesystem.py::
-    TestReadFileSecretsMaskingOrder) pins the ordering that makes this hold;
-    this is the behavioural half against the real component.
+    The unit half (test_custom_component_read_file.py::TestSecretsMasking)
+    checks every view of the file through the component's service; this
+    checks that the tool's yaml_path and include_parsed reads reach that
+    masked read on a real install.
     """
 
     async def test_subtree_and_parsed_are_masked(self, mcp_client):

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from ..renamed_tools import RENAMED_TOOLS, current_tool_name
 from .model import Policy, Rule
 
 logger = logging.getLogger(__name__)
@@ -21,12 +22,59 @@ def load_policy(data_dir: Path) -> Policy:
         return Policy()
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as e:
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
         raise ValueError(f"tool_policy.json is not valid JSON: {e}") from e
     try:
-        return Policy.model_validate(raw)
+        policy = Policy.model_validate(raw)
     except ValidationError as e:
         raise ValueError(f"tool_policy.json failed schema validation: {e}") from e
+    return _follow_renamed_tools(policy)
+
+
+def _follow_renamed_tools(policy: Policy) -> Policy:
+    """Point rules naming a retired tool at the name it answers to today.
+
+    A rule is a gate: left on the old name it matches nothing, so a tool the
+    user had put behind approval or denial would run ungated after the rename,
+    with the rule still visible in the editor as if it applied.
+
+    Re-keying can leave two rules on one tool, and both are kept on purpose:
+    gating is additive — ANY matching rule requires approval — so dropping
+    either would weaken the gate the user configured. What the duplication does
+    decide is ``remember_minutes``, which the middleware reads off the FIRST
+    matching rule, so an inherited rule moves behind the rules that already
+    name the current tool: the one authored against the tool as it is called
+    today is the deliberate one.
+
+    Nothing else moves. An inherited rule with no same-tool counterpart keeps
+    its position, so a ``*`` rule that used to sit behind it still does — this
+    re-keying is not the place to change which rule answers for a tool that
+    only ever had one.
+    """
+    if not any(rule.tool_name in RENAMED_TOOLS for rule in policy.rules):
+        return policy
+
+    resolved: list[tuple[Rule, bool]] = [
+        (rule.model_copy(update={"tool_name": current_tool_name(rule.tool_name)}), True)
+        if rule.tool_name in RENAMED_TOOLS
+        else (rule, False)
+        for rule in policy.rules
+    ]
+    authored: dict[str, int] = {
+        rule.tool_name: index
+        for index, (rule, inherited) in enumerate(resolved)
+        if not inherited
+    }
+
+    def anchor(index: int) -> tuple[int, int]:
+        rule, inherited = resolved[index]
+        if not inherited:
+            return (index, 0)
+        # Sort right behind the last rule authored on this tool, or stay put.
+        return (authored.get(rule.tool_name, index), 1)
+
+    order = sorted(range(len(resolved)), key=anchor)
+    return policy.model_copy(update={"rules": [resolved[index][0] for index in order]})
 
 
 def migrate_policy_any_semantics(data_dir: Path) -> bool:
@@ -37,7 +85,8 @@ def migrate_policy_any_semantics(data_dir: Path) -> bool:
     editor now writes one rule per condition and the UI reads "ANY condition
     matches" — so an untouched old file would silently enforce AND while the
     UI claims ANY. This splits every multi-predicate rule of an UNSTAMPED
-    file into one single-predicate rule each (the explicit, documented
+    require-approval file (an allow list is only stamped) into one
+    single-predicate rule each (the explicit, documented
     breaking change: old AND conditions become OR, the more-restrictive
     direction) and stamps ``schema_version`` so the migration never re-runs —
     post-upgrade multi-predicate rules (a condition with AND-ed
@@ -69,7 +118,7 @@ def _migrate_policy_any_semantics_locked(data_dir: Path) -> bool:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return False
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         logger.warning("policy migration: cannot read %s; leaving as-is", path)
         return False
     if not isinstance(raw, dict) or raw.get("schema_version") is not None:
@@ -77,8 +126,19 @@ def _migrate_policy_any_semantics_locked(data_dir: Path) -> bool:
     try:
         policy = Policy.model_validate(raw)
     except ValidationError:
-        logger.warning("policy migration: %s failed validation; leaving as-is", path)
+        logger.warning(
+            "policy migration: %s failed validation; leaving as-is",
+            path,
+            exc_info=True,
+        )
         return False
+    if policy.rule_effect == "allow":
+        # An allow list postdates #1993, so its rules were never packed by the
+        # old editor; splitting one would turn an AND into an OR and widen
+        # what it approves.
+        save_policy(data_dir, policy)
+        logger.info("Stamped schema_version on %s (allow list, rules untouched).", path)
+        return True
     new_rules: list[Rule] = []
     split = 0
     for rule in policy.rules:

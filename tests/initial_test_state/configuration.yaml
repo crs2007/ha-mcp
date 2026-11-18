@@ -37,7 +37,7 @@ demo:
 # Helper used by the pagination tests in test_history.py and test_logbook.py.
 # Defined here so the entity always exists at HA boot; the recorder DB ships
 # with pre-baked state-change rows for it (see scripts/bake_pagination_seed.py
-# and the timestamp-refresh hook in conftest.py).
+# and the timestamp-refresh hook in _conftest_seed.py).
 input_number:
   e2e_pagination_seed:
     name: E2E Pagination Seed
@@ -75,3 +75,21 @@ template:
         device_class: temperature
         state_class: measurement
         unit_of_measurement: "°C"
+      # mold_indicator's flow requires a humidity source alongside the two
+      # temperature ones. HA's EntitySelector validates only the entity_id
+      # shape, so a temperature sensor would be accepted here and then log
+      # "unsupported unit" and hold the helper at unknown forever.
+      - name: demo Humidity
+        unique_id: e2e_demo_humidity
+        state: "{{ 45.0 }}"
+        device_class: humidity
+        state_class: measurement
+        unit_of_measurement: "%"
+# e2e: default_config loads the logger integration at WARNING, so the
+# component's INFO lines never reach home-assistant.log or the console. The
+# in-HA LLM-API proof (tests/src/e2e/workflows/embedded/test_llm_api_in_ha.py)
+# asserts on the component's INFO registration line, on the container and
+# HAOS embedded lanes alike, so raise just this component's logger here.
+logger:
+  logs:
+    custom_components.ha_mcp_tools: info

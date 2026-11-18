@@ -1,12 +1,12 @@
-# Webhook Proxy Add-on (stable + dev)
+# Webhook Proxy App (add-on) (stable + dev)
 
 ## What it is
-A thin add-on that does NOT run an MCP server. It discovers a running ha-mcp server
-add-on (stable `ha_mcp`, then dev `ha_mcp_dev`), installs a custom component into HA
+A thin app that does NOT run an MCP server. It discovers a running ha-mcp server
+app (stable `ha_mcp`, then dev `ha_mcp_dev`), installs a custom component into HA
 Core, registers a webhook (`/api/webhook/<id>`) plus optional OAuth 2.1 views, and
-proxies remote MCP traffic to the server add-on's local port. Built locally by
+proxies remote MCP traffic to the server app's local port. Built locally by
 Supervisor from the Dockerfile (no prebuilt image) — a "release" is a `version` bump in
-`config.yaml` on the branch the add-on store points at.
+`config.yaml` on the branch the app store points at.
 
 ## Two flavors
 - Stable: dir `homeassistant-addon-webhook-proxy/`, slug `ha_mcp_webhook_proxy`,
@@ -18,7 +18,7 @@ They are a **hand-maintained duplicate** — no codegen. The dev tree is the sta
 with every `mcp_proxy` token rewritten to `mcp_proxy_dev` (this also renames the
 `/config/.mcp_proxy_*` state files, `/opt/mcp_proxy`, the `/api/mcp_proxy/oauth` base,
 the HA config-entry domain, and `/config/custom_components/mcp_proxy`). `/data/*` files
-(webhook id, OAuth creds) are already isolated per add-on. CI test
+(webhook id, OAuth creds) are already isolated per app. CI test
 `tests/src/unit/test_webhook_proxy_dev_isolation.py` fails if any bare `mcp_proxy` token
 leaks into the dev tree.
 
@@ -42,7 +42,9 @@ promote PR.
 
 ## Mutual exclusion
 Both flavors install a webhook + OAuth views; the OAuth provider owns the root
-`/authorize` and `/token` routes, which two live integrations cannot share. So only one
+`/authorize` and `/token` routes, which two live integrations cannot share. (The scoped
+`/api/mcp_proxy{,_dev}/oauth/*` routes carry the domain, so those do not collide — the
+bare root pair is what forces the exclusion.) So only one
 flavor may run at a time. Each `start.py` checks the Supervisor `/addons` list on
 startup and refuses (logs + a self-clearing HA notification, then exits) if its sibling
 is `started`. `start.py:_sibling_is_running` matches the sibling by exact slug or
@@ -54,11 +56,11 @@ is `started`. `start.py:_sibling_is_running` matches the sibling by exact slug o
   so dev always sorts ahead of the stable it will promote into. Bump
   `homeassistant-addon-webhook-proxy-dev/config.yaml` `version` AND
   `mcp_proxy_dev/manifest.json` `version` together (they must stay equal). The
-  `webhook-proxy-dev-version-guard` workflow fails any PR that touches the dev add-on
+  `webhook-proxy-dev-version-guard` workflow fails any PR that touches the dev app
   without an increase. Use the `Webhook Proxy Dev — Bump Version` workflow
   (`workflow_dispatch`, never scheduled) to do the bump and open a draft PR, or edit the
-  two files by hand. (Dev entries below `v2.0.3.dev1` in the dev CHANGELOG predate this
-  rule — the line originally counted independently from the 1.2.2 fork point.)
+  two files by hand. Dev CHANGELOG entries below `v2.0.3.dev1` follow an
+  older, independent numbering.
 - Stable keeps its own version line and never inherits a `.devN` label; the promote
   workflow assigns the stable number.
 
@@ -78,7 +80,7 @@ manual fallback):
 2. Reverse-rename `mcp_proxy_dev` -> `mcp_proxy` everywhere (the inverse of the dev
    transform): component dir `mcp_proxy_dev/` -> `mcp_proxy/`, `DOMAIN`, `/opt` path,
    `/config/.mcp_proxy_dev_*` state files, `/api/mcp_proxy_dev/oauth` base, config-entry
-   domain, and the add-on slug `ha_mcp_webhook_proxy_dev` -> `ha_mcp_webhook_proxy`.
+   domain, and the app slug `ha_mcp_webhook_proxy_dev` -> `ha_mcp_webhook_proxy`.
 3. In `start.py`, the stable mutual-exclusion constants are `SIBLING_SLUG_BASE =
    "ha_mcp_webhook_proxy_dev"`, `MUTEX_NOTIFICATION_ID = "mcp_proxy_mutex"`,
    `SIBLING_LABEL = "Webhook Proxy (Dev)"` (do not copy the dev-side values).
@@ -93,11 +95,19 @@ manual fallback):
    direct stable repair.
 
 ## Testing
-`tests/addon/test_webhook_proxy.py` is parametrized over BOTH flavors — an autouse
-`_webhook_proxy_variant` fixture rebinds `PROXY_ADDON_DIR`/`CURRENT`, so every test runs
-once as `[stable]` and once as `[dev]`. CI runs `tests/addon/`, so the dev code is
-exercised on every PR — that is what makes it safe to develop on the dev flavor before
-promoting. When you add a variant-specific value, add it to the `WEBHOOK_PROXY_VARIANTS`
-table rather than hard-coding it in a test. `tests/src/unit/test_webhook_proxy_dev_isolation.py`
-separately guards the rename (no bare `mcp_proxy` token in the dev tree) and the dev-side
-mutual-exclusion constants.
+The tests in `tests/addon/webhook_proxy/` run on real Home Assistant Core and are
+parametrized over BOTH flavors: the autouse `variant` fixture in its `conftest.py` runs
+every test once as `[stable]` and once as `[dev]`, and the `component` fixture loads the
+flavor's component as a custom integration that Core sets up. CI runs `tests/addon/`, so
+the dev code is exercised on every PR — that is what makes it safe to develop on the dev
+flavor before promoting. When you add a variant-specific VALUE — a path, slug, domain, or
+route base — add it to `Variant` in `_variants.py` rather than hard-coding it in a test.
+A variant-specific CAPABILITY is the opposite: feature-detect it from the flavor's own
+source, the way `ha_auth_supported`, `none_autoapprove_supported`, and
+`rfc9207_iss_supported` in `_variants.py` already do. The promote transform copies code
+but never edits these tests, so a capability recorded as a table boolean stays `False` for stable
+after the code arrives, and the promote PR then asserts the old surface against the new
+one. `tests/src/unit/test_webhook_proxy_dev_isolation.py`
+separately guards the rename (no bare `mcp_proxy` token in the dev tree) and the dev
+flavor's slug and domain; `tests/addon/webhook_proxy/test_start_mutex.py` tests that
+neither flavor starts beside the other.

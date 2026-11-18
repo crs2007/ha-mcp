@@ -32,6 +32,26 @@ Consequences:
   [python_sandbox.py](src/ha_mcp/utils/python_sandbox.py) for the explicit
   "not a security boundary" note.
 
+### Custom dashboard cards are the user's own code
+
+To describe and check `custom:` cards, the `ha_mcp_tools` component runs the
+JavaScript files the user registered as dashboard resources (`/hacsfiles/...`,
+`/local/...`) in a QuickJS sandbox inside Home Assistant. ha-mcp installs no
+card; it only runs cards the user chose to install, the same files their
+browsers already run with a logged-in Home Assistant session. Deciding which
+cards are safe to install is the user's responsibility. The sandbox exposes no
+network, filesystem or process APIs, and caps each card's memory, file size and
+run time to contain a broken card, not an adversarial one. The DOM library it
+runs on (linkedom) is fetched from the npm registry at a pinned version and
+checked against its integrity hash before use.
+
+Inspection starts on the first relevant request, never at HA startup. QuickJS
+is an optional, exact-version dependency installed through HA's requirements
+manager under Core's constraints. An existing incompatible provider or
+dependency conflict disables this advice without replacing the provider or
+preventing the integration from loading. The shared `quickjs` module name
+means `quickjs` and `quickjs-ng` must not be installed over each other.
+
 ### Local network is the trusted zone for standard mode
 
 The HTTP entrypoint (`ha-mcp-web`) authenticates by URL-path
@@ -39,23 +59,41 @@ secrecy and is designed for loopback HTTP or LAN HTTP with a high-entropy
 `MCP_SECRET_PATH`. Any peer that can reach the configured path is treated as
 trusted — securing the local network is outside ha-mcp's scope.
 
+On app (add-on) installs, ha-mcp additionally talks to the Supervisor REST
+API at `http://supervisor` with the Supervisor-issued token. That transport
+is the platform's contract, not a choice this project can harden: Supervisor
+serves its API over plain HTTP only (`web.TCPSite(..., port=80)` in
+`supervisor/api/__init__.py` — no TLS endpoint, no IPC socket), on the
+internal `hassio` docker network that is not reachable from the LAN. The
+isolation of that internal network is the boundary protecting the token, and
+it is enforced by the Home Assistant OS platform, not by ha-mcp.
+
 For internet-facing deployments use the OAuth entrypoint (`ha-mcp-oauth`) or,
 for gating access behind an external identity provider instead of per-user HA
 tokens, the OIDC entrypoint (`ha-mcp-oidc`; see [docs/oidc.md](docs/oidc.md)),
 behind a TLS-terminating reverse proxy (see
 [OAuth Mode](#oauth-mode--beta-warning) below). Deployment guidance:
-[AGENTS.md → Docker](AGENTS.md#docker).
+[development reference → Docker](docs/agents/development.md#docker).
 
 By default the HTTP entrypoints bind to `0.0.0.0` so they are reachable from
 other machines on the LAN. To restrict to the local machine, set
 `MCP_HOST=127.0.0.1` (or use `-p 127.0.0.1:8086:8086` at the Docker layer).
+
+The app (add-on), and the in-process server's **Local network** option, also
+listen on IPv6. IPv6 has no NAT to keep the port off the internet, so those
+listeners refuse IPv6 peers outside loopback, link-local, unique local
+addresses, the host's directly connected networks and the operator's
+`ipv6_allowed_networks` list. The check uses the socket peer, before any
+`X-Forwarded-For` handling, so a forged header cannot pass it. The in-process
+server's authentication mode applies to its webhook, not to this direct port,
+which is protected by the secret path as on IPv4.
 
 ### Host/Origin validation (DNS-rebinding guard) is off by default
 
 fastmcp ships a Host/Origin guard — a DNS-rebinding defense that only accepts
 loopback `Host` headers and same-origin/loopback `Origin`s. ha-mcp defaults it
 off (`FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=false`) across its Streamable-HTTP
-entry points (`ha-mcp-web`, `ha-mcp-oauth`, `ha-mcp-oidc`, the add-on, and the
+entry points (`ha-mcp-web`, `ha-mcp-oauth`, `ha-mcp-oidc`, the app (add-on), and the
 in-process component server). The supported
 deployment model — reverse proxies, tunnels (Cloudflare, Nabu Casa), and direct
 LAN access — presents `Host` headers ha-mcp cannot enumerate, and the guard
@@ -91,36 +129,75 @@ ha-mcp uses the long-lived access token the operator provides. That token's
 permissions in Home Assistant are what they are. If the configured token is an
 admin token, ha-mcp can perform admin-level operations. Reports stating "ha-mcp
 can do X" where X is permitted by the configured token are not vulnerabilities —
-they are the intended behavior. Restricting HA permissions is done in Home
-Assistant (e.g. by creating a non-admin user and generating a token for that
-user).
+they are the intended behavior. ha-mcp expects an administrator's token;
+non-admin tokens are not officially supported but still work, with
+limitations: admin-only operations fail. Home Assistant answers an
+admin-only REST request from a non-admin with a 401 that `http.ban` counts
+toward an IP ban, so ha-mcp refuses those locally and calls services over
+WebSocket, where a refusal is not counted.
+To limit what an agent can do, use ha-mcp's tool security policies or
+disable tools rather than a non-admin token.
 
 ### Entity visibility enforce mode is best-effort concealment
 
 The opt-in entity visibility filter's **enforce mode** (`"enforce": true`, see
 the [Entity visibility filter FAQ](docs/FAQ.md#enforce-mode)) makes a hidden set
-unreadable across all tools: direct reads of a hidden entity are refused with a
-generic not-found before the tool runs, and content reads (dashboards, templates,
-automations, traces, logs, files) that would surface a hidden entity_id are
-refused on contact. It fails closed when the registry cannot be loaded. This is a
-strong barrier against an agent *incidentally* surfacing a hidden entity, not a
-cryptographic guarantee: enforcement is a text scan for the hidden entity_id, so a
-Jinja template or sandbox-adjacent computation that *derives* a hidden entity's
-state without ever naming its entity_id cannot be caught. The guaranteed property
-is that a hidden entity's data never flows to the client through a tool read —
-existence concealment
-is best-effort: the concealment error is a canonical not-found, and per-tool
-not-found shapes vary (details text, suggestions, bulk reads that normally
-partial-succeed), so a prober comparing error shapes may infer that an id is
-hidden rather than absent. The boundary covers Home Assistant entity data, not
-physical-world imagery: a camera the filter does not hide stays readable
-(`ha_get_camera_image`), and its frames could incidentally show a display that
-renders a hidden entity's state — hide the camera itself (denylist or its area)
-when its view is sensitive. Enforce mode is not a
-defense against an adversarial prompt author deliberately trying to exfiltrate a
-hidden entity's state, and (like the default filter) it is not a substitute for
-Home Assistant's own permission model — restrict what the configured token can
-reach in HA for a hard boundary.
+unreadable across ordinary tool reads: direct reads of a hidden entity are
+refused with a generic not-found before the tool runs, and scannable content
+reads (dashboards, templates, automations, traces, logs, files) that would
+surface a hidden entity_id are refused on contact. A hidden script, scene or
+automation addressed by its bare storage key or config `id` (the registry
+`unique_id`) rather than its entity_id is concealed the same way, including
+its traces. A `script.<storage key>` service call is concealed, and a config
+body or result that names one is refused. A config-file read is refused when
+the whole file defines a hidden script, scene or automation (judged on the full
+file, whatever slice was asked for). Those
+enforced paths fail closed when registry data cannot be loaded.
+
+One shape-bounded exception preserves an allowed entity's state: JSON
+`ha_get_state` results omit fields, mapping keys, list items, or related records
+that name a hidden entity and add a warning listing the omitted JSON paths. An
+entity's whole `attributes` mapping is omitted when any of its content names a
+hidden entity, because attribute values derive from the related entity (a
+person's coordinates come from its device trackers) even where they do not name
+it. The result is scanned again after filtering; non-JSON output, a shape that
+cannot carry the warning, or any surviving hidden reference is refused. Direct
+requests for the hidden related entity remain concealed before execution.
+
+The warning necessarily discloses that the allowed result contained at least one
+hidden-entity reference and which paths were omitted. It does not name the hidden
+entity (a hidden mapping key is reported as `<hidden key>`) or reveal the omitted
+values.
+
+`ha_get_skill_guide` and `ha_search_tools` are never scanned: they return
+bundled docs and tool schemas, whose examples can name an entity_id that is also
+hidden. The developer-mode `ha_dev_*` tools are not scanned either: developer
+mode is a development and testing override that can change settings and replace
+the running server, and its reads (a stored security-policy rule, for example)
+can return a hidden entity_id.
+
+One diagnostic path is deliberately outside that guarantee by default:
+`ha_report_issue` bypasses both scans while `restrict_report_issue` is false,
+even when visibility data is healthy, and its report may contain logs naming a
+hidden entity. This is the troubleshooting escape hatch when the filter itself
+fails; operators can opt it into enforcement. A config that cannot be loaded
+with no last-good copy follows that unrestricted default for this one tool while
+all other calls fail closed.
+
+This is a strong barrier against an agent *incidentally* surfacing a hidden
+entity, not a cryptographic guarantee: enforcement scans for the hidden
+entity_id, so a Jinja template or sandbox-adjacent computation that *derives* a
+hidden entity's state without naming its entity_id cannot be caught. On enforced
+scannable paths, a matching hidden entity's data is not returned. Existence
+concealment is best-effort: per-tool not-found shapes vary, so a prober comparing
+errors may infer that an id is hidden rather than absent. The boundary covers
+Home Assistant entity data, not physical-world imagery: a visible camera stays
+readable (`ha_get_camera_image`) and could incidentally show a display that
+renders a hidden entity's state — hide that camera when its view is sensitive.
+Enforce mode is not a defense against an adversarial prompt author deliberately
+trying to exfiltrate a hidden entity's state, nor a substitute for Home
+Assistant's permission model; restrict what the configured token can reach in
+HA for a hard boundary.
 
 ### OAuth Bearer token design
 
@@ -153,27 +230,78 @@ The consent form explains this revocation path. Reports about token opacity
 The `ha_mcp_tools` component's **in-process MCP server** config entry can run the
 ha-mcp server in-process inside Home Assistant and expose it through a Home
 Assistant webhook (see [docs/in-process-server.md](docs/in-process-server.md)).
-It offers three authentication postures, selected by the **Authentication
-mode** option in the entry options:
+A new entry starts with the webhook disabled and the server port bound to
+loopback; the setup form and the entry options let an administrator enable
+remote access with one of three authentication postures (**Authentication
+mode**), or LAN access to the port. Entries created before setup offered that
+choice keep the webhook on in `none` mode with LAN binding.
 
-- **Secret webhook URL (default, `none`).** The webhook id is a high-entropy
+- **Secret webhook URL (`none`).** The webhook id is a high-entropy
   random string and *is* the credential — the same secret-URL trust model as
   standard mode above, except the URL is designed to be reached remotely through
   Home Assistant's own remote access (Nabu Casa or a TLS-terminating reverse
   proxy). Any party that has the full webhook URL is a trusted principal; keep
-  the URL secret.
+  the URL secret. **The secret URL is the main and only form of security in
+  this mode.** The mode also serves an OAuth compatibility surface (discovery
+  documents, an anonymous RFC 7591 registration endpoint, and an auto-approve
+  authorization server) purely so OAuth-insisting connector brokers can
+  complete a flow: the tokens it issues are cosmetic — bearers are ignored,
+  the webhook URL remains the only credential. Because the auto-approve
+  endpoint is anonymous, it redirects only to a callback on an
+  administrator-editable allowlist (#2427): exact matching, plus the RFC 8252
+  §7.3 any-port rule for a listed `http` loopback callback. Anything else gets
+  a 400 page and no redirect, so the Home Assistant origin is not an open
+  redirector. The list ships with the common clients' published callbacks. It is stored on the
+  server entry and edited on its Configure screen or in the admin-only
+  sidebar panel; dynamic client registration cannot add to it. An
+  administrator can turn the list off with **Allow any OAuth callback URL**,
+  which accepts any `https` or loopback `http` callback without userinfo or a
+  fragment and so makes that endpoint an open redirector again; it is off by
+  default.
 - **Home Assistant account (`ha_auth`).** Home Assistant Core is the OAuth
   authorization server: the entry serves the discovery documents and
   validates inbound Bearer tokens against Home Assistant's own auth, so access
   is gated by a Home Assistant login — and restricted to **administrator**
-  users. The server acts with its own provisioned admin token (the caller's
+  users. The server acts with its own administrator token (the caller's
   bearer is never forwarded), so accepting any valid login would grant every
   household member admin-equivalent control; non-admin, inactive, and
   system-generated users are rejected. This is distinct from the beta OAuth mode
   below — no bespoke authorization server or self-issued token is involved, and
   revoking the user's Home Assistant token/session revokes access.
+  The component-scoped authorize/token/revoke endpoints front Core's own
+  `/auth/*` (a browser redirect, a server-side token forward, and an RFC 7009
+  revocation forward) so the URLs clients cache are the component's — Core
+  remains the authorization authority and performs its own validation on every
+  request. Revocation is fronted because the refresh token the client holds is
+  a signed envelope naming the identity Core bound the grant to, and Core
+  answers 200 for a token it does not recognise: posting the envelope to Core
+  directly would report a revocation that never happened. The scoped endpoint
+  is anonymous exactly as Core's own is (RFC 7009 authorizes the bearer of the
+  token, not a client identity). It makes no outbound request for a token that
+  is not one of its own envelopes; a prefixed one is forwarded even when its
+  signature does not verify, which is what keeps revocation working after the
+  signing key rotates (removing and re-adding the integration mints a new one).
+  That grants a forger nothing: possession is the only authorization a
+  revocation needs, and Core's revocation endpoint is anonymous and idempotent,
+  so an unverified body could just as well have been posted to Core directly.
+  The refresh path is the strict one — an envelope whose signature it cannot
+  verify is answered locally and never forwarded. For URL-shaped client
+  identities Core would reject (cross-origin Client ID Metadata Document
+  clients), the component validates the CIMD document itself per the MCP
+  2026-07-28 requirements (https-only fetch with no redirects, 10 KiB cap,
+  exact `client_id` round-trip, `redirect_uris` match, loopback/IP-literal
+  hosts refused) and forwards a same-origin-shaped client_id. This grants
+  nothing new: Core already accepts any self-asserted redirect-origin
+  client_id, so a validated translation authorizes only what a client could
+  claim directly; anything failing validation is forwarded unchanged. The
+  anonymous registration endpoint mints stateless public-client ids
+  (HMAC-signed, embedding the registered redirect URIs — no server-side
+  registration store); access still requires completing Core's admin login.
 - **Legacy OAuth (`legacy`).** A self-hosted OAuth 2.1 authorization server the
-  component runs at the Home Assistant root (`/authorize` + `/token`), for
+  component serves on its scoped endpoints (`/api/ha_mcp_tools/oauth/authorize`
+  + `/token`, which discovery advertises) and additionally at the Home
+  Assistant root (`/authorize` + `/token`) as an alias for metadata-ignoring
+  clients, for
   OAuth-only MCP clients that HA Core's native OAuth cannot serve (Google Gemini
   Spark's cross-origin Client-ID-Metadata-Document redirect, GitHub Copilot
   CLI's dynamic registration). The credential is a **static `client_id` +
@@ -181,8 +309,8 @@ mode** option in the entry options:
   signing key — all persisted in the config entry. Its security properties:
   - **The client secret is the boundary.** Anyone holding the `client_id` +
     `client_secret` can complete the flow and mint tokens; there is no
-    per-user identity. Access is **admin-equivalent** — the same provisioned
-    admin token backs it as the other modes. Keep the secret secret.
+    per-user identity. Access is **admin-equivalent** — the same server
+    administrator token backs it as the other modes. Keep the secret secret.
   - **Self-issued Bearer tokens**, HMAC-signed and stateless, carrying
     `{kind, iat, exp, jti, cid}` — **no** Home Assistant LLAT (unlike the beta
     OAuth mode in "OAuth Bearer token design" above; that section's
@@ -193,8 +321,9 @@ mode** option in the entry options:
     which invalidates every outstanding token — but only once Home Assistant
     restarts, because the root `/authorize`/`/token` views cannot be rebound
     without a restart (a repair issue prompts for it). Until that restart the
-    previous credential keeps working; the startup log withholds the rotated
-    credential during that window so a still-valid old token cannot read it.
+    previous credential keeps working. The credentials are shown only on the
+    entry's Configure screen, never in the startup log, so a still-valid old
+    token cannot read the rotated credential through the server's log tools.
   - **The consent endpoint is unauthenticated** (no HA session) — it is a
     plain human-approval page. This is safe because the authorization code is
     inert without the `client_secret` at the token endpoint (the client is
@@ -212,23 +341,56 @@ mode** option in the entry options:
   - **TLS is required in practice** — the endpoints ride Home Assistant's own
     HTTP, so expose them only over HA's HTTPS remote access (Nabu Casa or a
     TLS-terminating reverse proxy), never plaintext over the internet.
-  - **Route ownership:** the component and the Webhook Proxy add-on both bind
+  - **Route ownership:** the component and the Webhook Proxy app both bind
     the root `/authorize`/`/token`; only one may own them per Home Assistant
-    instance. A cross-integration guard refuses to enable legacy mode (with a
-    repair prompt) rather than clash silently.
+    instance. When the app already owns them, the component's legacy mode
+    still enables and serves on its scoped endpoints only, logging a warning —
+    metadata-honoring clients are unaffected; metadata-ignoring clients that
+    guess root paths reach the app instead.
+
+Discovery never publishes the webhook id, in any of the three modes. The entry
+serves protected-resource metadata only at
+`/.well-known/oauth-protected-resource/api/webhook/<id>` and its endpoint-suffix
+variants (`/readonly`, `/catalog/full`, `/catalog/search`, and both catalogs
+after `/readonly`). All of them require the caller to already hold the id, and the webhook's
+401 challenge points to its matching document rather than a fixed, guessable
+path. Switching from `ha_auth` or
+`legacy` back to the secret-URL posture therefore does not promote a published
+value into the sole credential. Component versions before 2.1.1 also served the
+document at a fixed path, where it handed the full webhook URL to any
+unauthenticated GET while `ha_auth` or `legacy` was on; an install that ran
+either mode reachable from the internet on such a version should use the
+entry's **Regenerate connect secrets now** option once.
 
 The connect notification deliberately carries no secrets: Home Assistant
 shows persistent notifications to every authenticated user, so the webhook
-URL (the credential in the default posture) is surfaced only on
-administrator-only surfaces - the entry's Configure screen, the sidebar
-panel, and the log. A local-only option removes the webhook entirely.
+URL (the credential in secret-URL mode) is surfaced only on the
+administrator-only Configure screen of the entry; the log and notifications
+never carry it. New entries start with the
+webhook off, and a local-only option removes it entirely.
 
-The server reaches Home Assistant with a dedicated admin token the component
-provisions and stores in the config entry. The token is handed to the server
-in-memory (never through the Home Assistant process environment); removing the
-entry revokes it, and disabling the config entry stops the server. As with
-standard mode, that token's Home Assistant permissions define what the server can
-do.
+The server reaches Home Assistant with an administrator's long-lived access
+token (#2427): one the administrator pastes, or one the component issues at
+setup from the login of a local-only account the administrator created for the
+server. The component never creates an account. It revokes a token it issued
+when the token is switched or the entry removed, and leaves a pasted token
+alone. The login skips that account's multi-factor step, but only an
+administrator can submit it. Entries created by older releases keep the
+account and token those releases provisioned while both remain valid; a
+missing, revoked or non-administrator credential stops the server and files a
+repair that asks for a replacement, rather than minting a new administrator.
+The token is stored in the config entry and handed to the server in memory
+(never through the Home Assistant process environment). Disabling the config
+entry stops the server, and so does turning off the entry's **Access** switch
+(#2801), which closes the webhook, the direct port and the conversation-agent
+LLM API while the entry stays loaded. The switch is disabled by default, and as
+a configuration entity it is not exposed to Assist by default. It does not
+revoke Home Assistant credentials a `ha_auth` client already holds: those work
+against Home Assistant's own API regardless of the switch, and against the
+server again once access is back on. Removing the entry deletes only an account
+an older release created, never an account the user created, and revokes only a
+token the component issued, never a pasted one. As with standard mode, that
+token's Home Assistant permissions define what the server can do.
 
 The component also adds an admin-only **settings panel** to the Home Assistant
 sidebar that reverse-proxies the server's web settings UI over Home Assistant's
@@ -239,14 +401,17 @@ re-validates that the session still maps to an active admin. The loopback secret
 path is never exposed to the browser and no token or secret is placed in a URL;
 the proxy returns 503 whenever the server is not running.
 
-### Webhook Proxy add-on (`ha_mcp_webhook_proxy`)
+### Webhook Proxy app (`ha_mcp_webhook_proxy`)
 
-In the add-on's `ha_auth` mode the Home Assistant login is the credential, not
-the webhook URL. The URL without a Bearer gets a 401, and the URL is not
-withheld: as in any OAuth mode, the RFC 9728 protected-resource document
-advertises it at a fixed unauthenticated path so clients can discover the
-endpoint. (This is the difference from the add-on's default posture with OAuth
-disabled, where the URL is withheld because it alone is the credential.)
+In the app's `ha_auth` mode the Home Assistant login is the credential, not
+the webhook URL. The URL without a Bearer gets a 401, and that 401 points at
+the RFC 9728 protected-resource document served under the webhook's own path
+(`/.well-known/oauth-protected-resource/api/webhook/<id>`). The dev flavor also
+serves its endpoint-suffix variants (`/readonly`, `/catalog/<mode>` and
+`/readonly/catalog/<mode>`). These metadata paths require the caller to
+already hold the id. Discovery therefore never publishes the webhook id in
+any mode, which is what lets the default posture with OAuth disabled keep
+treating that URL as the sole credential.
 
 **`ha_auth` is an access gate, not per-user authorization.** It validates the
 inbound Bearer against Home Assistant core and accepts any token core still
@@ -255,7 +420,7 @@ non-administrators, and system-generated accounts are all accepted alike. (Home
 Assistant core itself rejects a deactivated user's tokens, so deactivation does
 revoke proxy access.) The in-process entry above, by contrast, accepts only
 active human administrators. The caller's Bearer is never forwarded upstream:
-the ha-mcp add-on services every request with its own
+the ha-mcp app services every request with its own
 Supervisor/`homeassistant_api` privileges regardless of which account
 authenticated. A caller holding a credential Home Assistant core honors is a
 trusted principal per "MCP clients are trusted principals" above, which draws
@@ -263,22 +428,29 @@ the line at possession of a working credential — not at holding any particular
 Home Assistant role.
 
 Treat a Home Assistant account on this instance as admin-equivalent wherever the
-add-on runs `ha_auth`: every account that can sign in reaches the same tool
+app runs `ha_auth`: every account that can sign in reaches the same tool
 surface. Because the gate never inspects the account's role, demoting a user out
 of the administrator group does not revoke their access through the proxy —
 deactivate the account, which Home Assistant honors immediately by dropping that
-user's refresh tokens. Turning the add-on's OAuth mode off revokes nobody, and
+user's refresh tokens. Turning the app's OAuth mode off revokes nobody, and
 loosens the boundary: the webhook id persists across the switch, so that posture
 falls back to treating as the sole credential a URL every `ha_auth` client
-already holds — and one that was advertised anonymously the whole time `ha_auth`
-was on. Treat any webhook id that has served `ha_auth` as public, and rotate it
-(add-on DOCS.md, "Rotating the webhook URL") when moving to the URL-secret
-posture. The in-process entry's admin restriction is a property of that entry,
-not a guarantee of the add-on.
+already holds. Rotate the id (the app's DOCS.md, "Rotating the webhook URL")
+when moving to the URL-secret posture. A fixed-path protected-resource document
+also handed that URL to any anonymous GET the whole time `ha_auth` or `legacy`
+was on, on app versions before 3.0.3.dev2 (dev channel) and before the stable
+release that promotes it: an install that ran either mode reachable from the
+internet on such a version should treat its webhook id as public and rotate
+once, whichever posture it is moving to. From this version no anonymous URL publishes the id,
+and a rotation takes effect immediately — the previous id's discovery URL
+answers 404 as soon as the app restarts with the new id, and a Repair prompts
+for the Home Assistant restart that binds the new id's discovery URL. The
+in-process entry's admin restriction is a property of that entry, not a
+guarantee of the app.
 
-The add-on's `legacy` mode carries the same properties as the in-process
+The app's `legacy` mode carries the same properties as the in-process
 `legacy` mode described above — the component's implementation was ported from
-this add-on's — including the static `client_id`/`client_secret` as the sole
+this app's — including the static `client_id`/`client_secret` as the sole
 boundary, admin-equivalent access, self-issued HMAC bearers, and revocation by
 credential rotation plus a restart. Only one of the two may own the root
 `/authorize` and `/token` routes per Home Assistant instance.
@@ -331,14 +503,14 @@ credential rotation plus a restart. Only one of the two may own the root
   data — and `run_saved` executes with the caller's own HA token, granting no
   access the caller lacks. Any client that can reach ha-mcp is a trusted
   principal (see [Threat Model](#threat-model) above).
-- Any Home Assistant account being accepted by the Webhook Proxy add-on's
+- Any Home Assistant account being accepted by the Webhook Proxy app's
   `ha_auth` mode — non-administrators and system-generated accounts alike:
   holding a credential Home Assistant core honors makes a caller a trusted
   principal (see [Threat Model](#threat-model) above), which is the bar that
   mode sets.
   `ha_auth` is an access gate, not per-user authorization; the in-process
   entry's admin restriction is a property of that entry, not a guarantee of the
-  add-on.
+  app.
 - Vulnerabilities that are only exploitable due to a misconfigured deployment
   (e.g., standard-mode instance exposed to the internet without TLS, or a
   network-reachable HTTP entrypoint using the default `MCP_SECRET_PATH`).
@@ -364,7 +536,7 @@ and carries a larger attack surface than the standard LLAT setup.
   restore or delete
   backups. Set `HA_MCP_DISABLE_SETTINGS_UI` to not serve the UI at all.
   Standard mode instead mounts the UI under the MCP secret path, which already
-  gates the tool surface. The add-on mounts it twice: under that secret path
+  gates the tool surface. The app mounts it twice: under that secret path
   for direct access, and at the bare root for Home Assistant ingress, where the
   routes admit only the Supervisor peer (`172.30.32.2`) and 403 every other
   caller.

@@ -28,15 +28,23 @@ import tempfile
 import urllib.parse
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
-from fastmcp.exceptions import ToolError
-from fastmcp.server.context import Context
+from pydantic import Field
 
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.server.context import Context
+
+from ..client.rest_client import (
+    NON_ADMIN_TOKEN_WARNING,
+    HomeAssistantAdminRequiredError,
+)
 from ..config import get_global_settings
 from ..errors import ErrorCode, create_error_response
+from .backup_access import snapshot_route_refusal
 from .helpers import log_tool_usage, raise_tool_error
-from .util_helpers import BLOCKED_WS_WRITE_COMMANDS
+from .tool_hints import write_hints
+from .util_helpers import raw_ws_refusal
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +79,8 @@ _saved_tools: dict[str, dict[str, str]] = {}
 
 # Tools that sandbox code must not call. Includes ``ha_manage_custom_tool``
 # itself (prevents recursive self-invocation) plus the four synthetics that
-# the categorized-search transform exposes when ``ENABLE_TOOL_SEARCH=true``
-# (``ha_search_tools``, ``ha_call_{read,write,delete}_tool``). Without those
+# a search-catalog connection exposes (main URL with ``ENABLE_TOOL_SEARCH``,
+# or ``/catalog/search``): ``ha_search_tools``, ``ha_call_*_tool``. Without those
 # four entries, sandbox code could "launder" a recursive call as
 # ``call_tool("ha_call_write_tool", {"name": "ha_manage_custom_tool", ...})``
 # — the proxy would then dispatch the underlying tool and the in-sandbox
@@ -277,7 +285,7 @@ def _classify_sandbox_error(exc: Exception) -> tuple[ErrorCode, str, list[str]]:
 
 def _check_api_post_blocked(normalized: str) -> str | None:
     """Return a rejection message if ``normalized`` matches the api_post
-    blocklist, or ``None`` if the call should proceed.
+    blocklist or a backup control, or ``None`` if the call should proceed.
 
     ``normalized`` is the path after ``_normalize_endpoint`` stripped any
     leading ``/`` and ``api/`` prefix, so for example
@@ -295,7 +303,7 @@ def _check_api_post_blocked(normalized: str) -> str | None:
                 "trigger user automations without the underlying real "
                 "event ever happening. Custom event types are allowed."
             )
-    return None
+    return snapshot_route_refusal(rest_path=normalized)
 
 
 # Cap on the number of saved tools to prevent runaway growth. A buggy
@@ -577,7 +585,7 @@ def _decode_tool_result_texts(texts: list[str], is_error: bool) -> Any:
     combined = "\n".join(texts)
     try:
         payload: Any = json.loads(combined)
-    except (json.JSONDecodeError, TypeError):
+    except json.JSONDecodeError, TypeError:
         payload = combined
     if is_error:
         message = payload if isinstance(payload, str) else json.dumps(payload)
@@ -621,9 +629,7 @@ def _extract_tool_result(result: Any) -> Any:
     elif isinstance(result, list):
         content = result
 
-    is_error = bool(
-        getattr(result, "isError", False) or getattr(result, "is_error", False)
-    )
+    is_error = bool(getattr(result, "is_error", False))
 
     if content:
         texts = _collect_content_texts(content)
@@ -757,11 +763,13 @@ class _SandboxBridge:
             logger.warning("api_get rejected endpoint %r: %s", endpoint, exc)
             return {"error": str(exc)}
         try:
-            response = await self.client.httpx_client.request("GET", normalized)
+            response = await self.client.guarded_request("GET", normalized)
             try:
                 return response.json()
             except json.JSONDecodeError:
                 return response.text
+        except HomeAssistantAdminRequiredError as exc:
+            return {"error": str(exc), "warnings": [NON_ADMIN_TOKEN_WARNING]}
         except Exception as exc:
             logger.warning("api_get(%r) failed", endpoint, exc_info=True)
             return {"error": str(exc)[:200]}
@@ -804,13 +812,15 @@ class _SandboxBridge:
             post_kwargs: dict[str, Any] = {}
             if data is not None:
                 post_kwargs["json"] = data
-            response = await self.client.httpx_client.request(
+            response = await self.client.guarded_request(
                 "POST", normalized, **post_kwargs
             )
             try:
                 return response.json()
             except json.JSONDecodeError:
                 return response.text
+        except HomeAssistantAdminRequiredError as exc:
+            return {"error": str(exc), "warnings": [NON_ADMIN_TOKEN_WARNING]}
         except Exception as exc:
             logger.warning("api_post(%r) failed", endpoint, exc_info=True)
             return {"error": str(exc)[:200]}
@@ -825,13 +835,10 @@ class _SandboxBridge:
         code is dynamic and may pass non-dict values; the runtime guard
         below converts that into an error dict.
 
-        Commands listed in ``BLOCKED_WS_WRITE_COMMANDS`` are rejected with an
-        explanatory error: those either rewrite persistent state in ways
-        that have no sandbox-appropriate use case (``config/core/update``)
-        or bypass the validation in their wrapping MCP tool
-        (``lovelace/config/save`` skips the dashboard-collision check that
-        ``ha_config_set_dashboard`` performs; registry mutations skip
-        their corresponding wrapping tools' invariant checks).
+        Commands that ``raw_ws_refusal`` refuses are rejected: writes with no
+        sandbox use case or that skip their wrapping tool's validation, and
+        credential, user and host SSH-key management. Full-snapshot backup
+        commands follow the backup controls.
         """
         if self._over_invocation_limit():
             return {
@@ -842,17 +849,11 @@ class _SandboxBridge:
         msg_type = message.get("type")
         if not isinstance(msg_type, str):
             return {"error": "ws_send(message) requires a 'type' field"}
-        if msg_type in BLOCKED_WS_WRITE_COMMANDS:
+        if ws_refusal := raw_ws_refusal(msg_type, message, sandbox=True):
             logger.info("sandbox.ws_send.blocked type=%r", msg_type)
-            return {
-                "error": (
-                    f"WebSocket command {msg_type!r} is blocked from the "
-                    "sandbox. Use the corresponding wrapping tool via "
-                    "call_tool (e.g. ha_config_set_dashboard, "
-                    "ha_set_area_or_floor, ha_set_device, ha_set_entity) "
-                    "so validation runs."
-                )
-            }
+            return {"error": ws_refusal.as_text()}
+        if refusal := snapshot_route_refusal(ws_command=msg_type, ws_params=message):
+            return {"error": refusal}
         logger.debug("sandbox.ws_send type=%r", msg_type)
         try:
             return await self.client.send_websocket_message(message)
@@ -883,7 +884,7 @@ class _SandboxBridge:
         except ToolError as te:
             try:
                 return json.loads(str(te))
-            except (json.JSONDecodeError, TypeError):
+            except json.JSONDecodeError, TypeError:
                 return _sandbox_error(ErrorCode.INTERNAL_ERROR, str(te))
         except Exception as exc:
             logger.warning("call_tool(%r) failed", tool_name, exc_info=True)
@@ -1094,7 +1095,7 @@ async def _run_saved_custom_tool(
         )
     except ToolError:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         code, message, suggestions = _classify_sandbox_error(e)
         raise_tool_error(
             create_error_response(
@@ -1181,7 +1182,7 @@ async def _execute_custom_tool_code(
         )
     except ToolError:
         raise
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         err_code, err_message, err_suggestions = _classify_sandbox_error(e)
         raise_tool_error(
             create_error_response(
@@ -1300,59 +1301,61 @@ def register_code_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
 
     @mcp.tool(
         tags={"System", "beta"},
-        annotations={
-            "openWorldHint": False,
-            "title": "Custom Tool",
-            "destructiveHint": True,
-            "idempotentHint": False,
-            "readOnlyHint": False,
-        },
+        annotations=write_hints(
+            "Custom Tool", destructive=True, idempotent=False, open_world=False
+        ),
     )
     @log_tool_usage
     async def ha_manage_custom_tool(
         ctx: Context,
-        code: str | None = None,
-        justification: str | None = None,
-        save_as: str | None = None,
-        run_saved: str | None = None,
-        list_saved: bool = False,
+        code: Annotated[
+            str | None,
+            Field(
+                description="Python code to execute.  Last expression is the return value."
+            ),
+        ] = None,
+        justification: Annotated[
+            str | None,
+            Field(description="Why no existing tool works."),
+        ] = None,
+        save_as: Annotated[
+            str | None,
+            Field(
+                description=(
+                    "Save the tool under this name for reuse "
+                    "(alphanumeric/underscores, max 64 chars)."
+                )
+            ),
+        ] = None,
+        run_saved: Annotated[
+            str | None,
+            Field(description="Name of a previously saved tool to re-run."),
+        ] = None,
+        list_saved: Annotated[
+            bool, Field(description="Set True to list all saved tools.")
+        ] = False,
     ) -> dict[str, Any]:
         """Create and run a custom tool in a sandbox, or manage saved custom tools.
 
-        ⚠️  **LAST RESORT** — search for existing tools first.
+        LAST RESORT — search for existing tools first.
 
-        **Modes** (mutually exclusive):
-        - Provide ``code`` + ``justification`` to execute custom code
-        - Set ``run_saved`` to re-run a previously saved tool by name
-        - Set ``list_saved=True`` to list all saved tools
+        **Modes** (mutually exclusive): ``code`` + ``justification``;
+        ``run_saved``; ``list_saved=True``.
 
         **Available functions in sandbox:**
-        - ``api_get(endpoint)`` — GET request to HA REST API
-        - ``api_post(endpoint, data)`` — POST request to HA REST API
-        - ``ws_send(message)`` — send a HA WebSocket command (e.g. registry
-          lookups, ``render_template``, dashboard ops). ``message`` must include
-          a ``"type"`` field; the MCP server adds ``id`` and handles auth.
+        - ``api_get(endpoint)`` / ``api_post(endpoint, data)`` — HA REST API,
+          for operations not covered by existing tools
+        - ``ws_send(message)`` — send a HA WebSocket command, for operations
+          only available over WebSocket (most registry CRUD, template rendering,
+          Lovelace operations). ``message`` must include a ``"type"`` field; the
+          MCP server adds ``id`` and handles auth.
         - ``call_tool(name, args)`` — call a registered MCP tool
-        - ``delete_saved_tool(name)`` — remove a previously saved custom
-          tool by name. Returns ``{"deleted": True, "name": name}`` or
-          ``{"error": ...}``.
-
-        Use ``api_get``/``api_post`` for REST operations not covered by existing
-        tools.  Use ``ws_send`` when the operation is only available over the
-        Home Assistant WebSocket API (most registry CRUD, template rendering,
-        and Lovelace operations).  Use ``call_tool`` when an existing tool
-        already does what you need. Use ``delete_saved_tool`` to clean up
-        saved tools you no longer need.
+        - ``delete_saved_tool(name)`` — remove a previously saved custom tool.
+          Returns ``{"deleted": True, "name": name}`` or ``{"error": ...}``.
 
         Saved tools persist across server restarts when
-        ``CODE_MODE_SAVED_TOOLS_PATH`` is set (the addon sets this by
-        default to ``/data/saved_tools.json``).
-
-        Example — check repairs (no built-in tool for this):
-        ```python
-        repairs = await api_get("/repairs/issues")
-        repairs
-        ```
+        ``CODE_MODE_SAVED_TOOLS_PATH`` is set (the app sets this by default to
+        ``/data/saved_tools.json``).
 
         Example — list areas via WebSocket:
         ```python
@@ -1363,26 +1366,11 @@ def register_code_tools(mcp: Any, client: Any, **kwargs: Any) -> None:
         Example — chain existing tools:
         ```python
         result = await call_tool("ha_search", {"query": "light", "limit": 5})
-        data = result.get("data", result)
-        lights = data.get("results", [])
+        lights = result.get("entities", [])
         for e in lights:
-            await call_tool("ha_call_service", {
-                "domain": "light", "service": "turn_off",
-                "entity_id": e["entity_id"]})
+            await call_tool("ha_call_service", {"domain": "light", "service": "turn_off", "entity_id": e["entity_id"]})
         {"turned_off": len(lights)}
         ```
-
-        Example — delete an obsolete saved tool:
-        ```python
-        delete_saved_tool("old_movie_mode")
-        ```
-
-        Args:
-            code: Python code to execute.  Last expression is the return value.
-            justification: Why no existing tool works (required with code).
-            save_as: Save the tool under this name for reuse (alphanumeric/underscores, max 64 chars).
-            run_saved: Name of a previously saved tool to re-run.
-            list_saved: Set True to list all saved tools.
         """
         _validate_custom_tool_modes(code, run_saved, list_saved)
 

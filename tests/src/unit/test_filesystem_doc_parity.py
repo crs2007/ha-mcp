@@ -31,6 +31,8 @@ def _load_const_standalone():
     spec = importlib.util.spec_from_file_location(
         "_ha_mcp_tools_const_parity", _COMPONENT_DIR / "const.py"
     )
+    assert spec is not None
+    assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -68,7 +70,7 @@ _SERVICE_PATH_DESCS = _service_path_descriptions()
 _READ_TOOLS = ("ha_read_file", "ha_list_files")
 _WRITE_TOOLS = ("ha_write_file", "ha_delete_file")
 _READ_SERVICES = ("read_file", "list_files")
-_WRITE_SERVICES = ("write_file", "delete_file")
+_WRITE_SERVICES = ("write_file", "edit_file", "delete_file")
 
 
 @pytest.mark.parametrize("tool", _READ_TOOLS)

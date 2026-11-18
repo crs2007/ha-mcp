@@ -8,7 +8,7 @@ allowed-tools: Bash, Read, Write, Glob, Grep, Task
 
 # BAT Story Evaluation
 
-You are the evaluator. Follow these steps IN ORDER. Do not skip steps.
+You are the evaluator. Run the steps in order; each one uses the output of the step before it.
 
 ## Parse Arguments
 
@@ -33,7 +33,7 @@ If `$ARGUMENTS` is `--help` or missing `--baseline`, show usage and stop:
 ### 0a. Compute Diff
 
 ```bash
-cd /home/julien/github/ha-mcp/worktree/uat-stories
+cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/worktree/uat-stories"
 git diff <baseline>..HEAD -- src/ha_mcp/ --stat
 git diff <baseline>..HEAD -- src/ha_mcp/ --name-only
 ```
@@ -112,9 +112,9 @@ For EACH agent, run all stories against the **baseline** version. One container 
 ### 1a. Start container with first story
 
 ```bash
-cd /home/julien/github/ha-mcp/worktree/uat-stories
+cd "$(dirname "$(git rev-parse --path-format=absolute --git-common-dir)")/worktree/uat-stories"
 uv run python tests/uat/stories/run_story.py \
-  catalog/<first_story>.yaml \
+  tests/uat/stories/catalog/<first_story>.yaml \
   --agents <agent> --keep-container \
   --branch <baseline> \
   --results-file local/uat-results.jsonl
@@ -140,7 +140,7 @@ outcomes; re-run it, and if it keeps failing record the story as `unverified`
 Run remaining pre-built stories on the same container:
 ```bash
 uv run python tests/uat/stories/run_story.py \
-  catalog/<next_story>.yaml \
+  tests/uat/stories/catalog/<next_story>.yaml \
   --agents <agent> --ha-url http://localhost:PORT --ha-token TOKEN \
   --branch <baseline> \
   --results-file local/uat-results.jsonl
@@ -160,8 +160,10 @@ Verify each via ha_query.py using the custom story's `verify.questions`.
 
 ### 1d. Stop container
 
+Stop only the container kept in step 1a. `PORT` is the host port in its `Container kept alive: http://localhost:PORT` line:
+
 ```bash
-docker stop $(docker ps -q --filter "ancestor=ghcr.io/home-assistant/home-assistant:2026.1.3") 2>/dev/null
+docker stop $(docker ps -q --filter "publish=PORT")
 ```
 
 ## Step 2: Run Target Version
@@ -172,7 +174,7 @@ The only difference: omit `--branch` so run_story.py uses local code.
 
 ```bash
 uv run python tests/uat/stories/run_story.py \
-  catalog/<first_story>.yaml \
+  tests/uat/stories/catalog/<first_story>.yaml \
   --agents <agent> --keep-container \
   --results-file local/uat-results.jsonl
 ```
@@ -370,4 +372,4 @@ Flag >5% total size increase (directly impacts token cost per turn).
 - Reuse containers: first story starts it (`--keep-container`), rest use `--ha-url`
 - Custom story YAMLs go to `/tmp/` (ephemeral); full details reported in Step 6
 - See "Metrics" section in Step 4 for primary vs secondary metric classification
-- The working directory MUST be `/home/julien/github/ha-mcp/worktree/uat-stories` for `uv run`
+- The working directory MUST be the `worktree/uat-stories` worktree root (where `pyproject.toml` lives) for `uv run`

@@ -4,8 +4,10 @@ The visibility filter (``visibility/``) normally only declutters ``ha_search`` /
 ``ha_get_overview``. When a user turns on ``enforce`` (Entity Visibility tab, or
 ``"enforce": true`` in ``entity_visibility.json``), the
 :class:`VisibilityInboundEnforcement` / :class:`VisibilityOutboundEnforcement`
-middleware pair makes the hidden set genuinely unreadable across ALL tools —
-"refuse on contact":
+middleware pair makes the hidden set unreadable across tool reads, except for
+the never-gated server tools (``ha_get_skill_guide``, ``ha_search_tools``,
+``ha_dev_*``) and the unrestricted-by-default ``ha_report_issue`` diagnostic
+escape hatch — "refuse on contact":
 
 - **Direct reads are concealed.** A call whose arguments name a hidden entity_id
   exactly is refused BEFORE the tool runs with a canonical ``ENTITY_NOT_FOUND``,
@@ -16,9 +18,25 @@ middleware pair makes the hidden set genuinely unreadable across ALL tools —
   (a template, an automation body, a service target list), or whose *output* would
   surface one, is refused with a generic ``ENTITY_VISIBILITY_ENFORCED`` error that
   never names the matched id.
+  Generic results are refused rather than token-redacted because adjacent values
+  may still be the hidden entity's data and mutation could corrupt an arbitrary
+  schema. The bounded exception is a JSON ``ha_get_state`` result for a visible
+  entity: fields, mapping keys, list items, or related records that name hidden
+  entities are omitted (a whole ``attributes`` mapping when any of its content
+  does, since attribute values derive from the related entity), a warning naming
+  the omitted paths is added, and the result is scanned again. Non-JSON,
+  un-warnable, or still-matching state output is refused.
 - **Unscannable surfaces are refused wholesale** while enforce is active — sandbox
   code execution and screenshot/pixel output can read arbitrary state that no text
   scan can attribute to an entity.
+- **Issue reports stay available by default.** ``ha_report_issue`` is always
+  outside the barrier while ``restrict_report_issue`` is false, including when
+  visibility inputs are healthy. This unconditional default keeps the diagnostic
+  path available if the filter or its Home Assistant registry inputs fail.
+  Operators can explicitly opt it into the same inbound/outbound scans.
+- **Proxy envelopes are enforced as the tool they dispatch.** Unscannable checks,
+  scans, errors, and logs use the inner call. A malformed envelope stays attributed
+  to the outer proxy, so enforcement remains active while proxy validation rejects it.
 
 This is a strong read barrier against *incidental* exposure, not a cryptographic
 guarantee: a Jinja template that derives a hidden entity's state without ever
@@ -37,27 +55,47 @@ import logging
 import re
 import time
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, NoReturn
+from contextvars import ContextVar
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
-from fastmcp.exceptions import ToolError
-from fastmcp.server.middleware.middleware import CallNext, Middleware, MiddlewareContext
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.server.middleware.middleware import (
+    CallNext,
+    Middleware,
+    MiddlewareContext,
+)
 
 from ..errors import ErrorCode, create_entity_not_found_error, create_error_response
-from ..policy.middleware import PROXY_META_TOOLS
+from ..renamed_tools import current_tool_name
+from ..tool_dispatch import CALL_PROXY_META_TOOLS, coerce_proxy_arguments
 from ..tools.helpers import raise_tool_error
 from . import resolver
+from .identifier_aliases import (
+    IdentifierAliases,
+    build_identifier_aliases,
+    hidden_identifier_argument,
+    is_trace_query,
+    result_reveals_hidden,
+)
 from .model import VisibilityConfig
 from .resolver import (
     VisibilityDataUnavailable,
     config_has_active_hide_dimensions,
     config_needs_device_registry,
+    core_device_list_reply,
     load_hidden_set,
 )
+from .result_payloads import result_payloads, serialize_result
 
 if TYPE_CHECKING:
-    from fastmcp.tools.tool import ToolResult
+    from ha_mcp._vendor.fastmcp.tools import ToolResult
 
 logger = logging.getLogger(__name__)
+
+_config_load_warning_emitted: ContextVar[bool | None] = ContextVar(
+    "visibility_config_load_warning_emitted", default=None
+)
 
 # The resolved hidden set is cached with a short TTL so a burst of tool calls
 # does not re-fetch the registry each time; a config edit invalidates it sooner
@@ -71,6 +109,15 @@ _DASHBOARD_TOOL = "ha_config_get_dashboard"
 _DASHBOARD_SET_TOOL = "ha_config_set_dashboard"
 _CUSTOM_TOOL = "ha_manage_custom_tool"
 
+# Diagnostic tool deliberately outside the visibility barrier unless opted in.
+_REPORT_ISSUE_TOOL = "ha_report_issue"
+# Always outside the barrier: bundled docs and tool schemas whose examples can
+# name a hidden id (#2949), and the ha_dev_* developer override by design.
+_UNGATED_TOOLS = frozenset({"ha_get_skill_guide", "ha_search_tools"})
+_UNGATED_PREFIX = "ha_dev_"
+# State reads have a shape-bounded scrub exception before the outbound scan.
+_STATE_TOOL = "ha_get_state"
+
 _SANDBOX_REASON = (
     "'{name}' executes sandbox code that can read arbitrary Home Assistant state, "
     "which cannot be checked against the entity visibility filter."
@@ -82,6 +129,34 @@ _SCREENSHOT_REASON = (
 _FAIL_CLOSED_REASON = (
     "The entity visibility data could not be loaded, so enforce mode fails closed "
     "rather than risk leaking a restricted entity."
+)
+_STATE_CONTENT_WARNING_PREFIX = "Entity Visibility enforce mode omitted "
+_STATE_CONTENT_WARNING_MAX_PATHS = 10
+
+
+def _state_content_warning(paths: list[str]) -> str:
+    """The ha_get_state omission warning, naming the omitted JSON paths.
+
+    Paths never contain a hidden entity_id: a whole ``attributes`` mapping is
+    reported as one path, and a hidden mapping key is reported as
+    ``<parent>.<hidden key>``.
+    """
+    shown = ", ".join(paths[:_STATE_CONTENT_WARNING_MAX_PATHS])
+    extra = len(paths) - _STATE_CONTENT_WARNING_MAX_PATHS
+    if extra > 0:
+        shown += f" and {extra} more"
+    return (
+        f"{_STATE_CONTENT_WARNING_PREFIX}{shown} because it referenced entities "
+        "hidden by the entity visibility filter. If something you expected is "
+        "missing, review the Entity Visibility section of the ha-mcp settings UI "
+        "(the rules are described under 'Entity visibility enforce mode' in "
+        "SECURITY.md)."
+    )
+
+
+_CONFIG_FILE_REASON = (
+    "The file defines a script, scene or automation restricted by the entity "
+    "visibility filter."
 )
 _CONFIG_LOAD_FAILED_REASON = (
     "The entity visibility config (entity_visibility.json) could not be loaded and "
@@ -158,9 +233,7 @@ def _iter_strings(value: Any) -> Any:
             yield from _iter_strings(item)
 
 
-def _scan_value(
-    value: Any, hidden: set[str], regex: re.Pattern[str] | None
-) -> tuple[str | None, bool]:
+def _scan_value(value: Any, matcher: _HiddenMatcher) -> tuple[str | None, bool]:
     """Return ``(first_exact_hidden_id, any_embedded_hidden_id)`` over nested strings.
 
     A string that equals a hidden id exactly drives concealment; a string that
@@ -170,10 +243,10 @@ def _scan_value(
     exact: str | None = None
     embedded = False
     for text in _iter_strings(value):
-        if text in hidden:
+        if matcher.exact(text):
             if exact is None:
                 exact = text
-        elif regex is not None and regex.search(text):
+        elif matcher.embeds(text):
             embedded = True
     return exact, embedded
 
@@ -191,20 +264,200 @@ def _build_hidden_regex(hidden: set[str]) -> re.Pattern[str] | None:
     return re.compile(rf"(?<![a-z0-9_])(?:{alternation})(?![a-z0-9_])", re.IGNORECASE)
 
 
-def _serialize_result(result: ToolResult) -> str:
-    """Flatten a tool result's text content and structured content for scanning."""
-    parts: list[str] = []
-    for block in getattr(result, "content", None) or []:
-        text = getattr(block, "text", None)
-        if isinstance(text, str):
-            parts.append(text)
+@dataclass(frozen=True)
+class _HiddenMatcher:
+    """The enforced hidden set, its identifier aliases and the boundary regex.
+
+    ``identifier_aliases`` holds the bare keys that address a hidden script,
+    scene or automation (see ``identifier_aliases``). The regex matches the
+    hidden entity_ids plus the alias terms that run a hidden script without
+    naming it. Built only through :meth:`from_hidden`, so ``regex`` is ``None``
+    exactly when ``hidden`` is empty and every scan sees one consistent view.
+    """
+
+    hidden: frozenset[str]
+    regex: re.Pattern[str] | None
+    identifier_aliases: IdentifierAliases = field(hash=False)
+
+    @classmethod
+    def from_hidden(
+        cls, hidden: set[str], aliases: IdentifierAliases
+    ) -> _HiddenMatcher:
+        terms = hidden | aliases.embedded_terms()
+        return cls(frozenset(hidden), _build_hidden_regex(terms), aliases)
+
+    def exact(self, text: str) -> bool:
+        """Whether ``text`` is a hidden entity_id."""
+        return text in self.hidden
+
+    def embeds(self, text: str) -> bool:
+        """Whether ``text`` is, or embeds, a hidden entity_id (exact included)."""
+        return self.regex is not None and self.regex.search(text) is not None
+
+
+# Sentinel returned for a hidden-naming string value or a mapping whose
+# ``entity_id`` is hidden; its enclosing mapping/sequence omits that value. At the
+# top level it reaches ``_scrub_state_representation``, which treats the
+# representation as un-warnable.
+_DROP_HIDDEN_REFERENCE = object()
+# A visible entity's ``attributes`` mapping carries values derived from related
+# entities (a person's coordinates come from its device trackers), so any hidden
+# reference inside it drops the whole mapping rather than the naming field.
+_ATTRIBUTES_KEY = "attributes"
+
+
+def _scrub_hidden_references(
+    value: Any, matcher: _HiddenMatcher, path: str
+) -> tuple[Any, list[str]]:
+    """Return a scrubbed JSON-shaped value and the JSON paths it omitted."""
+    if isinstance(value, str):
+        if matcher.embeds(value):
+            return _DROP_HIDDEN_REFERENCE, [path]
+        return value, []
+
+    if isinstance(value, dict):
+        return _scrub_hidden_mapping(value, matcher, path)
+
+    if isinstance(value, (list, tuple)):
+        return _scrub_hidden_sequence(value, matcher, path)
+
+    return value, []
+
+
+def _scrub_hidden_mapping(
+    value: dict[Any, Any], matcher: _HiddenMatcher, path: str
+) -> tuple[Any, list[str]]:
+    entity_id = value.get("entity_id")
+    if isinstance(entity_id, str) and matcher.embeds(entity_id):
+        return _DROP_HIDDEN_REFERENCE, [path]
+
+    scrubbed_dict: dict[Any, Any] = {}
+    omitted: list[str] = []
+    for key, item in value.items():
+        child_path = f"{path}.{key}" if path else str(key)
+        if isinstance(key, str) and matcher.embeds(key):
+            omitted.append(f"{path}.<hidden key>" if path else "<hidden key>")
+            continue
+        scrubbed_item, item_omitted = _scrub_hidden_references(
+            item, matcher, child_path
+        )
+        if key == _ATTRIBUTES_KEY and isinstance(item, dict) and item_omitted:
+            omitted.append(child_path)
+            continue
+        omitted.extend(item_omitted)
+        if scrubbed_item is _DROP_HIDDEN_REFERENCE:
+            continue
+        scrubbed_dict[key] = scrubbed_item
+    return scrubbed_dict, omitted
+
+
+def _scrub_hidden_sequence(
+    value: list[Any] | tuple[Any, ...], matcher: _HiddenMatcher, path: str
+) -> tuple[list[Any], list[str]]:
+    scrubbed_list: list[Any] = []
+    omitted: list[str] = []
+    for index, item in enumerate(value):
+        scrubbed_item, item_omitted = _scrub_hidden_references(
+            item, matcher, f"{path}[{index}]"
+        )
+        omitted.extend(item_omitted)
+        if scrubbed_item is _DROP_HIDDEN_REFERENCE:
+            continue
+        scrubbed_list.append(scrubbed_item)
+    return scrubbed_list, omitted
+
+
+def _add_state_content_warning(value: Any, warning: str) -> bool:
+    """Attach the omission warning, or return False when the shape cannot carry it."""
+    if not isinstance(value, dict):
+        return False
+    warnings = value.get("warnings")
+    if warnings is None:
+        value["warnings"] = [warning]
+        return True
+    if not isinstance(warnings, list):
+        return False
+    if warning not in warnings:
+        warnings.append(warning)
+    return True
+
+
+class _ScrubAttempt(NamedTuple):
+    """One JSON representation's scrub outcome.
+
+    ``value`` is the scrubbed copy (warning attached) only when ``warnable`` is
+    true; otherwise it is the untouched original, retained so the outbound scan
+    still sees the hidden reference. ``warnable`` is vacuously true when
+    ``omissions`` is zero.
+    """
+
+    value: Any
+    omissions: int
+    warnable: bool
+
+
+class _ScrubTally(NamedTuple):
+    """Committed omissions plus representations that could not carry a warning."""
+
+    omissions: int
+    mutated_representations: int
+    unwarnable_representations: int
+
+
+def _scrub_state_representation(value: Any, matcher: _HiddenMatcher) -> _ScrubAttempt:
+    """Scrub one JSON value, retaining its original unless a warning can attach."""
+    scrubbed, omitted = _scrub_hidden_references(value, matcher, "")
+    if not omitted:
+        return _ScrubAttempt(value, 0, True)
+    if scrubbed is _DROP_HIDDEN_REFERENCE or not _add_state_content_warning(
+        scrubbed, _state_content_warning(omitted)
+    ):
+        return _ScrubAttempt(value, len(omitted), False)
+    return _ScrubAttempt(scrubbed, len(omitted), True)
+
+
+def _scrub_state_result(result: ToolResult, matcher: _HiddenMatcher) -> _ScrubTally:
+    """Scrub ha_get_state JSON representations while preserving a warning.
+
+    A representation is replaced only when its top-level shape can carry the
+    generic omission warning. Otherwise the original is retained and counted in
+    ``unwarnable_representations`` so the caller refuses the result rather than
+    silently returning filtered content.
+    """
+    omissions_total = 0
+    mutated_representations = 0
+    unwarnable_representations = 0
     structured = getattr(result, "structured_content", None)
     if structured is not None:
+        attempt = _scrub_state_representation(structured, matcher)
+        if attempt.omissions and attempt.warnable:
+            result.structured_content = attempt.value
+            omissions_total += attempt.omissions
+            mutated_representations += 1
+        elif attempt.omissions:
+            unwarnable_representations += 1
+
+    for block in getattr(result, "content", None) or []:
+        text_value = getattr(block, "text", None)
+        if not isinstance(text_value, str):
+            continue
         try:
-            parts.append(json.dumps(structured, default=str))
-        except (TypeError, ValueError):
-            parts.append(str(structured))
-    return "\n".join(parts)
+            parsed = json.loads(text_value)
+        except json.JSONDecodeError:
+            continue
+        attempt = _scrub_state_representation(parsed, matcher)
+        if attempt.omissions and attempt.warnable:
+            block.text = json.dumps(attempt.value)
+            omissions_total += attempt.omissions
+            mutated_representations += 1
+        elif attempt.omissions:
+            unwarnable_representations += 1
+
+    return _ScrubTally(
+        omissions_total,
+        mutated_representations,
+        unwarnable_representations,
+    )
 
 
 def _tool_error_text(exc: ToolError) -> str:
@@ -234,42 +487,47 @@ def _unscannable_reason(name: str, args: dict[str, Any]) -> str | None:
     return None
 
 
-def _coerce_arguments(arguments: Any) -> dict[str, Any] | None:
-    """Normalise a proxy envelope's ``arguments`` to a dict or None (mirrors read_only)."""
-    if isinstance(arguments, dict):
-        return arguments
-    if arguments is None:
-        return {}
-    if isinstance(arguments, str):
-        try:
-            parsed = json.loads(arguments)
-        except (json.JSONDecodeError, ValueError):
-            return None
-        return parsed if isinstance(parsed, dict) else None
-    return None
+def _unwrap_proxy_call(args: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """Extract the innermost proxy target and arguments, or None if unusable.
 
-
-def _unwrap_proxy_call(args: dict[str, Any]) -> dict[str, Any] | None:
-    """Extract the innermost proxy-envelope ``arguments`` dict, or None if unusable.
-
-    Mirrors ``ReadOnlyMiddleware._unwrap_proxy_call``: the categorized call proxies
+    Mirrors ``ReadOnlyMiddleware._unwrap_proxy_call``: the dispatching call proxies
     accept ``arguments`` as a JSON string, so an inner exact entity_id match would
     otherwise be seen only as an embedded (generic-refusal) hit on the raw string.
-    Unwrapping parses it so the inner exact id yields concealment instead.
+    Unwrapping parses it so the inner exact id yields concealment instead. Retired
+    tool names are normalized because alias middleware rewrites only the outer
+    message, not names inside client-supplied envelopes.
     """
-    name = args.get("name")
-    arguments = _coerce_arguments(args.get("arguments"))
+    raw_name = args.get("name")
+    if not isinstance(raw_name, str):
+        return None
+    name = current_tool_name(raw_name)
+    arguments = coerce_proxy_arguments(args.get("arguments"))
     while (
-        isinstance(name, str)
-        and name in PROXY_META_TOOLS
+        name in CALL_PROXY_META_TOOLS
         and isinstance(arguments, dict)
         and isinstance(arguments.get("name"), str)
     ):
-        name = arguments.get("name")
-        arguments = _coerce_arguments(arguments.get("arguments"))
-    if not isinstance(name, str) or arguments is None:
+        raw_name = arguments["name"]
+        name = current_tool_name(raw_name)
+        arguments = coerce_proxy_arguments(arguments.get("arguments"))
+    if arguments is None:
         return None
-    return arguments
+    return name, arguments
+
+
+def _effective_tool_call(name: str, args: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Resolve a dispatching proxy to the call that will actually execute.
+
+    Search is a meta-tool but not a dispatcher, so its incidental ``name`` key
+    must never be treated as executable. If a call-proxy envelope is malformed,
+    retain the outer proxy and raw arguments: visibility enforcement stays active,
+    then the proxy emits its own validation error without dispatching anything.
+    """
+    name = current_tool_name(name)
+    if name not in CALL_PROXY_META_TOOLS:
+        return name, args
+    inner = _unwrap_proxy_call(args)
+    return inner if inner is not None else (name, args)
 
 
 def _config_cache_key(config: VisibilityConfig) -> str:
@@ -302,8 +560,10 @@ class _VisibilityEnforcementBase(Middleware):
             resolver.load_visibility_config, resolver.get_data_dir()
         )
 
-    async def _active_config(self, tool_name: str) -> VisibilityConfig | None:
-        """Return the config when enforce is active, ``None`` when passthrough.
+    async def _load_config_or_last_good(
+        self, tool_name: str
+    ) -> VisibilityConfig | None:
+        """Load the config, falling back to the last good load (``None`` if none).
 
         The active-mode gate must not crash the call with an opaque trace on an
         unloadable config (a hand-edit typo would break EVERY tool call), nor
@@ -311,7 +571,11 @@ class _VisibilityEnforcementBase(Middleware):
         enforce was on). Policy: fall back to the last config this process
         loaded successfully — for the common non-enforce install that preserves
         availability, and for an enforce install it preserves the boundary.
-        With no good load ever, fail CLOSED like PolicyMiddleware does.
+        With no good load ever, the caller fails CLOSED like PolicyMiddleware.
+
+        Each half diagnoses a distinct config-load failure. A context-local
+        marker suppresses only the second traceback when both halves fail during
+        the same call.
         """
         config: VisibilityConfig | None
         try:
@@ -319,11 +583,55 @@ class _VisibilityEnforcementBase(Middleware):
             self._last_good_config = config
         except Exception:
             config = self._last_good_config
-            logger.warning(
-                "visibility enforce: config load failed; %s",
-                "using last-known-good config" if config else "failing closed",
-                exc_info=True,
-            )
+            if config is not None:
+                outcome = "using last-known-good config"
+            elif tool_name == _REPORT_ISSUE_TOOL:
+                outcome = (
+                    "allowing ha_report_issue because its diagnostic exemption "
+                    "defaults to unrestricted"
+                )
+            else:
+                outcome = "failing closed"
+            warning_emitted = _config_load_warning_emitted.get()
+            if warning_emitted is not True:
+                logger.warning(
+                    "visibility enforce: config load failed; %s",
+                    outcome,
+                    exc_info=True,
+                )
+                if warning_emitted is not None:
+                    _config_load_warning_emitted.set(True)
+        return config
+
+    async def _active_config(
+        self,
+        tool_name: str,
+        *,
+        emit_report_issue_diagnostic: bool = False,
+    ) -> VisibilityConfig | None:
+        """Return the config when enforce is active, ``None`` when passthrough."""
+        if tool_name in _UNGATED_TOOLS or tool_name.startswith(_UNGATED_PREFIX):
+            return None
+        config = await self._load_config_or_last_good(tool_name)
+        # ``ha_report_issue`` is an unconditional diagnostic escape hatch while
+        # the toggle is off, not only a registry-failure fallback. A missing or
+        # corrupt first config load follows that safe default; a last-known-good
+        # explicit opt-in continues to enforce.
+        if tool_name == _REPORT_ISSUE_TOOL and (
+            config is None or not config.restrict_report_issue
+        ):
+            if (
+                emit_report_issue_diagnostic
+                and config is not None
+                and config.enabled
+                and config.enforce
+                and config_has_active_hide_dimensions(config)
+            ):
+                logger.info(
+                    "visibility enforce: bypassing ha_report_issue because "
+                    "restrict_report_issue=false"
+                )
+            return None
         if config is None:
             _raise_enforced(tool_name, _CONFIG_LOAD_FAILED_REASON)
         if not (
@@ -334,11 +642,11 @@ class _VisibilityEnforcementBase(Middleware):
             return None
         return config
 
-    async def _hidden_and_regex(
-        self, config: VisibilityConfig
-    ) -> tuple[set[str], re.Pattern[str] | None]:
-        """Resolve the hidden set + regex through the module-shared cache."""
-        return await _hidden_cache.get(config, self._get_client())
+    async def _hidden_matcher(
+        self, config: VisibilityConfig, *, fresh: bool = False
+    ) -> _HiddenMatcher:
+        """Resolve the hidden set, aliases and regex through the module-shared cache."""
+        return await _hidden_cache.get(config, self._get_client(), fresh=fresh)
 
 
 class VisibilityInboundEnforcement(_VisibilityEnforcementBase):
@@ -354,41 +662,66 @@ class VisibilityInboundEnforcement(_VisibilityEnforcementBase):
     async def on_call_tool(
         self, context: MiddlewareContext, call_next: CallNext
     ) -> Any:
-        config = await self._active_config(context.message.name)
+        token = _config_load_warning_emitted.set(False)
+        try:
+            return await self._on_call_tool(context, call_next)
+        finally:
+            _config_load_warning_emitted.reset(token)
+
+    async def _on_call_tool(
+        self, context: MiddlewareContext, call_next: CallNext
+    ) -> Any:
+        name = context.message.name
+        args = context.message.arguments or {}
+        effective_name, effective_args = _effective_tool_call(name, args)
+        config = await self._active_config(
+            effective_name, emit_report_issue_diagnostic=True
+        )
         if config is None:
             return await call_next(context)
 
-        name = context.message.name
-        args = context.message.arguments or {}
-
-        reason = _unscannable_reason(name, args)
+        reason = _unscannable_reason(effective_name, effective_args)
         if reason is not None:
-            logger.info("visibility enforce: refused unscannable call to %s", name)
-            _raise_enforced(name, reason)
+            logger.info(
+                "visibility enforce: refused unscannable call to %s", effective_name
+            )
+            _raise_enforced(effective_name, reason)
 
         try:
-            hidden, regex = await self._hidden_and_regex(config)
+            matcher = await self._hidden_matcher(
+                config, fresh=is_trace_query(effective_name, effective_args)
+            )
         except VisibilityDataUnavailable:
-            _raise_enforced(name, _FAIL_CLOSED_REASON)
+            _raise_enforced(effective_name, _FAIL_CLOSED_REASON)
 
-        self._scan_inbound(name, args, hidden, regex)
+        bare = hidden_identifier_argument(
+            effective_name, effective_args, matcher.identifier_aliases
+        )
+        if bare is not None:
+            logger.info(
+                "visibility enforce: concealed hidden entity addressed by bare "
+                "identifier in %s call",
+                effective_name,
+            )
+            _conceal_as_not_found(bare)
+        self._scan_inbound(effective_name, name, args, matcher)
         return await call_next(context)
 
     def _scan_inbound(
         self,
         name: str,
+        outer_name: str,
         args: dict[str, Any],
-        hidden: set[str],
-        regex: re.Pattern[str] | None,
+        matcher: _HiddenMatcher,
     ) -> None:
         """Conceal on an exact hidden-id argument; refuse on an embedded one."""
         exact: str | None = None
         embedded = False
-        if name in PROXY_META_TOOLS:
+        if current_tool_name(outer_name) in CALL_PROXY_META_TOOLS:
             inner = _unwrap_proxy_call(args)
             if inner is not None:
-                exact, embedded = _scan_value(inner, hidden, regex)
-        raw_exact, raw_embedded = _scan_value(args, hidden, regex)
+                exact, embedded = _scan_value(inner[1], matcher)
+        raw_exact, raw_embedded = _scan_value(args, matcher)
         exact = exact or raw_exact
         embedded = embedded or raw_embedded
         if exact is not None:
@@ -409,38 +742,63 @@ class VisibilityOutboundEnforcement(_VisibilityEnforcementBase):
     async def on_call_tool(
         self, context: MiddlewareContext, call_next: CallNext
     ) -> Any:
-        config = await self._active_config(context.message.name)
+        name = context.message.name
+        args = context.message.arguments or {}
+        effective_name, _effective_args = _effective_tool_call(name, args)
+        config = await self._active_config(effective_name)
         if config is None:
             return await call_next(context)
-        name = context.message.name
         try:
-            _hidden, regex = await self._hidden_and_regex(config)
+            matcher = await self._hidden_matcher(config)
         except VisibilityDataUnavailable:
-            _raise_enforced(name, _FAIL_CLOSED_REASON)
-        return await self._call_and_scan_outbound(name, context, call_next, regex)
+            _raise_enforced(effective_name, _FAIL_CLOSED_REASON)
+        return await self._call_and_scan_outbound(
+            effective_name, context, call_next, matcher
+        )
 
     async def _call_and_scan_outbound(
         self,
         name: str,
         context: MiddlewareContext,
         call_next: CallNext,
-        regex: re.Pattern[str] | None,
+        matcher: _HiddenMatcher,
     ) -> Any:
         """Run the tool; refuse if its output (or a tool error) names a hidden id."""
         try:
             result = await call_next(context)
         except ToolError as exc:
-            if regex is not None and regex.search(_tool_error_text(exc)):
+            if matcher.embeds(_tool_error_text(exc)):
                 logger.info("visibility enforce: refused tool error from %s", name)
                 _raise_enforced(name, _outbound_reason(name))
             raise
-        if regex is not None and regex.search(_serialize_result(result)):
+        scrub_tally = _ScrubTally(0, 0, 0)
+        if name == _STATE_TOOL:
+            scrub_tally = _scrub_state_result(result, matcher)
+            if scrub_tally.unwarnable_representations:
+                # A retained original still names a hidden id; refuse here rather
+                # than rely on the scan below catching it.
+                logger.info(
+                    "visibility enforce: ha_get_state scrub could not attach its "
+                    "omission warning to %d JSON representation(s); refused",
+                    scrub_tally.unwarnable_representations,
+                )
+                _raise_enforced(name, _outbound_reason(name))
+        if matcher.embeds(serialize_result(result)) or result_reveals_hidden(
+            result_payloads(result), matcher.identifier_aliases
+        ):
             logger.info("visibility enforce: refused result from %s", name)
             _raise_enforced(name, _outbound_reason(name))
+        if scrub_tally.mutated_representations:
+            logger.info(
+                "visibility enforce: scrubbed %d omission(s) across %d "
+                "ha_get_state JSON representation(s)",
+                scrub_tally.omissions,
+                scrub_tally.mutated_representations,
+            )
         return result
 
 
-async def _refresh_hidden_set(config: VisibilityConfig, client: Any) -> set[str]:
+async def _refresh_hidden_set(config: VisibilityConfig, client: Any) -> _HiddenMatcher:
     """Fetch registry/states (+device registry when needed) and resolve strictly.
 
     Mirrors the search seam's fetches. Any fetch error, or a strict resolver
@@ -452,9 +810,7 @@ async def _refresh_hidden_set(config: VisibilityConfig, client: Any) -> set[str]
         client.send_websocket_message({"type": "config/entity_registry/list"}),
     ]
     if need_device:
-        coros.append(
-            client.send_websocket_message({"type": "config/device_registry/list"})
-        )
+        coros.append(core_device_list_reply(client))
     fetched = await asyncio.gather(*coros, return_exceptions=True)
     for item in fetched:
         if isinstance(item, BaseException):
@@ -481,7 +837,9 @@ async def _refresh_hidden_set(config: VisibilityConfig, client: Any) -> set[str]
     hidden, _warnings = await load_hidden_set(
         fetched[1], fetched[0], client, device_result, strict=True
     )
-    return hidden
+    return _HiddenMatcher.from_hidden(
+        hidden, build_identifier_aliases(hidden, fetched[1])
+    )
 
 
 class _HiddenSetCache:
@@ -493,52 +851,105 @@ class _HiddenSetCache:
     cold cache and that instance's CLOSED client ("Cannot send a request, as the
     client has been closed" — CI round 3). Every ``get`` therefore takes the
     caller's own live client for any refresh, and all callers share one view of
-    the hidden set. On a refresh failure: fall back to the last-known-good set
-    for the SAME config key (a set computed under a different denylist is a
+    the hidden set. On a TTL refresh failure: fall back to the last-known-good
+    set for the SAME config key (a set computed under a different denylist is a
     different policy); with none, raise ``VisibilityDataUnavailable`` so call
-    gates fail closed. The lock prevents a refresh stampede.
+    gates fail closed. A forced refresh (trace queries) never uses
+    last-known-good: that snapshot may predate a newly registered trace key, so
+    it raises instead. The lock prevents a refresh stampede.
     """
 
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
-        self._hidden: set[str] | None = None
-        self._regex: re.Pattern[str] | None = None
+        self._matcher: _HiddenMatcher | None = None
         self._key: str | None = None
         self._expiry = 0.0
 
     async def get(
-        self, config: VisibilityConfig, client: Any
-    ) -> tuple[set[str], re.Pattern[str] | None]:
+        self, config: VisibilityConfig, client: Any, *, fresh: bool = False
+    ) -> _HiddenMatcher:
         key = _config_cache_key(config)
         now = time.monotonic()
         async with self._lock:
-            if self._hidden is not None and self._key == key and now < self._expiry:
-                return self._hidden, self._regex
+            if (
+                not fresh
+                and self._matcher is not None
+                and self._key == key
+                and now < self._expiry
+            ):
+                return self._matcher
             try:
-                hidden = await _refresh_hidden_set(config, client)
+                matcher = await _refresh_hidden_set(config, client)
             except Exception:
-                if self._hidden is not None and self._key == key:
+                if fresh:
+                    logger.warning(
+                        "visibility enforce: forced hidden-set refresh failed; "
+                        "failing closed",
+                        exc_info=True,
+                    )
+                    raise VisibilityDataUnavailable("hidden set unavailable") from None
+                if self._matcher is not None and self._key == key:
                     logger.warning(
                         "visibility enforce: hidden-set refresh failed; using "
                         "last-known-good set",
                         exc_info=True,
                     )
-                    return self._hidden, self._regex
+                    return self._matcher
                 logger.warning(
                     "visibility enforce: hidden-set refresh failed with no "
                     "last-known-good for this config; failing closed",
                     exc_info=True,
                 )
                 raise VisibilityDataUnavailable("hidden set unavailable") from None
-            regex = _build_hidden_regex(hidden)
-            self._hidden = hidden
-            self._regex = regex
+            self._matcher = matcher
             self._key = key
             self._expiry = now + _CACHE_TTL_SECONDS
-            return hidden, regex
+            return matcher
 
 
 _hidden_cache = _HiddenSetCache()
+
+
+async def _active_matcher(client: Any) -> _HiddenMatcher | None:
+    """The shared matcher while enforce mode is active; ``None`` otherwise or on error.
+
+    Fail-soft: the fail-closed policy is owned by the middleware's call gates,
+    not by the best-effort tool-side scrubs that call this.
+    """
+    try:
+        config = await asyncio.to_thread(
+            resolver.load_visibility_config, resolver.get_data_dir()
+        )
+        if not (
+            config.enabled
+            and config.enforce
+            and config_has_active_hide_dimensions(config)
+        ):
+            return None
+        return await _hidden_cache.get(config, client)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def active_hidden_entity_ids(client: Any) -> frozenset[str]:
+    """The enforced hidden entity_ids, empty while enforce mode is inactive.
+
+    Tools that list entity IDs in a genuine error (``available_script_ids``)
+    drop these so the list neither leaks a hidden ID nor trips the outbound scan.
+    """
+    matcher = await _active_matcher(client)
+    return matcher.hidden if matcher is not None else frozenset()
+
+
+async def active_identifier_aliases(client: Any) -> IdentifierAliases | None:
+    """The hidden items' identifier aliases while enforce mode is active."""
+    matcher = await _active_matcher(client)
+    return matcher.identifier_aliases if matcher is not None else None
+
+
+def refuse_hidden_config_file(tool_name: str) -> NoReturn:
+    """Refuse a config-file read whose file defines a hidden item."""
+    _raise_enforced(tool_name, _CONFIG_FILE_REASON)
 
 
 async def active_hidden_regex(client: Any) -> re.Pattern[str] | None:
@@ -551,23 +962,9 @@ async def active_hidden_regex(client: Any) -> re.Pattern[str] | None:
     omit" contract into a wholesale refusal. ``client`` is the CALLER's live
     client, used only if the shared cache needs a refresh (the middleware's
     inbound gate for the request in flight normally primed it already).
-    Fail-soft to ``None`` on any load/data error: the fail-closed policy is
-    owned by the middleware's call gates, not by this best-effort scrub seam.
     """
-    try:
-        config = await asyncio.to_thread(
-            resolver.load_visibility_config, resolver.get_data_dir()
-        )
-        if not (
-            config.enabled
-            and config.enforce
-            and config_has_active_hide_dimensions(config)
-        ):
-            return None
-        _hidden, regex = await _hidden_cache.get(config, client)
-    except Exception:
-        return None
-    return regex
+    matcher = await _active_matcher(client)
+    return matcher.regex if matcher is not None else None
 
 
 def scrub_records(
@@ -583,7 +980,7 @@ def scrub_records(
     for record in records:
         try:
             blob = json.dumps(record, default=str)
-        except (TypeError, ValueError):
+        except TypeError, ValueError:
             blob = str(record)
         if not regex.search(blob):
             kept.append(record)

@@ -1,7 +1,8 @@
 """Read-only YAML fragment lookup for Home Assistant config files.
 
 The read companion to ``ha_config_set_yaml``: same ``file`` + ``yaml_path``
-addressing, so a fragment found here can be handed straight back to the editor.
+addressing, so a fragment found here under a ``yaml_path`` the editor accepts
+for that file can be handed straight back to it.
 
 **Dependency:** Requires the ha_mcp_tools custom component (the round-trip parse
 needs ``ruamel``, which the component carries and the MCP server does not).
@@ -16,21 +17,26 @@ back door.
 """
 
 import asyncio
+import fnmatch
+import json
 import logging
 import re
 from typing import Annotated, Any
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
 from pydantic import Field
 
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import tool
+
 from ..errors import ErrorCode, create_error_response
+from .config_file_visibility import refuse_reading_hidden_definitions
 from .helpers import (
     exception_to_structured_error,
     log_tool_usage,
     raise_tool_error,
     register_tool_methods,
 )
+from .tool_hints import read_only_hints
 from .tools_filesystem import (
     _assert_mcp_tools_available,
     call_mcp_tools_service,
@@ -105,6 +111,17 @@ def _unwrap_or_raise(result: Any, service: str, context: dict[str, Any]) -> Any:
     if not unwrapped.get("success", True):
         raise_tool_error(unwrapped)
     return unwrapped
+
+
+def _failure_reason(err: Exception) -> str:
+    """Readable resolver failure without the serialized error envelope."""
+    try:
+        payload = json.loads(str(err))
+    except json.JSONDecodeError, TypeError:
+        return str(err)
+    if isinstance(payload, dict):
+        return _failure_text(payload)
+    return str(err)
 
 
 def _failure_text(payload: dict[str, Any]) -> str:
@@ -226,6 +243,103 @@ def _evaluate_read(
     return match, None
 
 
+def _matches_discovered_file(path: str, pattern: str) -> bool:
+    """Match a Core-discovered path against the caller's glob.
+
+    The directory is literal: the tool resolves folders by name, so a bracket
+    in ``pack[a]ges`` must not select the sibling ``packages``. The file name
+    keeps fnmatch expansion, and an exact path is kept because a bracketed name
+    cannot match itself (the same ambiguity ``_resolve_target_files`` handles
+    with its escaped-literal lookup).
+    """
+    if path == pattern:
+        return True
+    directory, _, name = pattern.rpartition("/")
+    if directory and not path.startswith(directory + "/"):
+        return False
+    candidate = path[len(directory) + 1 :] if directory else path
+    return fnmatch.fnmatch(candidate, name)
+
+
+async def _find_yaml_key_files(
+    client: Any, file: str, yaml_path: str
+) -> list[str] | None:
+    """Use Core's annotated load to find files defining ``yaml_path``.
+
+    ``None`` means the component cannot answer (or the load failed), so the
+    caller keeps the glob fallback. The result is filtered by the caller's
+    ``file`` pattern so a scoped search stays scoped.
+    """
+    try:
+        unwrapped = _unwrap_or_raise(
+            await call_mcp_tools_service(
+                client, "find_yaml_key", {"yaml_path": yaml_path}
+            ),
+            "find_yaml_key",
+            {"file": file},
+        )
+    except Exception:
+        logger.debug("find_yaml_key unavailable; using glob fallback", exc_info=True)
+        return None
+    files = unwrapped.get("files")
+    if not isinstance(files, list):
+        return None
+    return sorted(
+        str(path)
+        for path in files
+        if isinstance(path, str) and _matches_discovered_file(str(path), file)
+    )
+
+
+async def _resolve_all_targets(
+    client: Any, file: str, yaml_path: str
+) -> tuple[list[tuple[str, bool]], list[str], set[str]]:
+    """Merge Core-discovered files with the glob resolver's matches.
+
+    Discovery sees only what Core loaded, so a package file Core rejected is
+    absent and the resolver still runs. A resolver failure becomes a warning
+    when discovery already produced targets, because those reads are still
+    valid. Each target keeps the resolver's named-vs-expanded provenance.
+    """
+    targets: list[tuple[str, bool]] = []
+    warnings: list[str] = []
+    discovered_paths: set[str] = set()
+    discovered: list[str] | None = None
+    if _has_glob(file):
+        discovered = await _find_yaml_key_files(client, file, yaml_path)
+        if discovered is None:
+            warnings.append(
+                "Core's loaded YAML could not be searched; files included from "
+                "packages or subfolders may be missing from this result."
+            )
+        elif discovered:
+            named_literal = _names_a_file(file.rpartition("/")[2])
+            targets = [
+                (path, not (named_literal and path == file)) for path in discovered
+            ]
+            discovered_paths = {path for path, _ in targets}
+    resolved: list[tuple[str, bool]] = []
+    try:
+        resolved, resolver_warnings = await _resolve_target_files(client, file)
+    except Exception as err:
+        if not targets and discovered is None:
+            raise
+        reason = _failure_reason(err).rstrip(". ")
+        resolver_warnings = [
+            f"Glob expansion failed: {reason}. Files matching the pattern "
+            "may be missing from this result."
+        ]
+        if _names_a_file(file.rpartition("/")[2]) and file not in discovered_paths:
+            resolver_warnings.append(
+                f"{file} was not searched because its listing failed."
+            )
+    warnings.extend(resolver_warnings)
+    seen = {path for path, _ in targets}
+    targets.extend((path, expanded) for path, expanded in resolved if path not in seen)
+    targets.sort(key=lambda target: target[0])
+    return targets, warnings, discovered_paths
+
+
 async def _list_files_matching(
     client: Any, file: str, directory: str, pattern: str
 ) -> list[str]:
@@ -319,9 +433,9 @@ async def _resolve_target_files(
     The guard is any bracket, not a closed class: an unclosed or empty bracket
     is literal to ``fnmatch`` and so matches its own name, which means both
     lookups return it and the deduplication below is what keeps it a single
-    target. A listing failure on either lookup raises rather than degrading -
-    the directory is the same one in both calls, so a failure there is a broken
-    request, not one unreadable file among several.
+    target. A listing failure on either lookup raises rather than degrading;
+    the caller's discovery-aware handling decides whether that becomes a
+    warning or a hard error.
 
     When the literal lookup comes back empty the caller named a file that does
     not exist, and the pattern's siblings would otherwise be reported as if the
@@ -364,11 +478,7 @@ class YamlReadTools:
     @tool(
         name="ha_config_get_yaml",
         tags={"System", "beta"},
-        annotations={
-            "readOnlyHint": True,
-            "openWorldHint": False,
-            "title": "Read YAML Config Fragment",
-        },
+        annotations=read_only_hints("Read YAML Config Fragment", open_world=False),
     )
     @log_tool_usage
     async def ha_config_get_yaml(
@@ -389,9 +499,9 @@ class YamlReadTools:
                 default="configuration.yaml",
                 description=(
                     "Config-relative file to read. Accepts an fnmatch glob to "
-                    "search several files at once — 'packages/*.yaml' matches one "
-                    "directory level, not a nested tree. Use the glob to find "
-                    "which file defines a key."
+                    "search several files at once. When the component can load "
+                    "Core's config, key discovery follows packages and include "
+                    "directories recursively."
                 ),
             ),
         ] = "configuration.yaml",
@@ -419,8 +529,10 @@ class YamlReadTools:
         """Get the current YAML fragment under a key, from one config file or across a glob.
 
         Use before ha_config_set_yaml to inspect what a key currently holds, and
-        to find which file defines it — the returned ``file`` + ``yaml_path`` are
-        exactly the arguments that address the same fragment for an edit.
+        to find which file defines it — when ha_config_set_yaml accepts this
+        ``yaml_path`` for the returned ``file``, the two are exactly the
+        arguments that address the same fragment for an edit. To change a value
+        nested below such a key, read the whole key and replace it.
 
         Not for storage-mode items: automations, scripts and scenes created
         through the UI live outside YAML — read those with ha_config_get_automation,
@@ -438,9 +550,12 @@ class YamlReadTools:
         try:
             await _assert_mcp_tools_available(self._client)
 
-            # Strictness is a property of each target, not of the request, so
-            # the resolver reports which targets were named rather than expanded.
-            targets, resolve_warnings = await _resolve_target_files(self._client, file)
+            targets, resolve_warnings, discovered_paths = await _resolve_all_targets(
+                self._client, file, yaml_path
+            )
+            await refuse_reading_hidden_definitions(
+                self._client, "ha_config_get_yaml", [target for target, _ in targets]
+            )
 
             extra: dict[str, Any] = {"include_parsed": True} if include_parsed else {}
             # The reads are independent, so fan them out rather than paying N
@@ -479,6 +594,13 @@ class YamlReadTools:
                     files_unreadable += 1
                 elif match:
                     matches.append(match)
+                elif target in discovered_paths:
+                    warnings.append(
+                        f"{target} is annotated as defining {yaml_path} in "
+                        "Core's loaded config, but the dotted path is not "
+                        "readable from that file; a merged include directory "
+                        "may define it."
+                    )
 
             result: dict[str, Any] = {
                 "success": True,
@@ -499,7 +621,7 @@ class YamlReadTools:
 
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             exception_to_structured_error(
                 e,
                 context={
@@ -516,7 +638,7 @@ class YamlReadTools:
             # raise_tool_error() call CodeQL treats as returning. This try ends
             # in a real return, so the same trailer is provably dead there
             # (py/unreachable-statement).
-            return None
+            return None  # pragma: no cover - CodeQL fallthrough guard
 
 
 def register_yaml_read_tools(mcp: Any, client: Any, **kwargs: Any) -> None:

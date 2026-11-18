@@ -6,11 +6,12 @@ Home Assistant script configurations.
 """
 
 import logging
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
-from fastmcp.exceptions import ToolError
-from fastmcp.tools import tool
 from pydantic import Field
+
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.tools import tool
 
 from ..client.rest_client import (
     HomeAssistantAPIError,
@@ -33,37 +34,44 @@ from .best_practice_checker import (
 from .best_practice_checker import (
     check_script_config as _check_best_practices,
 )
-from .component_config_reads import fetch_entity_lookup_via_component
-from .helpers import (
-    exception_to_structured_error,
-    log_tool_usage,
-    raise_tool_error,
-    register_tool_methods,
-    validate_identifier_not_empty,
+from .blueprint_substitute import (
+    TakenControl,
+    take_control_config,
+    validate_write_modes,
 )
-from .reference_validator import validate_config_references
-from .tools_config_helpers import validate_registry_ids
-from .util_helpers import (
-    JSON_STRING_COERCION,
+from .coercion import JSON_STRING_COERCION, parse_json_param
+from .config_helpers.registry import validate_registry_ids
+from .config_write_helpers import (
     apply_entity_category,
     attach_skill_content,
     augment_error_dict_with_skill_content,
     augment_tool_error_with_skill_content,
     fetch_entity_category,
     merge_validation_meta,
-    parse_json_param,
-    wait_for_entity_registered,
-    wait_for_entity_removed,
 )
+from .entity_registration import resolve_entity_id_after_write
+from .helpers import (
+    exception_to_structured_error,
+    log_tool_usage,
+    raise_tool_error,
+    register_tool_methods,
+    reject_malformed_list_fields,
+    validate_identifier_not_empty,
+)
+from .reference_validator import validate_config_references as ref_check
+from .tool_hints import read_only_hints, write_hints
+from .util_helpers import list_visible_registry_ids
+from .ws_waiters import verify_entity_removed, wait_for_entity_registered
 
 logger = logging.getLogger(__name__)
 
 
-# Scripts share the automation skill mapping — both use
-# action / condition / trigger templates and benefit from the same
-# native-vs-template guidance.
+# Scripts attach the same files as automations: a script sequence uses
+# actions, conditions and ``wait_for_trigger``. The actions file comes first
+# because the strict-mode block error names the first entry.
 _SCRIPT_SKILL_FILES: tuple[str, ...] = (
-    "references/automation-patterns.md",
+    "references/automation-actions.md",
+    "references/triggers-and-conditions.md",
     "references/template-guidelines.md",
 )
 
@@ -91,6 +99,11 @@ def _strip_empty_script_fields(config: dict[str, Any]) -> dict[str, Any]:
     return cleaned
 
 
+def _skip_script_run_backup(kwargs: dict[str, Any]) -> bool:
+    """Skip config snapshots for a run start/stop (no config change)."""
+    return kwargs.get("run") is not None
+
+
 class ConfigScriptTools:
     """Script configuration management tools for Home Assistant."""
 
@@ -100,12 +113,7 @@ class ConfigScriptTools:
     @tool(
         name="ha_config_get_script",
         tags={"Scripts"},
-        annotations={
-            "openWorldHint": False,
-            "idempotentHint": True,
-            "readOnlyHint": True,
-            "title": "Get Script Config",
-        },
+        annotations=read_only_hints("Get Script Config", open_world=False),
     )
     @log_tool_usage
     async def ha_config_get_script(
@@ -118,13 +126,13 @@ class ConfigScriptTools:
         ],
     ) -> dict[str, Any]:
         """
-        Retrieve Home Assistant script configuration.
+        Get Home Assistant script configuration.
 
         Returns the complete configuration for a script, including sequence, mode, fields, and other settings.
 
-        The returned `config_hash` is stable across consecutive reads of an unchanged config — `compute_config_hash` documents the underlying contract.
+        The returned `config_hash` stays the same across consecutive reads of an unchanged config.
 
-        The returned `script_id` is the canonical bare storage key resolved by the REST client (matching what `ha_config_set_script` / `ha_config_remove_script` expect), falling back to the input identifier on the rare path where the REST envelope omits it. A leading `script.` prefix on the input is stripped before lookup — behavioral parity with `ha_config_get_automation` (mechanism differs: automations resolve via state lookup; scripts strip the prefix).
+        The returned `script_id` is the canonical bare storage key resolved by the REST client (matching what `ha_config_set_script` / `ha_config_remove_script` expect), falling back to the input identifier on the rare path where the REST envelope omits it. Prefix handling matches `ha_config_get_automation` in behavior (mechanism differs: automations resolve through the entity registry; scripts strip the prefix).
 
         EXAMPLES:
         - Get script (bare form): ha_config_get_script("morning_routine")
@@ -175,7 +183,7 @@ class ConfigScriptTools:
             return await self._legacy_get_script(script_id)
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             exception_to_structured_error(
                 e,
                 context={"script_id": script_id},
@@ -209,7 +217,7 @@ class ConfigScriptTools:
             self._client, entity_id, "script", cat_warnings
         )
         if cat_id:
-            config_result["category"] = cat_id
+            actual_config["category"] = cat_id
 
         # Issue #1334: return the canonical storage key from the
         # rest_client envelope so callers can thread the result into
@@ -231,44 +239,21 @@ class ConfigScriptTools:
             "success": True,
             "action": "get",
             "script_id": canonical_id,
-            "config": config_result,
+            # The script BODY, not the REST envelope. Returning the envelope
+            # here put ``{success, script_id, config}`` under ``config``, so
+            # ``response["config"]["sequence"]`` did not exist and every caller
+            # had to unwrap twice -- the e2e carried a helper to do exactly
+            # that. ``ha_config_get_automation`` returns the body, this
+            # docstring promises the body, and the hash is already computed
+            # over the body.
+            "config": actual_config,
             "config_hash": config_hash_value,
         }
-        # Top level, not inside ``config``: ``config_result`` becomes the
-        # nested payload, and warnings are a top-level list[str] by contract.
+        # Top level, not inside ``config``: warnings are a top-level list[str]
+        # by contract.
         if cat_warnings:
             response.setdefault("warnings", []).extend(cat_warnings)
         return response
-
-    async def _list_script_entity_ids(self) -> list[str]:
-        """Best-effort list of bare script IDs (up to 10) from the entity registry.
-
-        Returns the bare storage keys (e.g. ``morning_routine``), stripping
-        the ``script.`` entity_id prefix — ``ha_config_get_script`` /
-        ``ha_config_set_script`` / ``ha_config_remove_script`` all take the
-        bare form, so the entity_id prefix would force callers to strip it
-        before retry. Returns an empty list on any failure — caller treats
-        absence as "no IDs to report" rather than failing the structured
-        error raise. The 10-entry cap lives here (not at the callers) so a
-        new call site can't accidentally bloat the error payload.
-        """
-        try:
-            result = await self._client.send_websocket_message(
-                {"type": "config/entity_registry/list"}
-            )
-        except Exception as e:
-            logger.debug("Failed to list script entity_ids from registry: %s", e)
-            return []
-        entries = result.get("result", []) if isinstance(result, dict) else result
-        if not isinstance(entries, list):
-            return []
-        return [
-            entry["entity_id"][len("script.") :]
-            for entry in entries
-            if isinstance(entry, dict)
-            and isinstance(entry.get("entity_id"), str)
-            and entry["entity_id"].startswith("script.")
-        ][:10]
 
     async def _raise_script_not_found(self, script_id: str) -> None:
         """Raise a structured RESOURCE_NOT_FOUND ToolError for a missing script.
@@ -279,7 +264,9 @@ class ConfigScriptTools:
         ``ha_config_remove_script``). Populates ``available_script_ids``
         (up to 10 bare IDs) from the entity registry.
         """
-        available_ids = await self._list_script_entity_ids()
+        available_ids = await list_visible_registry_ids(
+            self._client, "script", bare=True
+        )
         raise_tool_error(
             create_error_response(
                 ErrorCode.RESOURCE_NOT_FOUND,
@@ -426,6 +413,9 @@ class ConfigScriptTools:
             )
 
         config_dict = cast(dict[str, Any], parsed_config)
+        reject_malformed_list_fields(
+            config_dict, ("sequence",), {"script_id": script_id}
+        )
 
         # Extract category before sending to HA REST API (which rejects unknown keys).
         # Parameter takes precedence over config dict value.
@@ -454,13 +444,16 @@ class ConfigScriptTools:
     @tool(
         name="ha_config_set_script",
         tags={"Scripts"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "title": "Create or Update Script",
-        },
+        annotations=write_hints(
+            "Create or Update Script",
+            destructive=True,
+            idempotent=False,
+            open_world=False,
+        ),
     )
-    @with_auto_backup(domain="script", id_param="script_id")
+    @with_auto_backup(
+        domain="script", id_param="script_id", skip_fn=_skip_script_run_backup
+    )
     @log_tool_usage
     async def ha_config_set_script(
         self,
@@ -474,8 +467,7 @@ class ConfigScriptTools:
             dict[str, Any] | None,
             JSON_STRING_COERCION,
             Field(
-                description="Script configuration dictionary. Must include EITHER 'sequence' (for regular scripts) OR 'use_blueprint' (for blueprint-based scripts). "
-                "Optional fields: 'alias', 'description', 'icon', 'mode', 'max', 'fields'. "
+                description="Script configuration dictionary. "
                 "Mutually exclusive with python_transform.",
                 default=None,
             ),
@@ -485,7 +477,6 @@ class ConfigScriptTools:
             Field(
                 description="Python expression to transform existing script config. "
                 "Mutually exclusive with config. "
-                "Requires config_hash for validation. "
                 "WARNING: Expressions with infinite loops will hang the server. "
                 "Examples: "
                 "Simple: python_transform=\"config['sequence'][0]['data']['message'] = 'Hello'\" "
@@ -497,11 +488,23 @@ class ConfigScriptTools:
         config_hash: Annotated[
             str | None,
             Field(
-                description="Config hash from ha_config_get_script for optimistic locking. "
-                "REQUIRED for python_transform (validates script unchanged). "
-                "Optional for config updates (validates before full replacement if provided).",
+                description="Config hash from ha_config_get_script for optimistic locking. Required"
+                " for python_transform; optional for config updates (validates before "
+                "full replacement if provided).",
             ),
         ] = None,
+        take_control_of_blueprint: Annotated[
+            bool,
+            Field(
+                description="Convert a blueprint-backed script into an editable "
+                'standalone one -- the UI\'s "Take control". Renders the blueprint '
+                "with its current inputs and saves the result over the same script, "
+                "which keeps its script_id, alias and description and then has its "
+                "own sequence and no 'use_blueprint'. Mutually exclusive with config "
+                "and python_transform.",
+                default=False,
+            ),
+        ] = False,
         category: Annotated[
             str | None,
             Field(
@@ -512,10 +515,36 @@ class ConfigScriptTools:
         wait: Annotated[
             bool,
             Field(
-                description="Wait for script to be queryable before returning. Default: True. Set to False for bulk operations.",
+                description="Wait for script to be queryable before returning. Set to False for "
+                "bulk operations.",
                 default=True,
             ),
         ] = True,
+        run: Annotated[
+            Literal["start", "stop"] | None,
+            Field(
+                description=(
+                    "Run control, used alone with script_id (no config, "
+                    "python_transform or take_control_of_blueprint): 'start' runs "
+                    "the script (script.turn_on; returns once it has started, "
+                    "without waiting for it to finish), 'stop' stops its running "
+                    "executions (script.turn_off). Stopping does not disable the "
+                    "script; Home Assistant has no script enable/disable."
+                ),
+                default=None,
+            ),
+        ] = None,
+        variables: Annotated[
+            dict[str, Any] | None,
+            JSON_STRING_COERCION,
+            Field(
+                description=(
+                    "With run='start': values for the script's fields, passed to "
+                    "the run as its variables."
+                ),
+                default=None,
+            ),
+        ] = None,
         MandatoryBPS: Annotated[
             bool,
             Field(default=True),
@@ -524,140 +553,44 @@ class ConfigScriptTools:
         # here — see strict_bps.py for the declaration contract.
         BestPracticeKey: BestPracticeKeyParam = None,
     ) -> dict[str, Any]:
-        """
-        Create or update a Home Assistant script.
+        """Create or update a Home Assistant script.
 
         MUST call ha_get_skill_guide OR refer to your locally installed skills first.
 
-        PREFER NATIVE ACTIONS OVER TEMPLATES (read this before writing any `{{ ... }}`):
-        Native actions are validated at config load, fail loudly, and do not bypass HA's
-        schema. Templates in logic positions fail silently and obscure intent.
-        - `choose` / `if/then/else` instead of template-based service names
-        - `wait_for_trigger` instead of `wait_template`
-        - Native `for:` field on `state` conditions inside `choose`/`if`, and on
-          `state`/`numeric_state` triggers in `wait_for_trigger`, instead of
-          `{{ now() - X.last_changed > timedelta(...) }}` duration math.
-        - `repeat` with `for_each` instead of template loops
-        - Hardcode `target.entity_id` literals — never `{{ this.entity_id }}`.
-        Templates are appropriate ONLY in `data.*` fields, notification message/title,
-        `event_data`, and `variables`. The reactive best-practice checker on this tool
-        will surface anything in a logic position that should be native; consult the
-        `best_practice_warnings` field on the response and fix before re-submitting.
-        The relevant skill section is auto-embedded under `skill_content` on warnings,
-        and the full `automation-patterns.md` + `template-guidelines.md` references
-        ship under `skill_content` proactively by default. For comprehensive
-        guidance beyond that, call `ha_get_skill_guide`.
+        Prefer native actions (`choose` / `if`, `wait_for_trigger`, `repeat`,
+        `for:`) over templates in logic positions; templates belong only in
+        `data.*`, notification text, `event_data` and `variables`. The
+        best-practice checker reports violations under `best_practice_warnings`.
+        `automation-actions.md`, `triggers-and-conditions.md` and
+        `template-guidelines.md` ship under `skill_content` by default.
 
-        Supports two modes: full config replacement OR Python transformation.
+        Scripts use 'sequence', NOT 'trigger' or 'action'; for trigger-based
+        execution use ha_config_set_automation.
 
-        WHEN TO USE WHICH MODE:
-        - python_transform: RECOMMENDED for edits to existing scripts. Surgical updates.
-        - config: Use for creating new scripts or full restructures.
-
-        IMPORTANT: python_transform requires 'config_hash' from ha_config_get_script().
-
-        PYTHON TRANSFORM EXAMPLES:
-        - Update step: python_transform="config['sequence'][0]['data']['message'] = 'Hello'"
-        - Add step: python_transform="config['sequence'].append({'delay': {'seconds': 5}})"
-        - Remove last step: python_transform="config['sequence'].pop()"
-
-        Creates a new script or updates an existing one with the provided configuration.
-        Supports both regular scripts (with sequence) and blueprint-based scripts.
-
-        Required config fields (choose one):
-            - sequence: List of actions to execute (for regular scripts)
-            - use_blueprint: Blueprint configuration (for blueprint-based scripts)
-
-        Optional config fields:
-            - alias: Display name (defaults to script_id)
-            - description: Script description
-            - icon: Icon to display
-            - mode: Execution mode ('single', 'restart', 'queued', 'parallel')
-            - max: Maximum concurrent executions (for queued/parallel modes)
-            - fields: Input parameters for the script
-
-        SCRIPTS vs AUTOMATIONS: Scripts use 'sequence', NOT 'trigger' or 'action'.
-        If you need trigger-based execution, use ha_config_set_automation instead.
+        MODES (pick one):
+        - python_transform: surgical edits to an existing script. Requires
+          config_hash from ha_config_get_script(), e.g.
+          python_transform="config['sequence'].append({'delay': {'seconds': 5}})"
+        - config: new scripts or full restructures. Needs 'sequence' (regular) or
+          'use_blueprint' {path, input} (blueprint-based).
+        - take_control_of_blueprint: convert a blueprint-backed script into a
+          standalone one. Takes no config of its own.
+        - run (alone with script_id): 'start' runs the script (optional
+          variables), 'stop' stops its running executions. Write config changes
+          in a separate call first: Home Assistant signals no completion of the
+          script reload a write triggers.
 
         EXAMPLES:
+        - Create: ha_config_set_script(script_id="blink_light", config={"alias": "Light Blink", "sequence": [{"action": "light.turn_on", "target": {"entity_id": "light.living_room"}}, {"delay": {"seconds": 2}}, {"action": "light.turn_off", "target": {"entity_id": "light.living_room"}}]})
+        - From a blueprint: ha_config_set_script(script_id="notification_script", config={"alias": "My Notification Script", "use_blueprint": {"path": "notification_script.yaml", "input": {"message": "Hello World"}}})
+        - Take control: ha_config_set_script(script_id="notification_script", take_control_of_blueprint=True)
 
-        Create basic delay script:
-        ha_config_set_script(script_id="wait_script", config={
-            "sequence": [{"delay": {"seconds": 5}}],
-            "alias": "Wait 5 Seconds",
-            "description": "Simple delay script"
-        })
-
-        Create service call script:
-        ha_config_set_script(script_id="blink_light", config={
-            "sequence": [
-                {"action": "light.turn_on", "target": {"entity_id": "light.living_room"}},
-                {"delay": {"seconds": 2}},
-                {"action": "light.turn_off", "target": {"entity_id": "light.living_room"}}
-            ],
-            "alias": "Light Blink",
-            "mode": "single"
-        })
-
-        Create script with parameters:
-        ha_config_set_script(script_id="backup_script", config={
-            "alias": "Backup with Reference",
-            "description": "Create backup with optional reference parameter",
-            "fields": {
-                "reference": {
-                    "name": "Reference",
-                    "description": "Optional reference for backup identification",
-                    "selector": {"text": None}
-                }
-            },
-            "sequence": [
-                {
-                    "action": "hassio.backup_partial",
-                    "data": {
-                        "compressed": False,
-                        "homeassistant": True,
-                        "homeassistant_exclude_database": True,
-                        "name": "Backup_{{ reference | default('auto') }}_{{ now().strftime('%Y%m%d_%H%M%S') }}"
-                    }
-                }
-            ]
-        })
-
-        Update script:
-        ha_config_set_script(script_id="morning_routine", config={
-            "sequence": [
-                {"action": "light.turn_on", "target": {"area_id": "bedroom"}},
-                {"action": "climate.set_temperature", "target": {"entity_id": "climate.bedroom"}, "data": {"temperature": 22}}
-            ],
-            "alias": "Updated Morning Routine"
-        })
-
-        Create blueprint-based script:
-        ha_config_set_script(script_id="notification_script", config={
-            "alias": "My Notification Script",
-            "use_blueprint": {
-                "path": "notification_script.yaml",
-                "input": {
-                    "message": "Hello World",
-                    "title": "Test Notification"
-                }
-            }
-        })
-
-        Update blueprint script inputs:
-        ha_config_set_script(script_id="notification_script", config={
-            "alias": "My Notification Script",
-            "use_blueprint": {
-                "path": "notification_script.yaml",
-                "input": {
-                    "message": "Updated message",
-                    "title": "Updated Title"
-                }
-            }
-        })
-
-        Note: Scripts use Home Assistant's action syntax. Check the documentation for advanced
-        features like conditions, variables, parallel execution, and service call options.
+        TAKE CONTROL is one-way: later blueprint edits stop reaching the script;
+        to change an input value, update 'use_blueprint.input' instead. It does
+        NOT free the blueprint — Home Assistant keeps counting the converted
+        script as a user, so deleting that blueprint stays refused until the
+        script is removed. To preview the rendering without writing anything,
+        use ha_manage_blueprints(action="substitute", domain="script", path=..., input=...).
         """
         bp_warnings: BestPracticeCheckResult = BestPracticeCheckResult()
         try:
@@ -688,20 +621,36 @@ class ConfigScriptTools:
                 ],
                 context={"action": "set"},
             )
-            # Validate mutual exclusivity of config and python_transform
-            if config is not None and python_transform is not None:
-                raise_tool_error(
-                    create_error_response(
-                        ErrorCode.VALIDATION_INVALID_PARAMETER,
-                        "Cannot use both config and python_transform simultaneously",
-                        suggestions=[
-                            "Use only ONE of: config or python_transform",
-                            "config: Full replacement",
-                            "python_transform: Python-based edits (recommended for existing scripts)",
-                        ],
-                        context={"action": "set", "script_id": script_id},
-                    )
+            if run is not None or variables is not None:
+                return await self._run_script_control(
+                    script_id,
+                    run,
+                    variables,
+                    has_write=config is not None
+                    or python_transform is not None
+                    or take_control_of_blueprint,
+                    category=category,
+                    MandatoryBPS=MandatoryBPS,
                 )
+            validate_write_modes(
+                "script",
+                "script_id",
+                script_id,
+                config,
+                python_transform,
+                take_control_of_blueprint,
+            )
+
+            detached_blueprint: str | None = None
+            if take_control_of_blueprint:
+                taken = await self._take_control_config(script_id)
+                config = taken.config
+                detached_blueprint = taken.blueprint_path
+                # Take control is a read-modify-write the TOOL performs, so it
+                # owns the consistency guarantee the caller could not supply:
+                # without this, an edit landing between that read and this
+                # write is silently overwritten. An explicit caller hash wins.
+                config_hash = config_hash or taken.config_hash
 
             # Handle python_transform mode
             if python_transform is not None:
@@ -731,6 +680,7 @@ class ConfigScriptTools:
                     python_transform,
                     bp_warnings,
                     MandatoryBPS,
+                    wait,
                     effective_category,
                 )
 
@@ -785,14 +735,15 @@ class ConfigScriptTools:
                 wait,
                 bp_warnings,
                 MandatoryBPS,
+                detached_blueprint,
             )
 
         except ToolError as te:
             raise augment_tool_error_with_skill_content(te, bp_warnings) from None
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             suggestions = [
                 "Ensure config includes either 'sequence' field (regular scripts) or 'use_blueprint' field (blueprint-based scripts)",
-                "For blueprint scripts, use ha_get_blueprint(domain='script') to list available blueprints",
+                "For blueprint scripts, use ha_manage_blueprints(action='list', domain='script') to list available blueprints",
                 "Validate sequence actions syntax for regular scripts",
                 "Check entity_ids exist if using service calls",
                 "Use ha_search(domain_filter='script') to find scripts",
@@ -816,6 +767,82 @@ class ConfigScriptTools:
             )
             augment_error_dict_with_skill_content(error, bp_warnings)
             raise_tool_error(error)
+
+    async def _run_script_control(
+        self,
+        script_id: str,
+        run: str | None,
+        variables: dict[str, Any] | None,
+        *,
+        has_write: bool,
+        category: str | None,
+        MandatoryBPS: bool,
+    ) -> dict[str, Any]:
+        """Start or stop a script without touching its config."""
+        problem = None
+        if run is None:
+            problem = "variables only apply with run='start'"
+        elif has_write:
+            problem = (
+                "run cannot be combined with config, python_transform or "
+                "take_control_of_blueprint"
+            )
+        elif category is not None:
+            problem = "category requires a config update"
+        elif variables is not None and run != "start":
+            problem = "variables only apply with run='start'"
+        if problem:
+            raise_tool_error(
+                create_error_response(
+                    ErrorCode.VALIDATION_INVALID_PARAMETER,
+                    problem,
+                    suggestions=[
+                        "Write the script config in one call, then start or stop "
+                        + "it in a second call with only script_id and run",
+                        "Pass variables together with run='start'",
+                    ],
+                    context={"action": "run", "script_id": script_id, "run": run},
+                )
+            )
+        # An existing script needs one registry lookup, not a registration poll.
+        entity_id = await resolve_entity_id_after_write(
+            self._client, script_id, "script", timeout=0
+        )
+        # HA's script services are a silent no-op on an unknown entity.
+        try:
+            await self._client.get_entity_state(entity_id)
+        except HomeAssistantAPIError as e:
+            if e.status_code == 404:
+                await self._raise_script_not_found(script_id)
+            raise
+        data: dict[str, Any] = {"entity_id": entity_id}
+        if variables:
+            data["variables"] = variables
+        service = "turn_on" if run == "start" else "turn_off"
+        try:
+            await self._client.call_service("script", service, data)
+        except (
+            HomeAssistantAPIError,
+            HomeAssistantAuthError,
+            HomeAssistantConnectionError,
+        ) as exc:
+            exception_to_structured_error(
+                exc,
+                context={"action": run, "script_id": script_id, "entity_id": entity_id},
+            )
+        response: dict[str, Any] = {
+            "success": True,
+            "action": run,
+            "script_id": script_id,
+            "entity_id": entity_id,
+        }
+        attach_skill_content(
+            response,
+            MandatoryBPS=MandatoryBPS,
+            canonical_files=_SCRIPT_SKILL_FILES,
+            referenced_files=None,
+        )
+        return response
 
     async def _prepare_script_transform(
         self, script_id: str, config_hash: str | None, python_transform: str
@@ -867,6 +894,12 @@ class ConfigScriptTools:
                 )
             )
 
+        reject_malformed_list_fields(
+            transformed_config,
+            ("sequence",),
+            {"action": "python_transform", "script_id": script_id},
+            source="python_transform",
+        )
         # Validate transformed config
         if (
             "sequence" not in transformed_config
@@ -888,46 +921,44 @@ class ConfigScriptTools:
             )
         return transformed_config, resolved_id
 
-    async def _resolve_script_entity_id(self, storage_key: str) -> str:
-        """Resolve a script storage key to its current entity_id.
+    async def _finalize_script_write(
+        self,
+        result: dict[str, Any],
+        script_id: str,
+        resolved_key: str | None,
+        wait: bool,
+        category: str | None,
+    ) -> None:
+        """Resolve, wait, and apply a category for either script write mode.
 
-        Normally ``script.<storage_key>``, but a registry rename decouples
-        the entity_id from the storage key while the registry entry keeps
-        ``unique_id == storage_key``. Component lookup first, then a
-        registry-get fast path, then a registry-list scan; the constructed id
-        is the last resort (fresh creates resolve here before registration).
+        Match the upsert's storage key, which can differ from the caller's
+        entity ID after a registry rename. Keep the caller's ID as fallback.
         """
-        constructed = f"script.{storage_key}"
-        try:
-            matches = await fetch_entity_lookup_via_component(
-                self._client, storage_key, domain="script"
+        if not wait and not category:
+            return
+        storage_key = result.get("script_id") or resolved_key or script_id
+        entity_id = await resolve_entity_id_after_write(
+            self._client,
+            storage_key,
+            "script",
+            fallback_entity_id=f"script.{script_id.removeprefix('script.')}",
+        )
+        if wait:
+            try:
+                registered = await wait_for_entity_registered(self._client, entity_id)
+                if not registered:
+                    result.setdefault("warnings", []).append(
+                        f"Script saved but {entity_id} not yet queryable. "
+                        "It may take a moment to become available."
+                    )
+            except (HomeAssistantConnectionError, HomeAssistantAuthError) as e:
+                result.setdefault("warnings", []).append(
+                    f"Script saved but verification failed: {e}"
+                )
+        if category:
+            await apply_entity_category(
+                self._client, entity_id, category, "script", result, "script"
             )
-            if matches is not None:
-                for match in matches:
-                    entity_id = match.get("entity_id") or ""
-                    if entity_id.startswith("script."):
-                        return str(entity_id)
-                return constructed
-            result = await self._client.send_websocket_message(
-                {"type": "config/entity_registry/get", "entity_id": constructed}
-            )
-            if isinstance(result, dict) and result.get("success"):
-                return constructed
-            listing = await self._client.send_websocket_message(
-                {"type": "config/entity_registry/list"}
-            )
-            entries = (listing.get("result") or []) if isinstance(listing, dict) else []
-            for entry in entries:
-                if (
-                    isinstance(entry, dict)
-                    and entry.get("platform") == "script"
-                    and entry.get("unique_id") == storage_key
-                    and str(entry.get("entity_id", "")).startswith("script.")
-                ):
-                    return str(entry["entity_id"])
-        except Exception as e:
-            logger.debug(f"Failed to resolve entity_id for script {storage_key}: {e}")
-        return constructed
 
     async def _commit_script_transform(
         self,
@@ -937,19 +968,17 @@ class ConfigScriptTools:
         python_transform: str,
         bp_warnings: BestPracticeCheckResult,
         MandatoryBPS: bool,
+        wait: bool,
         effective_category: str | None = None,
     ) -> dict[str, Any]:
-        """Upsert a transformed script config and build the tool response.
-
-        Extracted verbatim from ``ha_config_set_script``'s python_transform
-        branch (the post-``_check_best_practices`` tail).
-        """
+        """Upsert, refresh the hash, finalize wait/category, and build the response."""
         # Save transformed config. ``_fetch_and_verify_hash`` already
         # resolved the storage key; pass it as the write target so the
         # upsert skips the redundant re-resolve (issue #1813 Phase 0).
         # ``script_id`` stays the caller id (the fetched config already
         # carries an alias here, so the default is a no-op, but keep the
         # contract consistent — #1935).
+        references = await ref_check(self._client, transformed_config, "script")
         result = await self._client.upsert_script_config(
             transformed_config, script_id, resolved_id=resolved_id
         )
@@ -957,18 +986,9 @@ class ConfigScriptTools:
         # Re-fetch to get authoritative hash (HA may normalize after save)
         _, new_config_hash, _ = await self._get_script_config_internal(script_id)
 
-        # Apply category to entity registry if provided (parity with the
-        # full-config branch — issue #2159). Resolve the storage key first: a
-        # registry-renamed script no longer lives at script.<storage_key>.
-        if effective_category:
-            await apply_entity_category(
-                self._client,
-                await self._resolve_script_entity_id(script_id),
-                effective_category,
-                "script",
-                result,
-                "script",
-            )
+        await self._finalize_script_write(
+            result, script_id, resolved_id, wait, effective_category
+        )
 
         response: dict[str, Any] = {
             "success": True,
@@ -982,6 +1002,7 @@ class ConfigScriptTools:
         }
         if bp_warnings:
             response["best_practice_warnings"] = list(bp_warnings)
+        merge_validation_meta(response, references)
         attach_skill_content(
             response,
             MandatoryBPS=MandatoryBPS,
@@ -989,6 +1010,23 @@ class ConfigScriptTools:
             referenced_files=bp_warnings.referenced_files,
         )
         return response
+
+    async def _take_control_config(self, script_id: str) -> TakenControl:
+        """Render a blueprint script into the config that replaces it.
+
+        The hash is of the config this read saw, so the write locks against it. Produces a
+        config for the ordinary replacement path rather than
+        writing it here, so the rendering goes through the same validation,
+        best-practice checks and skill-content attachment as every other
+        script write.
+        """
+        current_config, fetched_hash, _ = await self._get_script_config_internal(
+            script_id
+        )
+        taken, blueprint_path = await take_control_config(
+            self._client, "script", script_id, current_config
+        )
+        return TakenControl(taken, blueprint_path, fetched_hash)
 
     async def _commit_script_config(
         self,
@@ -999,64 +1037,30 @@ class ConfigScriptTools:
         wait: bool,
         bp_warnings: BestPracticeCheckResult,
         MandatoryBPS: bool,
+        detached_blueprint: str | None = None,
     ) -> dict[str, Any]:
-        """Validate references, upsert, wait, and build the tool response.
-
-        Extracted verbatim from ``ha_config_set_script``'s full-config branch
-        (the post-``_check_best_practices`` tail).
-        """
-        # Cross-check literal service and entity references against
-        # the live registries. Soft warnings only — the write still
-        # happens, even when references don't resolve (#940).
-        validation_meta = await validate_config_references(self._client, config_dict)
-
+        """Validate references, upsert, finalize wait/category, and build the response."""
+        references = await ref_check(self._client, config_dict, "script")
         result = await self._upsert_script(config_dict, script_id, resolved_key)
 
-        # Resolve the storage key only when the entity_id is consumed (the
-        # wait poll or the category write): with wait=False and no category —
-        # the documented bulk path — the resolution round-trips would be pure
-        # cost. A registry-renamed script no longer lives at
-        # script.<storage_key>; fresh creates fall back to the constructed id.
-        if wait or effective_category:
-            entity_id = await self._resolve_script_entity_id(script_id)
-        else:
-            entity_id = f"script.{script_id}"
-        if wait:
-            try:
-                registered = await wait_for_entity_registered(self._client, entity_id)
-                if not registered:
-                    result.setdefault("warnings", []).append(
-                        f"Script saved but {entity_id} not yet queryable. "
-                        "It may take a moment to become available."
-                    )
-            except (HomeAssistantConnectionError, HomeAssistantAuthError) as e:
-                result.setdefault("warnings", []).append(
-                    f"Script saved but verification failed: {e}"
-                )
-
-        # Apply category to entity registry if provided
-        if effective_category and entity_id:
-            await apply_entity_category(
-                self._client,
-                entity_id,
-                effective_category,
-                "script",
-                result,
-                "script",
-            )
+        await self._finalize_script_write(
+            result, script_id, resolved_key, wait, effective_category
+        )
 
         if bp_warnings:
             result["best_practice_warnings"] = list(bp_warnings)
 
-        merge_validation_meta(result, validation_meta)
+        merge_validation_meta(result, references)
 
         response = {
             "success": True,
             **result,
         }
+        if detached_blueprint:
+            response["took_control_of_blueprint"] = detached_blueprint
         # attach AFTER the outer dict is built so hint lands at
         # position 0 of the FINAL response (see BAT history in
-        # util_helpers._SKILL_CONTENT_OPTOUT_HINT).
+        # config_write_helpers._SKILL_CONTENT_OPTOUT_HINT).
         attach_skill_content(
             response,
             MandatoryBPS=MandatoryBPS,
@@ -1068,12 +1072,9 @@ class ConfigScriptTools:
     @tool(
         name="ha_config_remove_script",
         tags={"Scripts"},
-        annotations={
-            "openWorldHint": False,
-            "destructiveHint": True,
-            "idempotentHint": True,
-            "title": "Remove Script",
-        },
+        annotations=write_hints(
+            "Remove Script", destructive=True, idempotent=True, open_world=False
+        ),
     )
     @with_auto_backup(domain="script", id_param="script_id")
     @log_tool_usage
@@ -1088,35 +1089,31 @@ class ConfigScriptTools:
         wait: Annotated[
             bool,
             Field(
-                description="Wait for script to be fully removed before returning. Default: True.",
+                description="Wait for script to be fully removed before returning.",
                 default=True,
             ),
         ] = True,
     ) -> dict[str, Any]:
-        """
-        Delete a Home Assistant script.
+        """Delete a Home Assistant script.
 
-        EXAMPLES:
-        - Delete script: ha_config_remove_script("old_script")
-        - Delete script: ha_config_remove_script("temporary_script")
+        EXAMPLE: ha_config_remove_script("old_script")
 
-        **IMPORTANT LIMITATION:**
-        This tool can only delete scripts created via the Home Assistant UI.
-        Scripts defined in YAML configuration files (scripts.yaml or configuration.yaml)
-        cannot be deleted through the API and will return a 405 Method Not Allowed error.
+        Only scripts created via the Home Assistant UI can be deleted. Scripts
+        defined in YAML configuration files (scripts.yaml or configuration.yaml)
+        cannot be deleted through the API and return a 405 Method Not Allowed
+        error; edit the configuration file directly instead.
 
-        To remove YAML-defined scripts, you must edit the configuration file directly.
-
-        **WARNING:** Deleting a script that is used by automations may cause those automations to fail.
+        WARNING: Deleting a script that is used by automations may cause those automations to fail.
         """
         try:
             # Strip BEFORE validate so a bare ``"script."`` (empty after
             # strip) is rejected as ``VALIDATION_INVALID_PARAMETER`` rather
             # than slipping through validate (non-empty pre-strip) and
             # producing a ``script.script.foo`` entity_id for the
-            # ``wait_for_entity_removed`` watcher below — that mis-formed
-            # entity_id never registers so the watcher times out on a
-            # phantom. Behavioral parity with ``ha_config_get_script``.
+            # ``verify_entity_removed`` check below — that mis-formed
+            # entity_id 404s, which counts as removed, so the real entity
+            # would never be checked. Behavioral parity with
+            # ``ha_config_get_script``.
             script_id = script_id.removeprefix("script.")
             # Empty/whitespace would surface as a misleading HA delete-failure.
             validate_identifier_not_empty(
@@ -1132,21 +1129,12 @@ class ConfigScriptTools:
             # Wait for script to be removed
             entity_id = f"script.{script_id}"
             if wait:
-                try:
-                    removed = await wait_for_entity_removed(self._client, entity_id)
-                    if not removed:
-                        result.setdefault("warnings", []).append(
-                            f"Deletion confirmed by API but {entity_id} may still appear briefly."
-                        )
-                except (HomeAssistantConnectionError, HomeAssistantAuthError) as e:
-                    result.setdefault("warnings", []).append(
-                        f"Deletion confirmed but removal verification failed: {e}"
-                    )
+                await verify_entity_removed(self._client, entity_id, result)
 
             return {"success": True, "action": "delete", **result}
         except ToolError:
             raise
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001
             if isinstance(e, HomeAssistantAPIError) and e.status_code == 404:
                 await self._raise_script_not_found(script_id)
             exception_to_structured_error(

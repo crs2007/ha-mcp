@@ -9,7 +9,7 @@ import json
 import logging
 from typing import Any
 
-from fastmcp.exceptions import ToolError
+from ha_mcp._vendor.fastmcp.exceptions import ToolError
 
 logger = logging.getLogger(__name__)
 
@@ -59,11 +59,9 @@ def parse_mcp_result(result) -> dict[str, Any]:
     if isinstance(result, dict):
         return result
 
-    # Check if this is an error response (from ToolError). fastmcp's
-    # CallToolResult spells the flag ``is_error``; the raw MCP CallToolResult
-    # spells it ``isError``. Accept either so the gate holds whichever type
-    # reaches this helper.
-    if getattr(result, "is_error", False) or getattr(result, "isError", False):
+    # Check if this is an error response (from ToolError). fastmcp's and the
+    # vendored MCP CallToolResult both carry the flag as ``is_error``.
+    if getattr(result, "is_error", False):
         return _parse_error_result(result)
 
     # Tools that return a FastMCP ``ToolResult`` with a non-text content block
@@ -113,8 +111,11 @@ async def safe_call_tool(
 ) -> dict[str, Any]:
     """Call an MCP tool and return parsed result, handling ToolError exceptions.
 
-    This is useful for tests that expect tools to fail and want to inspect
-    the error response without catching exceptions manually.
+    For a call whose outcome the test does NOT assert: removing or aborting, in a
+    ``finally`` block, something the test created or opened, and service-availability
+    probes. It swallows ``ToolError`` and returns a parsed dict either way, so a
+    test that asserts a failure should use ``MCPAssertions.call_tool_failure()``
+    with ``expected_error`` instead -- see tests/AGENTS.md "Test Patterns".
 
     Args:
         mcp_client: The MCP client instance
@@ -131,19 +132,28 @@ async def safe_call_tool(
         return tool_error_to_result(exc)
 
 
-def assert_mcp_success(result, operation_name: str = "operation"):
-    """
-    Assert that MCP tool result indicates success.
+def looks_like_success(data: dict[str, Any]) -> bool:
+    """Whether a parsed tool result is a success response.
 
-    Args:
-        result: FastMCP client result
-        operation_name: Name of operation for error message
+    Shared by ``assert_mcp_success`` and ``assert_mcp_failure`` so the two
+    cannot disagree about what "success" means. Several tools succeed
+    WITHOUT a ``success`` key (``pending_restart``, bulk-operation
+    payloads), so a bare ``data.get("success")`` check treats those as
+    failures -- which is fine for the success assertion (it lists them
+    explicitly) but silently accepted them as failures on the other side.
     """
-    data = parse_mcp_result(result)
-
-    # Handle different success indicators
     success_indicators = [
         data.get("success") is True,
+        # ha_manage_app's options/network write returns
+        # {"status": "pending_restart"} with no success key — the write was
+        # accepted, the app just needs a restart (tools_addons.py). The extra
+        # guards keep an explicit failure from riding in on the status string,
+        # hence "is not False" rather than "is True".
+        (
+            data.get("status") == "pending_restart"
+            and data.get("success") is not False
+            and data.get("error") is None
+        ),
         # If no explicit success field but has data and no error, consider success
         ("data" in data and data.get("error") is None and data.get("success") is None),
         # Bulk operations success: has operational data without explicit success field
@@ -162,7 +172,20 @@ def assert_mcp_success(result, operation_name: str = "operation"):
         ),
     ]
 
-    if not any(success_indicators):
+    return any(success_indicators)
+
+
+def assert_mcp_success(result, operation_name: str = "operation"):
+    """
+    Assert that MCP tool result indicates success.
+
+    Args:
+        result: FastMCP client result
+        operation_name: Name of operation for error message
+    """
+    data = parse_mcp_result(result)
+
+    if not looks_like_success(data):
         error_msg = data.get("error", "Unknown error")
         suggestions = data.get("suggestions", [])
 
@@ -189,8 +212,12 @@ def assert_mcp_failure(
     """
     data = parse_mcp_result(result)
 
-    # Check that operation actually failed
-    if data.get("success"):
+    # Check that operation actually failed. Uses the shared success
+    # predicate, not a bare data.get("success"): a tool that succeeds
+    # without a success key (pending_restart, bulk-operation payloads)
+    # would otherwise be accepted here as a failure, so a regression that
+    # made an expected-failure call SUCCEED could pass unnoticed.
+    if looks_like_success(data):
         raise AssertionError(f"{operation_name} should have failed but succeeded")
 
     # If expected error specified, check for it
@@ -370,8 +397,9 @@ class MCPAssertions:
         except ToolError as exc:
             # Convert ToolError to result dict and validate
             data = tool_error_to_result(exc)
-            # Verify this is actually a failure
-            if data.get("success"):
+            # Verify this is actually a failure (shared predicate, see
+            # assert_mcp_failure)
+            if looks_like_success(data):
                 raise AssertionError(
                     f"{operation_name} should have failed but succeeded"
                 ) from exc
@@ -444,7 +472,7 @@ async def wait_for_automation(
         parsed = await safe_call_tool(
             mcp_client,
             "ha_config_get_automation",
-            {"identifier": automation_id},
+            {"entity_id": automation_id},
         )
 
         if parsed.get("success"):

@@ -4,6 +4,7 @@ import asyncio
 import codecs
 import collections
 import logging
+import os
 import random
 import ssl
 import struct
@@ -11,6 +12,7 @@ import time
 import traceback
 import uuid
 import warnings
+import weakref
 from collections.abc import AsyncIterable, AsyncIterator, Awaitable, Iterable, Mapping
 from typing import Any, Callable, Deque, cast
 
@@ -22,6 +24,7 @@ from ..exceptions import (
     InvalidState,
     PayloadTooBig,
     ProtocolError,
+    TooManyFragments,
 )
 from ..extensions import Extension
 from ..frames import (
@@ -42,6 +45,8 @@ from .framing import Frame, prepare_ctrl, prepare_data
 
 
 __all__ = ["WebSocketCommonProtocol"]
+
+MAX_FRAGMENTS = int(os.environ.get("WEBSOCKETS_MAX_FRAGMENTS", "4096"))
 
 
 # In order to ensure consistency, the code always checks the current value of
@@ -205,7 +210,10 @@ class WebSocketCommonProtocol(asyncio.Protocol):
         # Logger or LoggerAdapter for this connection.
         if logger is None:
             logger = logging.getLogger("websockets.protocol")
-        self.logger: LoggerLike = logging.LoggerAdapter(logger, {"websocket": self})
+        self.logger: LoggerLike = logging.LoggerAdapter(
+            logger,
+            {"websocket": weakref.proxy(self)},
+        )
         """Logger for this connection."""
 
         # Track if DEBUG is enabled. Shortcut logging calls if it isn't.
@@ -987,6 +995,10 @@ class WebSocketCommonProtocol(asyncio.Protocol):
             self.transfer_data_exc = exc
             self.fail_connection(CloseCode.MESSAGE_TOO_BIG)
 
+        except TooManyFragments as exc:
+            self.transfer_data_exc = exc
+            self.fail_connection(CloseCode.MESSAGE_TOO_BIG, "too many fragments")
+
         except Exception as exc:
             # This shouldn't happen often because exceptions expected under
             # regular circumstances are handled above. If it does, consider
@@ -1067,6 +1079,8 @@ class WebSocketCommonProtocol(asyncio.Protocol):
                 raise ProtocolError("incomplete fragmented message")
             if frame.opcode != OP_CONT:
                 raise ProtocolError("unexpected opcode")
+            if len(fragments) >= MAX_FRAGMENTS:
+                raise TooManyFragments(MAX_FRAGMENTS)
             append(frame)
 
         return ("" if text else b"").join(fragments)
@@ -1278,6 +1292,8 @@ class WebSocketCommonProtocol(asyncio.Protocol):
             # Cancel the keepalive ping task.
             if hasattr(self, "keepalive_ping_task"):
                 self.keepalive_ping_task.cancel()
+                # Break reference cycle to allow immediate garbage collection.
+                del self.keepalive_ping_task
 
             # A client should wait for a TCP close from the server.
             if self.is_client and hasattr(self, "transfer_data_task"):

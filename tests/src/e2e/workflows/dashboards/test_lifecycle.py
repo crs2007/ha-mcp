@@ -50,7 +50,7 @@ def parse_mcp_result(result) -> dict[str, Any]:
                         .replace("null", "None")
                     )
                     return ast.literal_eval(fixed_text)
-                except (SyntaxError, ValueError):
+                except SyntaxError, ValueError:
                     return {"raw_response": response_text, "parse_error": True}
 
         return {
@@ -58,7 +58,7 @@ def parse_mcp_result(result) -> dict[str, Any]:
             if hasattr(result, "content")
             else str(result)
         }
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logger.warning(f"Failed to parse MCP result: {e}")
         return {"error": "Failed to parse result", "exception": str(e)}
 
@@ -248,15 +248,13 @@ class TestDashboardLifecycle:
         assert data["metadata_updated"] is True
         assert "resolved_from" not in data
 
-        # "nodash" (non-existent, no hyphen) SHOULD still be rejected
-        data = await safe_call_tool(
-            mcp_client,
+        # A new hyphenless url_path is rejected by Core's own create rule,
+        # whose message the tool relays.
+        await mcp.call_tool_failure(
             "ha_config_set_dashboard",
             {"url_path": "nodash", "title": "Invalid Dashboard"},
+            expected_error="Url path needs to contain a hyphen (-)",
         )
-        assert data["success"] is False
-        error_msg = extract_error_message(data)
-        assert "hyphen" in error_msg.lower()
 
         logger.info("Default dashboard hyphen validation test completed successfully")
 
@@ -319,6 +317,12 @@ class TestDashboardLifecycle:
                 d.get("url_path") == "test-no-config"
                 for d in list_data.get("dashboards", [])
             )
+            # Core has no config for it yet; the dashboard still exists.
+            empty_data = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"url_path": "test-no-config"}
+            )
+            assert empty_data["stored_config"] is False
+            assert empty_data["config"] is None
 
             update_data = await mcp.call_tool_success(
                 "ha_config_set_dashboard",
@@ -332,8 +336,8 @@ class TestDashboardLifecycle:
             )
             assert get_data["config"] == replacement
         finally:
-            await mcp.call_tool_success(
-                "ha_config_delete_dashboard", {"url_path": dashboard_id}
+            await safe_call_tool(
+                mcp_client, "ha_config_delete_dashboard", {"url_path": dashboard_id}
             )
 
         logger.info("Dashboard without config test completed successfully")
@@ -366,21 +370,51 @@ class TestDashboardLifecycle:
 
         logger.info("Metadata update via set_dashboard test completed successfully")
 
+    async def test_empty_icon_clears_stored_dashboard_icon(
+        self, mcp_client: Any
+    ) -> None:
+        """icon='' removes a stored icon instead of being ignored."""
+        mcp = MCPAssertions(mcp_client)
+        url_path = "test-icon-clear"
+
+        await mcp.call_tool_success(
+            "ha_config_set_dashboard",
+            {"url_path": url_path, "title": "Icon Clear", "icon": "mdi:home"},
+        )
+
+        async def stored_icon() -> Any:
+            list_data = await mcp.call_tool_success(
+                "ha_config_get_dashboard", {"list_only": True}
+            )
+            row = next(
+                d for d in list_data["dashboards"] if d.get("url_path") == url_path
+            )
+            return row.get("icon")
+
+        try:
+            assert await stored_icon() == "mdi:home"
+            await mcp.call_tool_success(
+                "ha_config_set_dashboard", {"url_path": url_path, "icon": ""}
+            )
+            assert await stored_icon() is None
+        finally:
+            await safe_call_tool(
+                mcp_client, "ha_config_delete_dashboard", {"url_path": url_path}
+            )
+
 
 class TestDashboardErrorHandling:
     """Test error handling and edge cases."""
 
     async def test_get_nonexistent_dashboard(self, mcp_client):
-        """Test getting config for non-existent dashboard."""
+        """An unknown dashboard is reported as not found, not as a failed call."""
         logger.info("Starting get nonexistent dashboard test")
 
-        data = await safe_call_tool(
-            mcp_client,
+        data = await MCPAssertions(mcp_client).call_tool_failure(
             "ha_config_get_dashboard",
             {"url_path": "nonexistent-dashboard-12345"},
         )
-        # May succeed but return empty/error config, or fail - either is acceptable
-        assert "success" in data or "error" in data
+        assert data["error"]["code"] == "RESOURCE_NOT_FOUND"
 
         logger.info("Get nonexistent dashboard test completed successfully")
 
@@ -388,7 +422,7 @@ class TestDashboardErrorHandling:
         """Test deleting non-existent dashboard raises ToolError with RESOURCE_NOT_FOUND."""
         logger.info("Starting delete nonexistent dashboard test")
 
-        from fastmcp.exceptions import ToolError
+        from ha_mcp._vendor.fastmcp.exceptions import ToolError
 
         with pytest.raises(ToolError) as exc_info:
             await mcp_client.call_tool(
@@ -457,12 +491,14 @@ class TestDashboardIdentifierResolution:
             assert get_data["success"] is True
             assert get_data["config"]["views"][0]["cards"][0]["content"] == "hi"
         finally:
-            await mcp.call_tool_success(
-                "ha_config_delete_dashboard", {"url_path": "test-981-get-by-id"}
+            await safe_call_tool(
+                mcp_client,
+                "ha_config_delete_dashboard",
+                {"url_path": "test-981-get-by-id"},
             )
 
     async def test_set_via_internal_id_pre_resolves(self, mcp_client):
-        """Set with the internal id (no hyphen) gets pre-resolved before validation."""
+        """Set with the internal id (no hyphen) updates the existing dashboard."""
         mcp = MCPAssertions(mcp_client)
 
         create_data = await mcp.call_tool_success(
@@ -478,13 +514,12 @@ class TestDashboardIdentifierResolution:
         internal_id = create_data["dashboard_id"]
         # Literal compare on the canonical id form — survives an HA-side
         # change of the slugify separator with a clearer failure message
-        # than ``"-" not in internal_id``. The pre-resolver must run before
-        # the hyphen-check on this id (it has no hyphen by construction).
+        # than ``"-" not in internal_id``. Without the pre-resolver this
+        # hyphenless id would reach Core as a new dashboard and be rejected.
         assert internal_id == "test_981_set_by_id"
 
         try:
-            # Update via internal id — pre-resolver replaces it with url_path
-            # so the hyphen validation passes.
+            # Update via internal id — pre-resolver replaces it with url_path.
             update_data = await mcp.call_tool_success(
                 "ha_config_set_dashboard",
                 {
@@ -503,8 +538,10 @@ class TestDashboardIdentifierResolution:
             )
             assert get_data["config"]["views"][0]["cards"][0]["content"] == "v2"
         finally:
-            await mcp.call_tool_success(
-                "ha_config_delete_dashboard", {"url_path": "test-981-set-by-id"}
+            await safe_call_tool(
+                mcp_client,
+                "ha_config_delete_dashboard",
+                {"url_path": "test-981-set-by-id"},
             )
 
     async def test_mixed_identifier_optimistic_locking(self, mcp_client):
@@ -565,8 +602,10 @@ class TestDashboardIdentifierResolution:
                 "did not change — likely no-op save regression"
             )
         finally:
-            await mcp.call_tool_success(
-                "ha_config_delete_dashboard", {"url_path": "test-981-mixed-hash"}
+            await safe_call_tool(
+                mcp_client,
+                "ha_config_delete_dashboard",
+                {"url_path": "test-981-mixed-hash"},
             )
 
 
@@ -630,7 +669,8 @@ class TestFindCard:
             logger.info("find_card by entity test passed")
 
         finally:
-            await mcp.call_tool_success(
+            await safe_call_tool(
+                mcp_client,
                 "ha_config_delete_dashboard",
                 {"url_path": "test-find-entity"},
             )
@@ -677,7 +717,8 @@ class TestFindCard:
             logger.info("find_card by type test passed")
 
         finally:
-            await mcp.call_tool_success(
+            await safe_call_tool(
+                mcp_client,
                 "ha_config_delete_dashboard",
                 {"url_path": "test-find-type"},
             )
@@ -762,7 +803,8 @@ class TestFindCard:
             logger.info("nested-card python_path round-trip test passed")
 
         finally:
-            await mcp.call_tool_success(
+            await safe_call_tool(
+                mcp_client,
                 "ha_config_delete_dashboard",
                 {"url_path": "test-find-roundtrip"},
             )
